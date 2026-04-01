@@ -1,0 +1,41 @@
+menu "ESPWIGLE"
+
+config WG_RGB_LED_ENABLE
+    bool "Enable RGB status LED"
+    default y
+    help
+        Enables a single WS2812-style RGB LED used for runtime status.
+
+if WG_RGB_LED_ENABLE
+
+config WG_RGB_LED_GPIO
+    int "RGB LED data GPIO"
+    range 0 48
+    default 48
+    help
+        GPIO connected to the RGB LED data input.
+
+config WG_RGB_LED_FRAME_MS
+    int "RGB LED refresh interval (ms)"
+    range 10 250
+    default 40
+    help
+        LED task period. Lower values smooth animations at a higher CPU cost.
+
+config WG_RGB_LED_BT_PULSE_MS
+    int "Bluetooth activity pulse length (ms)"
+    range 40 1000
+    default 140
+    help
+        How long RX/TX activity pulses remain visible on the LED.
+
+config WG_RGB_LED_BRIGHTNESS_PCT
+    int "RGB LED brightness (%)"
+    range 1 100
+    default 8
+    help
+        Global brightness scaling for all status colors and pulses.
+
+endif
+
+endmenu

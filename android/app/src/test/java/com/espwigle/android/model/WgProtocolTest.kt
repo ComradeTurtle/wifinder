@@ -1,0 +1,274 @@
+package com.espwigle.android.model
+
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
+import org.junit.Test
+
+class WgProtocolTest {
+  @Test
+  fun `decode status payload parses gps fields`() {
+    val payload = ByteArray(57)
+    payload[0] = 1
+    payload[1] = 1
+    payload[2] = 11
+    payload[3] = 0xFA.toByte()
+    payload[4] = 0x00
+    payload[5] = 0xFF.toByte()
+    payload[6] = 0x1F
+    payload[7] = 0x34
+    payload[8] = 0x12
+    payload[9] = 0x56
+    payload[10] = 0x00
+    payload[11] = 0x01
+    payload[12] = 0x00
+    payload[13] = 1
+    payload[14] = 1
+    payload[15] = 0x09
+    payload[16] = 0x00
+    payload[17] = 0x1E
+    payload[18] = 0x00
+    payload[19] = 1
+    payload[20] = 0x05
+    payload[21] = 0x00
+    payload[22] = 0x4A
+    payload[23] = 0x00
+    payload[24] = 0x10
+    payload[25] = 0x00
+    payload[26] = 6
+    payload[27] = 0x55
+    payload[28] = 0x15
+    payload[29] = 1
+    val sessionId = 0x1122334455667788L
+    for (i in 0 until 8) {
+      payload[30 + i] = ((sessionId ushr (8 * i)) and 0xFF).toByte()
+    }
+    payload[38] = 0x2A
+    payload[42] = 0x20
+    payload[43] = 0x03
+    payload[46] = 1
+    payload[47] = 0x11
+    payload[51] = 1
+    payload[52] = 0x07
+    payload[56] = 2
+
+    val status = WgProtocol.decodeStatusPayload(payload)
+
+    assertTrue(status.scanning)
+    assertTrue(status.bleEncrypted)
+    assertEquals(11, status.currentChannel)
+    assertEquals(250, status.hopMs)
+    assertEquals(0x1FFF, status.channelMask)
+    assertEquals(0x1234, status.uniqueBssids)
+    assertEquals(86, status.packetsPerSec)
+    assertEquals(1, status.droppedNotifies)
+    assertEquals(1, status.bootMode)
+    assertTrue(status.gpsValid)
+    assertEquals(9, status.gpsAgeS)
+    assertEquals(30, status.gpsAccuracyDm)
+    assertTrue(status.nodeLinkUp)
+    assertEquals(5, status.nodeLastSeenS)
+    assertEquals(74, status.nodePacketsPerSec)
+    assertEquals(16, status.nodeForwardedSightings)
+    assertEquals(6, status.nodeChannel)
+    assertEquals(0x1555, status.nodeChannelMask)
+    assertTrue(status.sessionOpen)
+    assertEquals(sessionId, status.sessionId)
+    assertEquals(42L, status.queuedRecords)
+    assertEquals(800L, status.queuedBytes)
+    assertTrue(status.replayActive)
+    assertEquals(17L, status.replayCursor)
+    assertTrue(status.queueFull)
+    assertEquals(7L, status.droppedFlashFull)
+    assertEquals(2, status.nodeCount)
+  }
+
+  @Test
+  fun `decode sighting payload keeps ssid and security details`() {
+    val ssid = "TestAP"
+    val ssidBytes = ssid.encodeToByteArray()
+    val payload = ByteArray(48 + ssidBytes.size)
+    payload[0] = 0x48
+    payload[1] = 0xA9.toByte()
+    payload[2] = 0x8A.toByte()
+    payload[3] = 0xED.toByte()
+    payload[4] = 0x1A
+    payload[5] = 0x4A
+    payload[6] = 6
+    payload[7] = (-57).toByte()
+    payload[8] = 4
+    payload[9] = (WgProtocol.SEC_PROTO_WPA2 or WgProtocol.SEC_PROTO_WPA3).toByte()
+    payload[10] = (WgProtocol.SEC_AKM_PSK or WgProtocol.SEC_AKM_SAE).toByte()
+    payload[11] = WgProtocol.SEC_CIPHER_CCMP_128.toByte()
+    payload[12] = ssidBytes.size.toByte()
+    ssidBytes.copyInto(payload, destinationOffset = 13)
+    payload[13 + ssidBytes.size] = 0x01
+    val sessionId = 0x0123456789ABCDEFL
+    for (i in 0 until 8) {
+      payload[14 + ssidBytes.size + i] = ((sessionId ushr (8 * i)) and 0xFF).toByte()
+    }
+    payload[22 + ssidBytes.size] = 0x2A
+    payload[26 + ssidBytes.size] = 1
+    payload[27 + ssidBytes.size] = 1
+    payload[28 + ssidBytes.size] = 1
+    payload[29 + ssidBytes.size] = 1
+    val latE7 = 391333890
+    val lonE7 = 209626726
+    val altMm = 22300
+    val unixS = 1711565786
+    for (i in 0 until 4) {
+      payload[30 + ssidBytes.size + i] = ((latE7 ushr (8 * i)) and 0xFF).toByte()
+      payload[34 + ssidBytes.size + i] = ((lonE7 ushr (8 * i)) and 0xFF).toByte()
+      payload[38 + ssidBytes.size + i] = ((altMm ushr (8 * i)) and 0xFF).toByte()
+      payload[42 + ssidBytes.size + i] = ((unixS ushr (8 * i)) and 0xFF).toByte()
+    }
+    payload[46 + ssidBytes.size] = 0xB0.toByte()
+    payload[47 + ssidBytes.size] = 0x04
+
+    val sighting = WgProtocol.decodeSightingPayload(payload)
+
+    assertEquals("48:A9:8A:ED:1A:4A", sighting.bssid)
+    assertEquals(6, sighting.channel)
+    assertEquals(-57, sighting.rssi)
+    assertEquals("WPA2/WPA3-PSK/SAE-CCMP-128", sighting.auth)
+    assertEquals(ssid, sighting.ssid)
+    assertEquals(0x01, sighting.flags)
+    assertEquals(sessionId, sighting.sessionId)
+    assertEquals(42L, sighting.recordSeq)
+    assertEquals(1, sighting.nodeId)
+    assertEquals(1, sighting.sourceFlags)
+    assertTrue(sighting.gpsValid)
+    assertEquals(1, sighting.gpsSource)
+    assertEquals(latE7, sighting.gpsLatE7)
+    assertEquals(lonE7, sighting.gpsLonE7)
+    assertEquals(altMm, sighting.gpsAltMm)
+    assertEquals(unixS.toLong(), sighting.gpsUnixTimeS)
+    assertEquals(1200, sighting.gpsAccuracyCm)
+  }
+
+  @Test
+  fun `decode sighting payload supports legacy records without gps extension`() {
+    val ssid = "Legacy"
+    val ssidBytes = ssid.encodeToByteArray()
+    val payload = ByteArray(28 + ssidBytes.size)
+    payload[0] = 0x40
+    payload[1] = 0xED.toByte()
+    payload[2] = 0x00
+    payload[3] = 0x25
+    payload[4] = 0xE0.toByte()
+    payload[5] = 0x02
+    payload[6] = 1
+    payload[7] = (-44).toByte()
+    payload[8] = 4
+    payload[9] = WgProtocol.SEC_PROTO_WPA2.toByte()
+    payload[10] = WgProtocol.SEC_AKM_PSK.toByte()
+    payload[11] = WgProtocol.SEC_CIPHER_CCMP_128.toByte()
+    payload[12] = ssidBytes.size.toByte()
+    ssidBytes.copyInto(payload, destinationOffset = 13)
+    payload[13 + ssidBytes.size] = 0x01
+    payload[26 + ssidBytes.size] = 1
+    payload[27 + ssidBytes.size] = 1
+
+    val sighting = WgProtocol.decodeSightingPayload(payload)
+
+    assertEquals("40:ED:00:25:E0:02", sighting.bssid)
+    assertEquals(ssid, sighting.ssid)
+    assertEquals(1, sighting.sourceFlags)
+    assertEquals(false, sighting.gpsValid)
+    assertEquals(0, sighting.gpsAccuracyCm)
+  }
+
+  @Test
+  fun `encode gps command payload packs little endian fields`() {
+    val fix = GpsFix(
+      flags = WgProtocol.GPS_FLAG_VALID or WgProtocol.GPS_FLAG_HAS_ALT or WgProtocol.GPS_FLAG_HAS_SPEED,
+      latE7 = 373320001,
+      lonE7 = -1220311222,
+      altMm = 123450,
+      speedMmps = 5123,
+      bearingMdeg = 90000,
+      unixTimeS = 1_700_000_001,
+      accuracyCm = 250,
+    )
+
+    val payload = WgProtocol.encodeGpsFixPayload(fix)
+
+    assertEquals(WgProtocol.GPS_FIX_PAYLOAD_SIZE, payload.size)
+    assertEquals(fix.flags.toByte(), payload[0])
+    assertEquals(0xFA, payload[25].toInt() and 0xFF)
+    assertEquals(0x00, payload[26].toInt() and 0xFF)
+  }
+
+  @Test
+  fun `decode gps payload parses source and coordinates`() {
+    val payload = byteArrayOf(
+      1,
+      2,
+      0x10,
+      0x27,
+      0x4F,
+      0x16,
+      0xD2.toByte(),
+      0x04,
+      0x56,
+      0xB7.toByte(),
+      0x39,
+      0x30,
+      0x00,
+      0x00,
+      0xE8.toByte(),
+      0x03,
+      0x00,
+      0x00,
+      0x28,
+      0x23,
+      0x00,
+      0x00,
+      0x80.toByte(),
+      0xF1.toByte(),
+      0x53,
+      0x65,
+      0xFA.toByte(),
+      0x00,
+      11,
+      0x5C,
+      0x00,
+      0x92.toByte(),
+      0x00,
+    )
+
+    val gps = WgProtocol.decodeGpsPayload(payload)
+
+    assertTrue(gps.valid)
+    assertEquals(2, gps.source)
+    assertEquals(374286096, gps.latE7)
+    assertEquals(-1219099438, gps.lonE7)
+    assertEquals(12345, gps.altMm)
+    assertEquals(1000, gps.speedMmps)
+    assertEquals(9000, gps.bearingMdeg)
+    assertEquals(1700000128, gps.unixTimeS)
+    assertEquals(250, gps.accuracyCm)
+    assertEquals(11, gps.satCount)
+    assertEquals(92, gps.hdopCenti)
+    assertEquals(146, gps.pdopCenti)
+  }
+
+  @Test
+  fun `encode replay ack payload packs session and sequence`() {
+    val payload = WgProtocol.encodeReplayAckPayload(0x1122334455667788, 77)
+    assertEquals(12, payload.size)
+    assertEquals(0x88, payload[0].toInt() and 0xFF)
+    assertEquals(0x11, payload[7].toInt() and 0xFF)
+    assertEquals(77, payload[8].toInt() and 0xFF)
+  }
+
+  @Test
+  fun `encode replay toggle payload packs single enable byte`() {
+    val enabled = WgProtocol.encodeReplayTogglePayload(true)
+    val disabled = WgProtocol.encodeReplayTogglePayload(false)
+
+    assertEquals(1, enabled.size)
+    assertEquals(1, enabled[0].toInt() and 0xFF)
+    assertEquals(1, disabled.size)
+    assertEquals(0, disabled[0].toInt() and 0xFF)
+  }
+}

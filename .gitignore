@@ -1,0 +1,34 @@
+# ---- ESP-IDF / firmware build outputs ----
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+
+# ---- ESP8266 PlatformIO ----
+esp8266/.pio/
+
+# ---- Android / Gradle ----
+android/.gradle/
+android/app/build/
+android/local.properties
+android/.kotlin/
+android/captures/
+
+# ---- Web frontend ----
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo
+
+# ---- Python / desktop tooling ----
+.venv-desktop/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# ---- IDE / OS noise ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

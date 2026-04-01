@@ -1,0 +1,201 @@
+# espwigle (ESP32 scanner + Web/Android/Desktop clients)
+
+This project turns `ESP32-S3-N16R8` into a BLE-controlled Wi-Fi wardriving
+scanner with:
+- a self-contained local web app
+- an Android app that adds GPS ingestion and Wigle CSV logging on phone
+- a desktop app (Python + Qt) for direct USB serial debugging/control
+
+## What current firmware includes
+
+- Wi-Fi management sniffing (beacon + probe response) on 2.4 GHz
+- Selectable channel set (`1..13`) with configurable hop interval (`50..2000 ms`)
+- Start/stop scan control over BLE
+- BLE status + AP sighting notifications (binary framed protocol)
+- WG protocol transport over USB serial (desktop client path)
+- WG protocol v2 with session metadata on sightings/status
+- SPIFFS-backed store-and-forward queue with explicit replay control + host ACK cursor
+- Live local web UI (Chromium) showing:
+  - connection and scanner status
+  - visible `(B)SSIDs`
+  - detailed security labels (for example `WPA2-PSK-CCMP-128`)
+  - channel occupancy + RSSI histogram + packet rate trend
+- NVS persistence on ESP for:
+  - hop interval
+  - channel mask
+  - boot mode (`manual` / `auto`)
+
+## BLE service
+
+- Custom service UUID: `6ee2e690-d7fd-4a11-94a2-89528da43130`
+- Characteristics:
+  - Control: `...3131` (write / write-no-response)
+  - Status: `...3132` (read / notify)
+  - Sighting stream: `...3133` (notify)
+  - Config: `...3134` (read / write)
+  - Device info: `...3135` (read)
+- Security: bonding + LE Secure Connections + MITM (fixed passkey `123456`)
+
+## Firmware build and flash
+
+Prerequisites:
+- ESP-IDF activated in shell (`idf.py` available)
+- Board connected at `/dev/ttyACM0`
+
+```bash
+idf.py set-target esp32s3
+idf.py -p /dev/ttyACM0 flash monitor
+```
+
+## Local web app
+
+The web app is in `web/` and uses native Web Bluetooth (Chromium over
+`localhost`/secure context).
+
+```bash
+npm --prefix web install
+npm --prefix web run dev
+```
+
+Open the shown local URL in Chromium, click `Connect`, then use Start/Stop and
+channel/hop controls.
+
+## Desktop app (USB serial + Qt)
+
+Desktop app lives in `desktop/` and talks to the master ESP over USB serial
+using the same WG framed protocol as BLE.
+
+```bash
+python -m venv .venv-desktop
+source .venv-desktop/bin/activate
+pip install -r desktop/requirements.txt
+python desktop/run.py
+```
+
+In the app:
+- select `/dev/ttyACM*`
+- connect
+- use Start/Stop, hop/channels/boot controls, and CSV logging
+- once the first WG command is received, firmware switches that USB stream to
+  frame-only mode (ESP logs are suppressed on that stream to avoid protocol noise)
+
+CSV output path on PC:
+- `~/Downloads/espwigle/wigle-YYYYMMDD-HHMMSS.csv`
+
+## Android app (BLE + GPS + CSV)
+
+Android project lives in `android/`.
+
+Features:
+- BLE control and telemetry (same protocol as web app)
+- Live visible `(B)SSID` table with timeout-based pruning
+- GPS push fallback to ESP (`SET_GPS_FIX`) when phone fix exists
+- ESP-originated GPS telemetry (`WG_MSG_GPS`) reception
+- node-link telemetry from secondary scanner (ESP8266)
+- Wigle CSV logging generated on phone storage (prefers fresh ESP GPS, phone fallback)
+- Explicit `Download ESP` backlog flow (`SET_REPLAY` on/off, blocked while scanner is active)
+
+Build/test:
+
+```bash
+cat > android/local.properties <<'EOF'
+sdk.dir=/path/to/Android/Sdk
+EOF
+
+GRADLE_USER_HOME=/tmp/gradle-home ./android/gradlew -p android test
+```
+
+Install debug build to connected phone:
+
+```bash
+GRADLE_USER_HOME=/tmp/gradle-home ./android/gradlew -p android installDebug
+```
+
+CSV output path on phone:
+- public Downloads subfolder:
+  - `Downloads/espwigle/wigle-YYYYMMDD-HHMMSS.csv`
+
+## Wireshark protocol decoding
+
+You can decode ESPWIGLE frames in BLE ATT traffic with the Lua post-dissector:
+
+- Script path: `tools/wireshark/espwigle.lua`
+- It parses WG frame headers and payloads for:
+  - `STATUS`, `SIGHTING`, `ACK`, `ERROR`, `SNAPSHOT_END`, `CONFIG`, `GPS`, `REPLAY_ACK`, `NODE_TABLE`, `COMMAND`
+
+Install:
+
+```bash
+mkdir -p ~/.local/lib/wireshark/plugins
+cp tools/wireshark/espwigle.lua ~/.local/lib/wireshark/plugins/
+```
+
+Then restart Wireshark and filter as usual (for example `btatt`).  
+Any ATT value beginning with WG magic (`57 47`) is decoded under a new
+`ESPWIGLE Frame` tree and tagged in the packet Info column.
+
+## Tests
+
+Firmware host logic tests:
+
+```bash
+./scripts/run_host_tests.sh
+```
+
+Web protocol/state core tests:
+
+```bash
+npm --prefix web run test:core
+```
+
+Web production build:
+
+```bash
+npm --prefix web run build
+```
+
+Desktop protocol/state/CSV tests:
+
+```bash
+python -m unittest discover -s desktop/tests -v
+```
+
+## Notes
+
+- ESP32-S3 promiscuous scanning is 2.4 GHz only.
+
+## ESP8266 slave node firmware (for C6 master)
+
+The `esp8266/` firmware is now a wired slave scanner for the ESP32-C6 master.
+
+What it does:
+- promiscuous Wi-Fi management scanning with channel hop
+- UART framed protocol to C6:
+  - RX: `HELLO`, `CONFIG`, `PING`
+  - TX: `HELLO_ACK`, periodic `STATUS`, `PONG`, `SIGHTING`
+- no onboard GPS, BLE, or flash logging (all logging remains on phone CSV side)
+
+Build/upload:
+
+```bash
+cd esp8266
+pio run
+pio run -t upload --upload-port /dev/ttyUSB0
+```
+
+## C6 + 8266 wiring
+
+Current defaults in firmware:
+- C6 node UART (LP UART):
+  - TX: `GPIO5`
+  - RX: `GPIO4`
+  - baud: `460800`
+- C6 GPS UART:
+  - TX: `GPIO10`
+  - RX: `GPIO11`
+  - baud: `9600`
+- 8266 node UART:
+  - TX0 (`GPIO1`) -> C6 RX (`GPIO4`)
+  - RX0 (`GPIO3`) <- C6 TX (`GPIO5`)
+
+Also connect common GND between boards.

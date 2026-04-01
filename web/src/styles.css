@@ -1,0 +1,259 @@
+:root {
+  --ink: #f5f8f7;
+  --ink-dim: #b5c8c4;
+  --accent: #2ec4a6;
+  --accent-strong: #1ba287;
+  --panel: rgba(8, 22, 25, 0.78);
+  --border: rgba(120, 186, 173, 0.25);
+  --bg-a: #05121a;
+  --bg-b: #0b2c2c;
+  --bg-c: #163737;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  font-family: "Space Grotesk", sans-serif;
+  background: radial-gradient(1000px 600px at 10% 0%, #19403a 0%, transparent 70%),
+    linear-gradient(120deg, var(--bg-a), var(--bg-b), var(--bg-c));
+}
+
+.layout {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 1.2rem;
+  display: grid;
+  gap: 0.9rem;
+}
+
+.hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1rem 1.2rem;
+  backdrop-filter: blur(4px);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 0.55rem;
+  font-weight: 700;
+}
+
+h1 {
+  letter-spacing: 0.03em;
+  font-size: 1.45rem;
+}
+
+h2 {
+  font-size: 1rem;
+}
+
+h3 {
+  font-size: 0.84rem;
+  color: var(--ink-dim);
+}
+
+p {
+  margin: 0;
+  color: var(--ink-dim);
+}
+
+.grid.two {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 0.85rem;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 0.35rem 0.8rem;
+}
+
+.kv span {
+  color: var(--ink-dim);
+}
+
+.kv strong {
+  text-align: right;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  border: 1px solid var(--border);
+  background: #122b2f;
+  color: var(--ink);
+  border-radius: 10px;
+  padding: 0.42rem 0.7rem;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: rgba(46, 196, 166, 0.55);
+}
+
+button.accent {
+  background: linear-gradient(140deg, #2ec4a6, #0f8e78);
+  color: #03110f;
+  font-weight: 700;
+}
+
+input[type="range"] {
+  width: 100%;
+}
+
+input[type="number"],
+select {
+  width: 100%;
+  background: #0a1c20;
+  border: 1px solid var(--border);
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 0.4rem 0.5rem;
+}
+
+.control-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.45rem;
+  margin-bottom: 0.55rem;
+}
+
+#hopRange {
+  grid-column: span 2;
+}
+
+#visibleTimeoutInput {
+  grid-column: span 2;
+}
+
+.channel-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0.3rem;
+  margin-bottom: 0.55rem;
+}
+
+.channel-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.25rem 0.35rem;
+  display: flex;
+  align-items: center;
+  gap: 0.32rem;
+}
+
+.bars {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 70px 1fr 34px;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+}
+
+.bar-track {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: #102327;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2ec4a6, #8be38c);
+}
+
+.bar-label,
+.bar-value {
+  color: var(--ink-dim);
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.log {
+  min-height: 180px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: #0a1d21;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.5rem;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.76rem;
+}
+
+.table-wrap {
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.42rem 0.5rem;
+  border-bottom: 1px solid rgba(138, 175, 169, 0.17);
+  font-size: 0.84rem;
+}
+
+th {
+  color: var(--ink-dim);
+  position: sticky;
+  top: 0;
+  background: #0e2226;
+}
+
+.mono {
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.inline-state {
+  color: var(--ink-dim);
+  font-size: 0.75rem;
+  margin-left: 0.45rem;
+}
+
+@media (max-width: 980px) {
+  .grid.two {
+    grid-template-columns: 1fr;
+  }
+
+  .channel-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+}

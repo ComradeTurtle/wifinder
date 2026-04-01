@@ -1,0 +1,2 @@
+"""ESPWIGLE desktop client package."""
+

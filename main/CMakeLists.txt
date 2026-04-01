@@ -1,0 +1,21 @@
+idf_component_register(
+  SRCS
+    "main.c"
+    "sniffer_logic.c"
+    "channel_plan.c"
+    "wg_protocol.c"
+    "wg_payload.c"
+  INCLUDE_DIRS
+    "."
+  REQUIRES
+    bt
+    nvs_flash
+    esp_wifi
+    esp_event
+    esp_netif
+    esp_timer
+    spiffs
+    esp_driver_rmt
+    esp_driver_uart
+    esp_driver_usb_serial_jtag
+)
