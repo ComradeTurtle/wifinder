@@ -1,7 +1,7 @@
 # espwigle (ESP32 scanner + Web/Android/Desktop clients)
 
-This project turns `ESP32-S3-N16R8` into a BLE-controlled Wi-Fi wardriving
-scanner with:
+This project runs a BLE-controlled Wi-Fi wardriving scanner stack centered on
+an `ESP32-C6` master (optionally with an `ESP8266` wired slave node), with:
 - a self-contained local web app
 - an Android app that adds GPS ingestion and Wigle CSV logging on phone
 - a desktop app (Python + Qt) for direct USB serial debugging/control
@@ -24,6 +24,10 @@ scanner with:
   - hop interval
   - channel mask
   - boot mode (`manual` / `auto`)
+- UART GPS ingestion (u-blox/NMEA)
+- GPS nav-rate control:
+  - dynamic `auto` mode (`1/2/4 Hz` based on speed)
+  - forced modes for testing (`1 Hz`, `2 Hz`, `4 Hz`)
 
 ## BLE service
 
@@ -43,9 +47,12 @@ Prerequisites:
 - Board connected at `/dev/ttyACM0`
 
 ```bash
-idf.py set-target esp32s3
+idf.py set-target esp32c6
 idf.py -p /dev/ttyACM0 flash monitor
 ```
+
+If you intentionally build for a different target (for example legacy S3), set
+the appropriate target first.
 
 ## Local web app
 
@@ -75,7 +82,7 @@ python desktop/run.py
 In the app:
 - select `/dev/ttyACM*`
 - connect
-- use Start/Stop, hop/channels/boot controls, and CSV logging
+- use Start/Stop, hop/channels/boot controls, GPS nav-rate override, and CSV logging
 - once the first WG command is received, firmware switches that USB stream to
   frame-only mode (ESP logs are suppressed on that stream to avoid protocol noise)
 
@@ -91,6 +98,7 @@ Features:
 - Live visible `(B)SSID` table with timeout-based pruning
 - GPS push fallback to ESP (`SET_GPS_FIX`) when phone fix exists
 - ESP-originated GPS telemetry (`WG_MSG_GPS`) reception
+- GPS nav-rate mode control (`Auto` / forced `1/2/4 Hz`) for field testing
 - node-link telemetry from secondary scanner (ESP8266)
 - Wigle CSV logging generated on phone storage (prefers fresh ESP GPS, phone fallback)
 - Explicit `Download ESP` backlog flow (`SET_REPLAY` on/off, blocked while scanner is active)
@@ -162,7 +170,7 @@ python -m unittest discover -s desktop/tests -v
 
 ## Notes
 
-- ESP32-S3 promiscuous scanning is 2.4 GHz only.
+- ESP32 scanning in this project is 2.4 GHz only.
 
 ## ESP8266 slave node firmware (for C6 master)
 
@@ -193,7 +201,7 @@ Current defaults in firmware:
 - C6 GPS UART:
   - TX: `GPIO10`
   - RX: `GPIO11`
-  - baud: `9600`
+  - boot baud: `9600` (firmware probes and may switch module to higher runtime baud)
 - 8266 node UART:
   - TX0 (`GPIO1`) -> C6 RX (`GPIO4`)
   - RX0 (`GPIO3`) <- C6 TX (`GPIO5`)
