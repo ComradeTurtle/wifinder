@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import com.espwigle.android.model.WigleCsvFormatter
 import com.espwigle.android.model.WigleWifiRow
@@ -17,6 +18,11 @@ import java.util.Date
 import java.util.Locale
 
 class WigleCsvLogger(private val context: Context) {
+  companion object {
+    private const val FLUSH_INTERVAL_MS = 750L
+    private const val FLUSH_BATCH_ROWS = 32
+  }
+
   private val fileNameFormat = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
 
   @Volatile
@@ -30,6 +36,12 @@ class WigleCsvLogger(private val context: Context) {
 
   @Volatile
   private var currentDisplayPath: String? = null
+
+  @Volatile
+  private var pendingRows: Int = 0
+
+  @Volatile
+  private var lastFlushMs: Long = 0L
 
   val isActive: Boolean
     get() = writer != null
@@ -122,6 +134,8 @@ class WigleCsvLogger(private val context: Context) {
     }
 
     writer = out
+    pendingRows = 0
+    lastFlushMs = SystemClock.elapsedRealtime()
     return CsvSessionInfo(displayPath = displayPath, uri = currentUri)
   }
 
@@ -130,7 +144,13 @@ class WigleCsvLogger(private val context: Context) {
     val out = writer ?: return
     out.write(WigleCsvFormatter.formatRow(row))
     out.newLine()
-    out.flush()
+    pendingRows += 1
+    val nowMs = SystemClock.elapsedRealtime()
+    if (pendingRows >= FLUSH_BATCH_ROWS || nowMs - lastFlushMs >= FLUSH_INTERVAL_MS) {
+      out.flush()
+      pendingRows = 0
+      lastFlushMs = nowMs
+    }
   }
 
   @Synchronized
@@ -138,6 +158,8 @@ class WigleCsvLogger(private val context: Context) {
     writer?.flush()
     writer?.close()
     writer = null
+    pendingRows = 0
+    lastFlushMs = 0L
     currentUri = null
     currentFile = null
     currentDisplayPath = null

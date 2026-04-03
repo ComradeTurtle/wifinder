@@ -46,6 +46,7 @@ class EspBleClient(
     private const val TARGET_DEVICE_NAME = "ESPWIGLE-C6"
     private const val TARGET_DEVICE_ADDRESS = "A0:85:E3:DB:04:92"
     private const val SCAN_TIMEOUT_MS = 12_000L
+    private const val TARGET_MTU = 247
   }
 
   private val appContext = context.applicationContext
@@ -329,7 +330,10 @@ class EspBleClient(
         if (newState == BluetoothGatt.STATE_CONNECTED) {
           listener.onInfo("Connected, discovering services...")
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            gatt.requestMtu(185)
+            if (!gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)) {
+              listener.onInfo("BLE connection priority request failed")
+            }
+            gatt.requestMtu(TARGET_MTU)
           }
           gatt.discoverServices()
         } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {

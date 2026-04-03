@@ -1,6 +1,7 @@
 package com.espwigle.android.model
 
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import org.junit.Test
 
@@ -259,6 +260,37 @@ class WgProtocolTest {
     assertEquals(0x88, payload[0].toInt() and 0xFF)
     assertEquals(0x11, payload[7].toInt() and 0xFF)
     assertEquals(77, payload[8].toInt() and 0xFF)
+  }
+
+  @Test
+  fun `decode replay batch payload unpacks records`() {
+    val payload =
+      byteArrayOf(
+        2, // count
+        3, 0, // len #1
+        0x11, 0x22, 0x33,
+        2, 0, // len #2
+        0x44, 0x55,
+      )
+
+    val records = WgProtocol.decodeReplayBatchPayload(payload)
+
+    assertEquals(2, records.size)
+    assertTrue(records[0].contentEquals(byteArrayOf(0x11, 0x22, 0x33)))
+    assertTrue(records[1].contentEquals(byteArrayOf(0x44, 0x55)))
+  }
+
+  @Test
+  fun `decode replay batch payload rejects malformed payload`() {
+    val truncatedRecord = byteArrayOf(1, 4, 0, 0x10, 0x20, 0x30)
+    val trailingBytes = byteArrayOf(1, 1, 0, 0x7F, 0x55)
+
+    assertFailsWith<IllegalArgumentException> {
+      WgProtocol.decodeReplayBatchPayload(truncatedRecord)
+    }
+    assertFailsWith<IllegalArgumentException> {
+      WgProtocol.decodeReplayBatchPayload(trailingBytes)
+    }
   }
 
   @Test

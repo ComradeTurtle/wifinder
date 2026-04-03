@@ -19,7 +19,8 @@ object WgProtocol {
     const val SNAPSHOT_END = 0x05
     const val CONFIG = 0x06
     const val GPS = 0x07
-    const val REPLAY_ACK = 0x08
+    const val REPLAY_BATCH = 0x08
+    const val REPLAY_ACK = REPLAY_BATCH
     const val NODE_TABLE = 0x09
     const val COMMAND = 0x81
   }
@@ -266,6 +267,25 @@ object WgProtocol {
       gpsUnixTimeS = gpsUnixTimeS,
       gpsAccuracyCm = gpsAccuracyCm,
     )
+  }
+
+  fun decodeReplayBatchPayload(payload: ByteArray): List<ByteArray> {
+    require(payload.isNotEmpty()) { "Bad replay batch payload" }
+    val count = payload[0].toInt() and 0xFF
+    require(count > 0) { "Empty replay batch payload" }
+    var offset = 1
+    val records = ArrayList<ByteArray>(count)
+    repeat(count) {
+      require(offset + 2 <= payload.size) { "Truncated replay batch header" }
+      val len = (payload[offset].toInt() and 0xFF) or ((payload[offset + 1].toInt() and 0xFF) shl 8)
+      offset += 2
+      require(len > 0) { "Replay batch record has zero length" }
+      require(offset + len <= payload.size) { "Truncated replay batch record" }
+      records += payload.copyOfRange(offset, offset + len)
+      offset += len
+    }
+    require(offset == payload.size) { "Replay batch payload has trailing bytes" }
+    return records
   }
 
   fun encodeGpsFixPayload(fix: GpsFix): ByteArray {

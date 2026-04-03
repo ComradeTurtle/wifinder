@@ -678,6 +678,7 @@ class ScannerService : Service(), EspBleClient.Listener {
       WgProtocol.MessageType.STATUS -> handleStatusFrame(frame.payload)
       WgProtocol.MessageType.GPS -> handleGpsFrame(frame.payload)
       WgProtocol.MessageType.SIGHTING -> handleSightingFrame(frame.payload)
+      WgProtocol.MessageType.REPLAY_BATCH -> handleReplayBatchFrame(frame.payload)
       WgProtocol.MessageType.ACK -> handleAckFrame(frame.payload)
       WgProtocol.MessageType.ERROR -> handleErrorFrame(frame.payload)
       WgProtocol.MessageType.SNAPSHOT_END -> appendLog("Snapshot complete")
@@ -856,6 +857,18 @@ class ScannerService : Service(), EspBleClient.Listener {
         maybeAppendCsvRow(sighting, next, now)
         publishSightingsLocked()
       }
+    }
+  }
+
+  private fun handleReplayBatchFrame(payload: ByteArray) {
+    val records: List<ByteArray> = try {
+      WgProtocol.decodeReplayBatchPayload(payload)
+    } catch (e: Exception) {
+      appendLog("Replay batch decode error: ${e.message}")
+      return
+    }
+    for (record in records) {
+      handleSightingFrame(record)
     }
   }
 

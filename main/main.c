@@ -71,6 +71,11 @@ extern void ble_store_config_init(void);
 #define WG_UNIQUE_BSSID_HASH_SLOTS 8192
 #define WG_SCAN_SEED_MAX_APS 128
 #define WG_BLE_PASSKEY 123456U
+#define WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD 170
+#define WG_BLE_CONN_ITVL_MIN_1P25MS 6
+#define WG_BLE_CONN_ITVL_MAX_1P25MS 12
+#define WG_BLE_CONN_LATENCY 0
+#define WG_BLE_CONN_SUPERVISION_TIMEOUT_10MS 400
 _Static_assert((WG_UNIQUE_BSSID_HASH_SLOTS & (WG_UNIQUE_BSSID_HASH_SLOTS - 1)) == 0,
                "WG_UNIQUE_BSSID_HASH_SLOTS must be power-of-two");
 
@@ -102,7 +107,11 @@ _Static_assert((WG_UNIQUE_BSSID_HASH_SLOTS & (WG_UNIQUE_BSSID_HASH_SLOTS - 1)) =
 #define WG_STORAGE_VERSION 1
 #define WG_STORAGE_BLOCK_FLUSH_MS 1200
 #define WG_STORAGE_RECORD_HDR_SIZE 2
-#define WG_STORAGE_REPLAY_BUDGET_PER_TICK 24
+#define WG_STORAGE_REPLAY_BUDGET_PER_TICK 4
+#define WG_REPLAY_TASK_INTERVAL_MS 20
+#define WG_REPLAY_BATCH_MAX_RECORDS 8
+#define WG_REPLAY_BATCH_HEADER_SIZE 1
+#define WG_REPLAY_BATCH_RECORD_HDR_SIZE 2
 #define WG_STORAGE_MIN_FREE_BYTES (WG_STORAGE_BLOCK_SIZE * 4)
 #define WG_STORAGE_PERSIST_MIN_STATIONARY_MS 30000
 #define WG_STORAGE_PERSIST_MIN_MOVING_MS 8000
@@ -284,6 +293,7 @@ static uint8_t s_boot_mode = WG_BOOT_MANUAL;
 static esp_timer_handle_t s_hop_timer = NULL;
 static bool s_hop_timer_started = false;
 static TaskHandle_t s_status_task = NULL;
+static TaskHandle_t s_replay_task = NULL;
 
 static int64_t s_rate_window_start_ms = 0;
 static uint32_t s_rate_packet_acc = 0;
@@ -404,9 +414,15 @@ static uint16_t s_replay_block_payload_pos = 0;
 static uint32_t s_replay_block_first_seq = 0;
 static bool s_replay_pending_valid = false;
 static uint8_t s_replay_pending_payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
+static uint8_t s_replay_pending_msg_type = WG_MSG_SIGHTING;
 static uint16_t s_replay_pending_len = 0;
 static uint64_t s_replay_pending_session_id = 0;
 static uint32_t s_replay_pending_seq = 0;
+static bool s_replay_prefetch_valid = false;
+static uint8_t s_replay_prefetch_payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
+static uint16_t s_replay_prefetch_len = 0;
+static uint64_t s_replay_prefetch_session_id = 0;
+static uint32_t s_replay_prefetch_seq = 0;
 
 #if CONFIG_WG_RGB_LED_ENABLE
 typedef struct {
@@ -517,6 +533,7 @@ static void storage_run_replay_tick(void);
 static void storage_set_replay_enabled(bool enabled);
 static bool storage_clear_sessions(void);
 static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len, uint8_t source_flags);
+static void request_fast_ble_conn_params(uint16_t conn_handle);
 
 static const struct ble_gatt_svc_def gatt_services[] = {
     {
@@ -1439,6 +1456,14 @@ static bool storage_replay_load_next_block_locked(void) {
   }
 }
 
+static void storage_clear_replay_pending_message_locked(void) {
+  s_replay_pending_valid = false;
+  s_replay_pending_msg_type = WG_MSG_SIGHTING;
+  s_replay_pending_len = 0;
+  s_replay_pending_session_id = 0;
+  s_replay_pending_seq = 0;
+}
+
 static void storage_reset_replay_locked(void) {
   if (s_replay_fp != NULL) {
     fclose(s_replay_fp);
@@ -1453,10 +1478,11 @@ static void storage_reset_replay_locked(void) {
   s_replay_block_payload_len = 0;
   s_replay_block_payload_pos = 0;
   s_replay_block_first_seq = 0;
-  s_replay_pending_valid = false;
-  s_replay_pending_len = 0;
-  s_replay_pending_session_id = 0;
-  s_replay_pending_seq = 0;
+  storage_clear_replay_pending_message_locked();
+  s_replay_prefetch_valid = false;
+  s_replay_prefetch_len = 0;
+  s_replay_prefetch_session_id = 0;
+  s_replay_prefetch_seq = 0;
 }
 
 static bool storage_select_next_replay_session_locked(uint64_t *session_id_out,
@@ -1599,6 +1625,126 @@ static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len
   return true;
 }
 
+static bool storage_prepare_replay_single_pending_locked(void) {
+  uint8_t payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
+  uint16_t payload_len = 0;
+  uint64_t session_id = 0;
+  uint32_t seq = 0;
+  if (s_replay_prefetch_valid) {
+    payload_len = s_replay_prefetch_len;
+    session_id = s_replay_prefetch_session_id;
+    seq = s_replay_prefetch_seq;
+    memcpy(payload, s_replay_prefetch_payload, payload_len);
+    s_replay_prefetch_valid = false;
+    s_replay_prefetch_len = 0;
+    s_replay_prefetch_session_id = 0;
+    s_replay_prefetch_seq = 0;
+  } else if (!storage_replay_fetch_next_locked(payload, &payload_len, &session_id, &seq)) {
+    return false;
+  }
+
+  if (payload_len == 0 || payload_len > sizeof(s_replay_pending_payload)) {
+    return false;
+  }
+  (void)storage_patch_sighting_source(payload, payload_len, WG_SIGHTING_SOURCE_REPLAY);
+  memcpy(s_replay_pending_payload, payload, payload_len);
+  s_replay_pending_msg_type = WG_MSG_SIGHTING;
+  s_replay_pending_len = payload_len;
+  s_replay_pending_session_id = session_id;
+  s_replay_pending_seq = seq;
+  s_replay_pending_valid = true;
+  return true;
+}
+
+static bool storage_prepare_replay_batch_pending_locked(void) {
+  uint8_t batch_payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
+  uint16_t max_batch_payload = WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD;
+  if (max_batch_payload > sizeof(batch_payload)) {
+    max_batch_payload = sizeof(batch_payload);
+  }
+  uint16_t pos = WG_REPLAY_BATCH_HEADER_SIZE;
+  uint8_t count = 0;
+  uint64_t last_session_id = 0;
+  uint32_t last_seq = 0;
+
+  while (count < WG_REPLAY_BATCH_MAX_RECORDS) {
+    uint8_t record_payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
+    uint16_t record_len = 0;
+    uint64_t session_id = 0;
+    uint32_t seq = 0;
+
+    if (s_replay_prefetch_valid) {
+      record_len = s_replay_prefetch_len;
+      session_id = s_replay_prefetch_session_id;
+      seq = s_replay_prefetch_seq;
+      memcpy(record_payload, s_replay_prefetch_payload, record_len);
+      s_replay_prefetch_valid = false;
+      s_replay_prefetch_len = 0;
+      s_replay_prefetch_session_id = 0;
+      s_replay_prefetch_seq = 0;
+    } else if (!storage_replay_fetch_next_locked(record_payload, &record_len, &session_id, &seq)) {
+      break;
+    }
+
+    if (record_len == 0 || record_len > sizeof(record_payload)) {
+      continue;
+    }
+    (void)storage_patch_sighting_source(record_payload, record_len, WG_SIGHTING_SOURCE_REPLAY);
+
+    size_t needed = (size_t)WG_REPLAY_BATCH_RECORD_HDR_SIZE + record_len;
+    if ((size_t)pos + needed > max_batch_payload) {
+      if (count == 0) {
+        memcpy(s_replay_pending_payload, record_payload, record_len);
+        s_replay_pending_msg_type = WG_MSG_SIGHTING;
+        s_replay_pending_len = record_len;
+        s_replay_pending_session_id = session_id;
+        s_replay_pending_seq = seq;
+        s_replay_pending_valid = true;
+        return true;
+      }
+      memcpy(s_replay_prefetch_payload, record_payload, record_len);
+      s_replay_prefetch_len = record_len;
+      s_replay_prefetch_session_id = session_id;
+      s_replay_prefetch_seq = seq;
+      s_replay_prefetch_valid = true;
+      break;
+    }
+
+    batch_payload[pos + 0] = (uint8_t)(record_len & 0xFF);
+    batch_payload[pos + 1] = (uint8_t)((record_len >> 8) & 0xFF);
+    memcpy(&batch_payload[pos + WG_REPLAY_BATCH_RECORD_HDR_SIZE], record_payload, record_len);
+    pos = (uint16_t)((size_t)pos + needed);
+    count++;
+    last_session_id = session_id;
+    last_seq = seq;
+  }
+
+  if (count == 0) {
+    return false;
+  }
+
+  batch_payload[0] = count;
+  memcpy(s_replay_pending_payload, batch_payload, pos);
+  s_replay_pending_msg_type = WG_MSG_REPLAY_BATCH;
+  s_replay_pending_len = pos;
+  s_replay_pending_session_id = last_session_id;
+  s_replay_pending_seq = last_seq;
+  s_replay_pending_valid = true;
+  return true;
+}
+
+static bool storage_prepare_replay_pending_locked(void) {
+  if (s_replay_pending_valid) {
+    return true;
+  }
+  if (s_sighting_notify_enabled && !s_host_serial_active) {
+    if (storage_prepare_replay_batch_pending_locked()) {
+      return true;
+    }
+  }
+  return storage_prepare_replay_single_pending_locked();
+}
+
 static void storage_run_replay_tick(void) {
   if (!s_storage_ready) {
     return;
@@ -1613,49 +1759,41 @@ static void storage_run_replay_tick(void) {
       break;
     }
     storage_maybe_start_replay_locked();
-    if (!s_replay_pending_valid) {
-      uint8_t payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
-      uint16_t payload_len = 0;
-      uint64_t session_id = 0;
-      uint32_t seq = 0;
-      if (!storage_replay_fetch_next_locked(payload, &payload_len, &session_id, &seq)) {
-        storage_unlock();
-        break;
-      }
-      if (payload_len == 0 || payload_len > sizeof(s_replay_pending_payload)) {
-        storage_unlock();
-        continue;
-      }
-      memcpy(s_replay_pending_payload, payload, payload_len);
-      s_replay_pending_len = payload_len;
-      s_replay_pending_session_id = session_id;
-      s_replay_pending_seq = seq;
-      s_replay_pending_valid = true;
+    if (!storage_prepare_replay_pending_locked()) {
+      storage_unlock();
+      break;
     }
+
     uint16_t payload_len = s_replay_pending_len;
-    storage_unlock();
-    if (payload_len == 0 || payload_len > sizeof(s_replay_pending_payload)) {
-      if (!storage_lock(pdMS_TO_TICKS(20))) {
-        return;
-      }
-      s_replay_pending_valid = false;
-      s_replay_pending_len = 0;
-      s_replay_pending_session_id = 0;
-      s_replay_pending_seq = 0;
+    uint8_t msg_type = s_replay_pending_msg_type;
+    bool send_ble = s_sighting_notify_enabled;
+    bool send_host = s_host_serial_active;
+    if (send_host && msg_type != WG_MSG_SIGHTING) {
+      storage_clear_replay_pending_message_locked();
       storage_unlock();
       continue;
     }
-    (void)storage_patch_sighting_source(s_replay_pending_payload, payload_len,
-                                        WG_SIGHTING_SOURCE_REPLAY);
-    bool sent = false;
-    if (s_sighting_notify_enabled) {
-      sent = ble_notify_framed(s_sighting_handle, WG_MSG_SIGHTING, s_replay_pending_payload,
-                               payload_len) ||
-             sent;
+    uint8_t payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
+    if (payload_len > 0 && payload_len <= sizeof(payload)) {
+      memcpy(payload, s_replay_pending_payload, payload_len);
     }
-    if (s_host_serial_active) {
-      sent = host_serial_notify_framed(WG_MSG_SIGHTING, s_replay_pending_payload, payload_len) ||
-             sent;
+    storage_unlock();
+
+    if (payload_len == 0 || payload_len > sizeof(payload)) {
+      if (!storage_lock(pdMS_TO_TICKS(20))) {
+        return;
+      }
+      storage_clear_replay_pending_message_locked();
+      storage_unlock();
+      continue;
+    }
+
+    bool sent = false;
+    if (send_ble) {
+      sent = ble_notify_framed(s_sighting_handle, msg_type, payload, payload_len) || sent;
+    }
+    if (send_host) {
+      sent = host_serial_notify_framed(msg_type, payload, payload_len) || sent;
     }
     if (!sent) {
       break;
@@ -1663,10 +1801,7 @@ static void storage_run_replay_tick(void) {
     if (!storage_lock(pdMS_TO_TICKS(20))) {
       return;
     }
-    s_replay_pending_valid = false;
-    s_replay_pending_len = 0;
-    s_replay_pending_session_id = 0;
-    s_replay_pending_seq = 0;
+    storage_clear_replay_pending_message_locked();
     storage_unlock();
   }
 }
@@ -1845,10 +1980,14 @@ static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq) 
   if (highest_seq <= manifest.last_seq_acked) {
     if (s_replay_pending_valid && s_replay_pending_session_id == session_id &&
         manifest.last_seq_acked >= s_replay_pending_seq) {
-      s_replay_pending_valid = false;
-      s_replay_pending_len = 0;
-      s_replay_pending_session_id = 0;
-      s_replay_pending_seq = 0;
+      storage_clear_replay_pending_message_locked();
+    }
+    if (s_replay_prefetch_valid && s_replay_prefetch_session_id == session_id &&
+        manifest.last_seq_acked >= s_replay_prefetch_seq) {
+      s_replay_prefetch_valid = false;
+      s_replay_prefetch_len = 0;
+      s_replay_prefetch_session_id = 0;
+      s_replay_prefetch_seq = 0;
     }
     storage_unlock();
     return true;
@@ -1870,10 +2009,14 @@ static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq) 
   }
   if (s_replay_pending_valid && s_replay_pending_session_id == session_id &&
       highest_seq >= s_replay_pending_seq) {
-    s_replay_pending_valid = false;
-    s_replay_pending_len = 0;
-    s_replay_pending_session_id = 0;
-    s_replay_pending_seq = 0;
+    storage_clear_replay_pending_message_locked();
+  }
+  if (s_replay_prefetch_valid && s_replay_prefetch_session_id == session_id &&
+      highest_seq >= s_replay_prefetch_seq) {
+    s_replay_prefetch_valid = false;
+    s_replay_prefetch_len = 0;
+    s_replay_prefetch_session_id = 0;
+    s_replay_prefetch_seq = 0;
   }
   storage_refresh_backlog_locked(manifest.records_acked >= manifest.records_written);
   storage_unlock();
@@ -3227,8 +3370,9 @@ static bool ble_notify_framed(uint16_t attr_handle, uint8_t type, const uint8_t 
     return false;
   }
 
-  uint8_t frame[WG_FRAME_HEADER_SIZE + 96];
-  if ((size_t)payload_len > sizeof(frame) - WG_FRAME_HEADER_SIZE) {
+  uint8_t frame[WG_FRAME_HEADER_SIZE + WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD];
+  if (payload_len > WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD ||
+      (size_t)payload_len > sizeof(frame) - WG_FRAME_HEADER_SIZE) {
     return false;
   }
 
@@ -4063,7 +4207,6 @@ static void status_tick_once(void) {
   rate_counter_tick(now_ms());
   (void)storage_flush_pending(false);
   storage_refresh_backlog(false);
-  storage_run_replay_tick();
   if (s_node_status.link_up && (now_ms() - s_node_status.last_rx_ms) > WG_NODE_STALE_MS) {
     s_node_status.link_up = false;
     ESP_LOGW(TAG, "node link stale (status tick)");
@@ -4078,6 +4221,14 @@ static void status_task(void *arg) {
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     status_tick_once();
+  }
+}
+
+static void replay_task(void *arg) {
+  (void)arg;
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(WG_REPLAY_TASK_INTERVAL_MS));
+    storage_run_replay_tick();
   }
 }
 
@@ -4489,6 +4640,19 @@ static void refresh_link_security_state(uint16_t conn_handle) {
            desc.sec_state.encrypted, desc.sec_state.authenticated, desc.sec_state.bonded);
 }
 
+static void request_fast_ble_conn_params(uint16_t conn_handle) {
+  struct ble_gap_upd_params params;
+  memset(&params, 0, sizeof(params));
+  params.itvl_min = WG_BLE_CONN_ITVL_MIN_1P25MS;
+  params.itvl_max = WG_BLE_CONN_ITVL_MAX_1P25MS;
+  params.latency = WG_BLE_CONN_LATENCY;
+  params.supervision_timeout = WG_BLE_CONN_SUPERVISION_TIMEOUT_10MS;
+  const int rc = ble_gap_update_params(conn_handle, &params);
+  if (rc != 0 && rc != BLE_HS_EALREADY) {
+    ESP_LOGW(TAG, "ble_gap_update_params failed rc=%d", rc);
+  }
+}
+
 static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
   (void)arg;
   switch (event->type) {
@@ -4497,6 +4661,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       if (event->connect.status == 0) {
         s_conn_handle = event->connect.conn_handle;
         refresh_link_security_state(s_conn_handle);
+        request_fast_ble_conn_params(s_conn_handle);
         led_sync_link_state();
         if (!s_ble_encrypted) {
           int rc = ble_gap_security_initiate(s_conn_handle);
@@ -4740,6 +4905,8 @@ static void init_timers(void) {
   };
   ESP_ERROR_CHECK(esp_timer_create(&hop_args, &s_hop_timer));
   BaseType_t rc = xTaskCreate(status_task, "wg_status", 6144, NULL, 4, &s_status_task);
+  ESP_ERROR_CHECK(rc == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+  rc = xTaskCreate(replay_task, "wg_replay", 4096, NULL, 5, &s_replay_task);
   ESP_ERROR_CHECK(rc == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
 
