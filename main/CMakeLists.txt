@@ -5,6 +5,7 @@ idf_component_register(
     "channel_plan.c"
     "wg_protocol.c"
     "wg_payload.c"
+    "ble_security_policy.c"
   INCLUDE_DIRS
     "."
   REQUIRES

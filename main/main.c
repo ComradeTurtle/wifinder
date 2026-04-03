@@ -48,6 +48,7 @@
 #include "soc/soc_caps.h"
 
 #include "channel_plan.h"
+#include "ble_security_policy.h"
 #include "sniffer_logic.h"
 #include "wg_payload.h"
 #include "wg_protocol.h"
@@ -536,6 +537,7 @@ static bool storage_clear_sessions(void);
 static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len, uint8_t source_flags);
 static void request_fast_ble_conn_params(uint16_t conn_handle);
 static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_tag);
+static void request_link_security(uint16_t conn_handle, const char *reason_tag);
 
 static const struct ble_gatt_svc_def gatt_services[] = {
     {
@@ -4549,12 +4551,14 @@ static int handle_gatt_read(uint16_t attr_handle, struct ble_gatt_access_ctxt *c
   return BLE_ATT_ERR_UNLIKELY;
 }
 
-static int handle_gatt_write(uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt) {
+static int handle_gatt_write(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt) {
   if (attr_handle != s_control_handle && attr_handle != s_config_handle) {
     return BLE_ATT_ERR_UNLIKELY;
   }
 
-  if (!s_ble_encrypted) {
+  if (wg_ble_should_request_security_on_protected_write(s_ble_encrypted)) {
+    request_link_security(conn_handle, "gatt_write");
     return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
   }
 
@@ -4584,7 +4588,7 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     case BLE_GATT_ACCESS_OP_READ_CHR:
       return handle_gatt_read(attr_handle, ctxt);
     case BLE_GATT_ACCESS_OP_WRITE_CHR:
-      return handle_gatt_write(attr_handle, ctxt);
+      return handle_gatt_write(conn_handle, attr_handle, ctxt);
     default:
       return BLE_ATT_ERR_UNLIKELY;
   }
@@ -4670,6 +4674,21 @@ static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_ta
   }
 }
 
+static void request_link_security(uint16_t conn_handle, const char *reason_tag) {
+  const int rc = ble_gap_security_initiate(conn_handle);
+  if (wg_ble_security_initiate_is_ok(rc)) {
+    ESP_LOGI(TAG, "%s: ble_gap_security_initiate requested/in-progress", reason_tag);
+    return;
+  }
+  if (wg_ble_security_initiate_is_busy(rc)) {
+    ESP_LOGW(TAG,
+             "%s: ble_gap_security_initiate busy; will retry on next secure operation",
+             reason_tag);
+    return;
+  }
+  ESP_LOGW(TAG, "%s: ble_gap_security_initiate failed rc=%d", reason_tag, rc);
+}
+
 static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
   (void)arg;
   switch (event->type) {
@@ -4682,10 +4701,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
         request_fast_ble_conn_params(s_conn_handle);
         led_sync_link_state();
         if (!s_ble_encrypted) {
-          int rc = ble_gap_security_initiate(s_conn_handle);
-          if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG, "ble_gap_security_initiate failed rc=%d", rc);
-          }
+          request_link_security(s_conn_handle, "connect");
         }
         notify_status_frame();
       } else {
@@ -4715,12 +4731,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
         if (!s_security_retry_attempted) {
           s_security_retry_attempted = true;
           clear_peer_bond_for_conn(event->enc_change.conn_handle, "enc_change");
-          int retry_rc = ble_gap_security_initiate(event->enc_change.conn_handle);
-          if (retry_rc != 0 && retry_rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG, "ble_gap_security_initiate retry failed rc=%d", retry_rc);
-          } else {
-            ESP_LOGW(TAG, "ble_gap_security_initiate retry requested");
-          }
+          request_link_security(event->enc_change.conn_handle, "enc_change_retry");
         }
       }
       led_sync_link_state();
@@ -4759,6 +4770,9 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
         s_gps_notify_enabled = s_status_notify_enabled;
       } else if (event->subscribe.attr_handle == s_sighting_handle) {
         s_sighting_notify_enabled = event->subscribe.cur_notify;
+      }
+      if (wg_ble_should_request_security_on_subscribe(event->subscribe.cur_notify, s_ble_encrypted)) {
+        request_link_security(event->subscribe.conn_handle, "subscribe");
       }
       return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
