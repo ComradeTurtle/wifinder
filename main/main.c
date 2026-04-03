@@ -363,6 +363,7 @@ static bool s_ble_encrypted = false;
 static bool s_status_notify_enabled = false;
 static bool s_sighting_notify_enabled = false;
 static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
+static bool s_security_retry_attempted = false;
 
 static uint16_t s_control_handle;
 static uint16_t s_status_handle;
@@ -534,6 +535,7 @@ static void storage_set_replay_enabled(bool enabled);
 static bool storage_clear_sessions(void);
 static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len, uint8_t source_flags);
 static void request_fast_ble_conn_params(uint16_t conn_handle);
+static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_tag);
 
 static const struct ble_gatt_svc_def gatt_services[] = {
     {
@@ -4653,6 +4655,21 @@ static void request_fast_ble_conn_params(uint16_t conn_handle) {
   }
 }
 
+static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_tag) {
+  struct ble_gap_conn_desc desc;
+  const int rc = ble_gap_conn_find(conn_handle, &desc);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "%s: ble_gap_conn_find failed rc=%d", reason_tag, rc);
+    return;
+  }
+  const int del_rc = ble_store_util_delete_peer(&desc.peer_id_addr);
+  if (del_rc != 0) {
+    ESP_LOGW(TAG, "%s: ble_store_util_delete_peer failed rc=%d", reason_tag, del_rc);
+  } else {
+    ESP_LOGW(TAG, "%s: deleted peer bond", reason_tag);
+  }
+}
+
 static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
   (void)arg;
   switch (event->type) {
@@ -4660,6 +4677,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       ESP_LOGI(TAG, "BLE connect event status=%d", event->connect.status);
       if (event->connect.status == 0) {
         s_conn_handle = event->connect.conn_handle;
+        s_security_retry_attempted = false;
         refresh_link_security_state(s_conn_handle);
         request_fast_ble_conn_params(s_conn_handle);
         led_sync_link_state();
@@ -4679,6 +4697,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       ESP_LOGI(TAG, "BLE disconnect reason=%d", event->disconnect.reason);
       s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
       s_ble_encrypted = false;
+      s_security_retry_attempted = false;
       s_status_notify_enabled = false;
       s_gps_notify_enabled = false;
       s_sighting_notify_enabled = false;
@@ -4690,8 +4709,19 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       ESP_LOGI(TAG, "BLE encryption change status=%d", event->enc_change.status);
       if (event->enc_change.status == 0) {
         refresh_link_security_state(event->enc_change.conn_handle);
+        s_security_retry_attempted = false;
       } else {
         s_ble_encrypted = false;
+        if (!s_security_retry_attempted) {
+          s_security_retry_attempted = true;
+          clear_peer_bond_for_conn(event->enc_change.conn_handle, "enc_change");
+          int retry_rc = ble_gap_security_initiate(event->enc_change.conn_handle);
+          if (retry_rc != 0 && retry_rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "ble_gap_security_initiate retry failed rc=%d", retry_rc);
+          } else {
+            ESP_LOGW(TAG, "ble_gap_security_initiate retry requested");
+          }
+        }
       }
       led_sync_link_state();
       notify_status_frame();
@@ -4732,18 +4762,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       }
       return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
-      struct ble_gap_conn_desc desc;
-      int rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
-      if (rc == 0) {
-        const int del_rc = ble_store_util_delete_peer(&desc.peer_id_addr);
-        if (del_rc != 0) {
-          ESP_LOGW(TAG, "ble_store_util_delete_peer failed rc=%d", del_rc);
-        } else {
-          ESP_LOGW(TAG, "Deleted stale peer bond and retrying pairing");
-        }
-      } else {
-        ESP_LOGW(TAG, "ble_gap_conn_find repeat_pairing failed rc=%d", rc);
-      }
+      clear_peer_bond_for_conn(event->repeat_pairing.conn_handle, "repeat_pairing");
       return BLE_GAP_REPEAT_PAIRING_RETRY;
     }
     case BLE_GAP_EVENT_ADV_COMPLETE:

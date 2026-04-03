@@ -271,6 +271,20 @@ class EspBleClient(
   }
 
   @SuppressLint("MissingPermission")
+  private fun maybeRequestBond(device: BluetoothDevice) {
+    when (device.bondState) {
+      BluetoothDevice.BOND_NONE -> {
+        val started = device.createBond()
+        listener.onInfo(
+          if (started) "Bonding requested" else "Bonding request not started"
+        )
+      }
+      BluetoothDevice.BOND_BONDING -> listener.onInfo("Bonding in progress")
+      else -> {}
+    }
+  }
+
+  @SuppressLint("MissingPermission")
   private fun writeCharacteristicNoResponse(
     targetGatt: BluetoothGatt,
     characteristic: BluetoothGattCharacteristic,
@@ -329,6 +343,7 @@ class EspBleClient(
 
         if (newState == BluetoothGatt.STATE_CONNECTED) {
           listener.onInfo("Connected, discovering services...")
+          maybeRequestBond(gatt.device)
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             if (!gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)) {
               listener.onInfo("BLE connection priority request failed")
