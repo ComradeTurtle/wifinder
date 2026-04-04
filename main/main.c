@@ -5248,6 +5248,18 @@ static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_ta
   }
 }
 
+static void log_ble_store_counts(const char *tag) {
+  int peer_sec = 0;
+  int our_sec = 0;
+  int cccd = 0;
+  const int peer_rc = ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &peer_sec);
+  const int our_rc = ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &our_sec);
+  const int cccd_rc = ble_store_util_count(BLE_STORE_OBJ_TYPE_CCCD, &cccd);
+  ESP_LOGI(TAG,
+           "%s: ble_store counts peer_sec=%d(rc=%d) our_sec=%d(rc=%d) cccd=%d(rc=%d)",
+           tag, peer_sec, peer_rc, our_sec, our_rc, cccd, cccd_rc);
+}
+
 static void request_link_security(uint16_t conn_handle, const char *reason_tag) {
   const int rc = ble_gap_security_initiate(conn_handle);
   if (wg_ble_security_initiate_is_ok(rc)) {
@@ -5271,11 +5283,12 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       if (event->connect.status == 0) {
         s_conn_handle = event->connect.conn_handle;
         s_security_retry_attempted = false;
+        log_ble_store_counts("connect");
         refresh_link_security_state(s_conn_handle);
         request_fast_ble_conn_params(s_conn_handle);
         led_sync_link_state();
         if (!s_ble_encrypted) {
-          request_link_security(s_conn_handle, "connect");
+          ESP_LOGI(TAG, "connect: deferring security initiation until subscribe/write");
         }
         notify_status_frame();
       } else {
@@ -5305,8 +5318,16 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
         s_ble_encrypted = false;
         if (!s_security_retry_attempted) {
           s_security_retry_attempted = true;
-          clear_peer_bond_for_conn(event->enc_change.conn_handle, "enc_change");
-          request_link_security(event->enc_change.conn_handle, "enc_change_retry");
+          if (wg_ble_enc_change_status_should_drop_bond(event->enc_change.status)) {
+            clear_peer_bond_for_conn(event->enc_change.conn_handle, "enc_change");
+          } else {
+            ESP_LOGW(TAG, "enc_change: keeping peer bond status=%d", event->enc_change.status);
+          }
+          if (wg_ble_enc_change_status_should_retry(event->enc_change.status)) {
+            request_link_security(event->enc_change.conn_handle, "enc_change_retry");
+          } else {
+            ESP_LOGW(TAG, "enc_change: not retrying security status=%d", event->enc_change.status);
+          }
         }
       }
       led_sync_link_state();
@@ -5346,8 +5367,11 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       } else if (event->subscribe.attr_handle == s_sighting_handle) {
         s_sighting_notify_enabled = event->subscribe.cur_notify;
       }
-      if (wg_ble_should_request_security_on_subscribe(event->subscribe.cur_notify, s_ble_encrypted)) {
+      if (wg_ble_should_request_security_on_subscribe(event->subscribe.cur_notify,
+                                                      s_ble_encrypted)) {
         request_link_security(event->subscribe.conn_handle, "subscribe");
+      } else if (event->subscribe.cur_notify && !s_ble_encrypted) {
+        ESP_LOGI(TAG, "subscribe: security deferred until protected write");
       }
       return 0;
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
@@ -5403,9 +5427,9 @@ static void init_ble(void) {
   ble_hs_cfg.sync_cb = ble_on_sync;
   ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
   ble_hs_cfg.sm_bonding = 1;
-  ble_hs_cfg.sm_mitm = 1;
+  ble_hs_cfg.sm_mitm = 0;
   ble_hs_cfg.sm_sc = 1;
-  ble_hs_cfg.sm_io_cap = BLE_HS_IO_DISPLAY_ONLY;
+  ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
   ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
   ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
@@ -5417,6 +5441,7 @@ static void init_ble(void) {
   ble_gatts_add_svcs(gatt_services);
 
   ble_store_config_init();
+  log_ble_store_counts("init_ble");
   nimble_port_freertos_init(ble_host_task);
 }
 
