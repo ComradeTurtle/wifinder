@@ -141,6 +141,9 @@ class ScannerService : Service(), EspBleClient.Listener {
     private const val BLOB_BLOCK_VERSION = 1
     private const val BLOB_BLOCK_HEADER_SIZE = 28
     private const val BLOB_RECORD_HEADER_SIZE = 2
+    private const val DEBUG_SEED_TARGET_BYTES = 768 * 1024
+    private const val DEBUG_SEED_MIN_BYTES = 512 * 1024
+    private const val DEBUG_SEED_MAX_BYTES = 1024 * 1024
 
     internal fun normalizeGpsNavMode(mode: Int): Int = when (mode) {
       0, 1, 2, 4 -> mode
@@ -464,6 +467,27 @@ class ScannerService : Service(), EspBleClient.Listener {
     gpsTracker.start()
     appendLog("Phone GPS streaming started")
     return true
+  }
+
+  fun seedDebugBacklog(targetBytes: Int = DEBUG_SEED_TARGET_BYTES): Boolean {
+    if (!controlLinkReady("Seed synthetic backlog")) return false
+    if (_state.value.scanning) {
+      appendLog("Synthetic backlog seed blocked: stop scan first")
+      return false
+    }
+    if (_state.value.downloadBacklogActive) {
+      appendLog("Synthetic backlog seed blocked: stop backlog download first")
+      return false
+    }
+    val clamped = targetBytes.coerceIn(DEBUG_SEED_MIN_BYTES, DEBUG_SEED_MAX_BYTES)
+    val ok = bleClient.seedDebugStorage(clamped)
+    if (ok) {
+      appendLog("Synthetic backlog seed requested (${clamped / 1024} KB)")
+      bleClient.requestStatus()
+    } else {
+      appendLog("Synthetic backlog seed command failed")
+    }
+    return ok
   }
 
   fun downloadBacklogToCsv(): Boolean {

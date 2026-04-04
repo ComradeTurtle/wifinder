@@ -112,6 +112,7 @@ class MainActivity : ComponentActivity() {
           onStartLogging = viewModel::startLogging,
           onStopLogging = viewModel::stopLogging,
           onDownloadBacklog = viewModel::downloadBacklog,
+          onSeedDebugBacklog = viewModel::seedDebugBacklog,
           onPushPhoneGpsNow = viewModel::pushPhoneGpsNow,
           onToggleSection = viewModel::toggleSection,
         )
@@ -258,6 +259,7 @@ private fun EspWigleScreen(
   onStartLogging: () -> Unit,
   onStopLogging: () -> Unit,
   onDownloadBacklog: () -> Unit,
+  onSeedDebugBacklog: () -> Unit,
   onPushPhoneGpsNow: () -> Unit,
   onToggleSection: (String) -> Unit,
 ) {
@@ -342,6 +344,7 @@ private fun EspWigleScreen(
             onStartLogging = onStartLogging,
             onStopLogging = onStopLogging,
             onDownloadBacklog = onDownloadBacklog,
+            onSeedDebugBacklog = onSeedDebugBacklog,
             onPushPhoneGpsNow = onPushPhoneGpsNow,
           )
         }
@@ -601,6 +604,7 @@ private fun QuickActions(
   onStartLogging: () -> Unit,
   onStopLogging: () -> Unit,
   onDownloadBacklog: () -> Unit,
+  onSeedDebugBacklog: () -> Unit,
   onPushPhoneGpsNow: () -> Unit,
 ) {
   Card(
@@ -664,6 +668,17 @@ private fun QuickActions(
         } else {
           CompactButton(label = "Start CSV", primary = true, modifier = Modifier.weight(1f), onClick = onStartLogging)
         }
+      }
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+      ) {
+        CompactButton(
+          label = "Dev Seed ~768KB",
+          primary = false,
+          modifier = Modifier.weight(1f),
+          onClick = onSeedDebugBacklog,
+        )
       }
     }
   }

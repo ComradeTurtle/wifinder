@@ -149,6 +149,12 @@ class EspBleClient(
       WgProtocol.encodeBacklogBlobTogglePayload(enabled),
     )
 
+  fun seedDebugStorage(targetBytes: Int): Boolean =
+    sendCommand(
+      WgProtocol.Command.DEBUG_SEED_STORAGE,
+      WgProtocol.encodeDebugSeedStoragePayload(targetBytes),
+    )
+
   fun clearStorageSessions(): Boolean = sendCommand(WgProtocol.Command.CLEAR_STORAGE)
 
   fun setGpsNavRateMode(mode: Int): Boolean =

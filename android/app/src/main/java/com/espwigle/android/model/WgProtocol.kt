@@ -42,6 +42,7 @@ object WgProtocol {
     const val CLEAR_STORAGE = 0x0B
     const val SET_GPS_NAV_RATE = 0x0C
     const val SET_BACKLOG_BLOB = 0x0D
+    const val DEBUG_SEED_STORAGE = 0x0E
   }
 
   const val GPS_FLAG_VALID = 1 shl 0
@@ -337,6 +338,13 @@ object WgProtocol {
 
   fun encodeBacklogBlobTogglePayload(enabled: Boolean): ByteArray =
     byteArrayOf(if (enabled) 1 else 0)
+
+  fun encodeDebugSeedStoragePayload(targetBytes: Int): ByteArray {
+    val out = ByteArray(4)
+    val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+    bb.putInt(targetBytes.coerceAtLeast(0))
+    return out
+  }
 
   fun decodeBacklogBlobMetaPayload(payload: ByteArray): BacklogBlobMetaPayload {
     require(payload.size >= 20) { "Bad backlog blob meta payload" }

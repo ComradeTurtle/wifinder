@@ -197,6 +197,19 @@ static void test_set_backlog_blob_command_decode(void) {
   assert_true(cmd.backlog_blob_enable == 1, "set backlog blob enable should decode");
 }
 
+static void test_debug_seed_storage_command_decode(void) {
+  uint8_t payload[] = {
+      WG_CMD_DEBUG_SEED_STORAGE,
+      0x00, 0x00, 0x0C, 0x00,  // 786432 bytes
+  };
+
+  wg_command_t cmd = {0};
+  assert_true(wg_command_decode(payload, sizeof(payload), &cmd) == WG_OK,
+              "debug seed storage command decode should succeed");
+  assert_true(cmd.id == WG_CMD_DEBUG_SEED_STORAGE, "debug seed storage command id should match");
+  assert_u32(cmd.debug_seed_target_bytes, 786432U, "debug seed storage target bytes should decode");
+}
+
 int main(void) {
   test_frame_roundtrip();
   test_command_decode();
@@ -208,6 +221,7 @@ int main(void) {
   test_set_replay_command_bad_length();
   test_clear_storage_command_decode();
   test_set_backlog_blob_command_decode();
+  test_debug_seed_storage_command_decode();
   printf("PASS: %d tests\n", tests_run);
   return 0;
 }

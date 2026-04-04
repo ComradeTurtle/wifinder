@@ -353,6 +353,17 @@ class WgProtocolTest {
   }
 
   @Test
+  fun `encode debug seed storage payload packs little endian bytes`() {
+    val payload = WgProtocol.encodeDebugSeedStoragePayload(786432)
+
+    assertEquals(4, payload.size)
+    assertEquals(0x00, payload[0].toInt() and 0xFF)
+    assertEquals(0x00, payload[1].toInt() and 0xFF)
+    assertEquals(0x0C, payload[2].toInt() and 0xFF)
+    assertEquals(0x00, payload[3].toInt() and 0xFF)
+  }
+
+  @Test
   fun `decode backlog blob meta payload parses fields`() {
     val payload = ByteArray(20)
     val sessionId = 0x1122334455667788L

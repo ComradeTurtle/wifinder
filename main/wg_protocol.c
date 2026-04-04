@@ -105,6 +105,7 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
   out->replay_enable = 0;
   out->gps_nav_mode = 0;
   out->backlog_blob_enable = 0;
+  out->debug_seed_target_bytes = 0;
 
   switch (out->id) {
     case WG_CMD_START:
@@ -171,6 +172,12 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
         return WG_ERR_INVALID_FRAME;
       }
       out->backlog_blob_enable = payload[1];
+      return WG_OK;
+    case WG_CMD_DEBUG_SEED_STORAGE:
+      if (payload_len != (size_t)(1 + WG_DEBUG_SEED_STORAGE_PAYLOAD_SIZE)) {
+        return WG_ERR_INVALID_FRAME;
+      }
+      out->debug_seed_target_bytes = rd_u32(&payload[1]);
       return WG_OK;
     default:
       return WG_ERR_UNSUPPORTED;

@@ -223,6 +223,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
   fun startLogging() { service?.startLogging() }
   fun stopLogging() { service?.stopLogging() }
   fun downloadBacklog() { service?.downloadBacklogToCsv() }
+  fun seedDebugBacklog() { service?.seedDebugBacklog() }
   fun pushPhoneGpsNow() { service?.pushPhoneGpsNow() }
 
   // ── State merging ─────────────────────────────────────────
