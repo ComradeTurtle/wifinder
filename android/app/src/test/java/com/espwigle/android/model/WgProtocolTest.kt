@@ -7,8 +7,8 @@ import org.junit.Test
 
 class WgProtocolTest {
   @Test
-  fun `decode status payload parses gps fields`() {
-    val payload = ByteArray(57)
+  fun `decode status payload parses gps fields and extended storage stats`() {
+    val payload = ByteArray(91)
     payload[0] = 1
     payload[1] = 1
     payload[2] = 11
@@ -51,6 +51,32 @@ class WgProtocolTest {
     payload[51] = 1
     payload[52] = 0x07
     payload[56] = 2
+    payload[57] = 0xA0.toByte()
+    payload[58] = 0x86.toByte()
+    payload[59] = 0x01
+    payload[60] = 0x00
+    payload[61] = 2
+    payload[62] = 0x00
+    payload[63] = 0x00
+    payload[64] = 0x80.toByte()
+    payload[65] = 0x00
+    payload[66] = 0x00
+    payload[67] = 0x00
+    payload[68] = 0x30
+    payload[69] = 0x00
+    payload[70] = 0x00
+    payload[71] = 0x00
+    payload[72] = 0x50
+    payload[73] = 0x00
+    payload[74] = 1
+    val blobSessionId = 0x0102030405060708L
+    for (i in 0 until 8) {
+      payload[75 + i] = ((blobSessionId ushr (8 * i)) and 0xFF).toByte()
+    }
+    payload[83] = 0x00
+    payload[84] = 0x10
+    payload[87] = 0x00
+    payload[88] = 0x20
 
     val status = WgProtocol.decodeStatusPayload(payload)
 
@@ -59,7 +85,7 @@ class WgProtocolTest {
     assertEquals(11, status.currentChannel)
     assertEquals(250, status.hopMs)
     assertEquals(0x1FFF, status.channelMask)
-    assertEquals(0x1234, status.uniqueBssids)
+    assertEquals(100000, status.uniqueBssids)
     assertEquals(86, status.packetsPerSec)
     assertEquals(1, status.droppedNotifies)
     assertEquals(1, status.bootMode)
@@ -81,6 +107,28 @@ class WgProtocolTest {
     assertTrue(status.queueFull)
     assertEquals(7L, status.droppedFlashFull)
     assertEquals(2, status.nodeCount)
+    assertEquals(2, status.gpsNavAppliedHz)
+    assertEquals(8L * 1024L * 1024L, status.spiffsTotalBytes)
+    assertEquals(3L * 1024L * 1024L, status.spiffsUsedBytes)
+    assertEquals(5L * 1024L * 1024L, status.spiffsFreeBytes)
+    assertTrue(status.blobActive)
+    assertEquals(blobSessionId, status.blobSessionId)
+    assertEquals(4096L, status.blobBytesSent)
+    assertEquals(8192L, status.blobBytesTotal)
+  }
+
+  @Test
+  fun `decode status payload keeps legacy unique counter when extension missing`() {
+    val payload = ByteArray(57)
+    payload[7] = 0x34
+    payload[8] = 0x12
+
+    val status = WgProtocol.decodeStatusPayload(payload)
+
+    assertEquals(0x1234, status.uniqueBssids)
+    assertEquals(0, status.gpsNavAppliedHz)
+    assertEquals(0L, status.spiffsFreeBytes)
+    assertEquals(false, status.blobActive)
   }
 
   @Test
@@ -302,5 +350,80 @@ class WgProtocolTest {
     assertEquals(1, enabled[0].toInt() and 0xFF)
     assertEquals(1, disabled.size)
     assertEquals(0, disabled[0].toInt() and 0xFF)
+  }
+
+  @Test
+  fun `decode backlog blob meta payload parses fields`() {
+    val payload = ByteArray(20)
+    val sessionId = 0x1122334455667788L
+    for (i in 0 until 8) {
+      payload[i] = ((sessionId ushr (8 * i)) and 0xFF).toByte()
+    }
+    payload[8] = 0x00
+    payload[9] = 0x04
+    payload[10] = 0x00
+    payload[11] = 0x00
+    payload[12] = 0x10
+    payload[13] = 0x00
+    payload[14] = 0x00
+    payload[15] = 0x00
+    payload[16] = 0x40
+    payload[17] = 0x00
+    payload[18] = 0x00
+    payload[19] = 0x00
+
+    val meta = WgProtocol.decodeBacklogBlobMetaPayload(payload)
+
+    assertEquals(sessionId, meta.sessionId)
+    assertEquals(1024L, meta.totalBytes)
+    assertEquals(16L, meta.ackedSeq)
+    assertEquals(64L, meta.writtenSeq)
+  }
+
+  @Test
+  fun `decode backlog blob chunk payload parses header and data`() {
+    val payload = ByteArray(8 + 4 + 2 + 3)
+    val sessionId = 0x1020304050607080L
+    for (i in 0 until 8) {
+      payload[i] = ((sessionId ushr (8 * i)) and 0xFF).toByte()
+    }
+    payload[8] = 0x2A
+    payload[9] = 0x00
+    payload[10] = 0x00
+    payload[11] = 0x00
+    payload[12] = 0x03
+    payload[13] = 0x00
+    payload[14] = 0x11
+    payload[15] = 0x22
+    payload[16] = 0x33
+
+    val chunk = WgProtocol.decodeBacklogBlobChunkPayload(payload)
+
+    assertEquals(sessionId, chunk.sessionId)
+    assertEquals(42L, chunk.offset)
+    assertTrue(chunk.data.contentEquals(byteArrayOf(0x11, 0x22, 0x33)))
+  }
+
+  @Test
+  fun `decode backlog blob done payload parses summary`() {
+    val payload = ByteArray(16)
+    val sessionId = 0x0102030405060708L
+    for (i in 0 until 8) {
+      payload[i] = ((sessionId ushr (8 * i)) and 0xFF).toByte()
+    }
+    payload[8] = 0x00
+    payload[9] = 0x04
+    payload[10] = 0x00
+    payload[11] = 0x00
+    payload[12] = 0x7F
+    payload[13] = 0x00
+    payload[14] = 0x00
+    payload[15] = 0x00
+
+    val done = WgProtocol.decodeBacklogBlobDonePayload(payload)
+
+    assertEquals(sessionId, done.sessionId)
+    assertEquals(1024L, done.totalBytes)
+    assertEquals(127L, done.writtenSeq)
   }
 }

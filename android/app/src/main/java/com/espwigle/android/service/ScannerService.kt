@@ -15,16 +15,27 @@ import com.espwigle.android.gps.GpsTracker
 import com.espwigle.android.logging.WigleCsvLogger
 import com.espwigle.android.model.EspGpsPayload
 import com.espwigle.android.model.GpsFix
+import com.espwigle.android.model.BacklogBlobChunkPayload
+import com.espwigle.android.model.BacklogBlobDonePayload
+import com.espwigle.android.model.BacklogBlobMetaPayload
 import com.espwigle.android.model.SightingPayload
 import com.espwigle.android.model.StatusPayload
 import com.espwigle.android.model.WgFrame
 import com.espwigle.android.model.WgProtocol
 import com.espwigle.android.model.WigleWifiRow
 import com.espwigle.android.ui.SightingUi
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TreeSet
+import java.util.zip.CRC32
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
@@ -85,6 +96,14 @@ data class ServiceState(
   val autoHopBaseMs: Int = 250,
   val autoHopAppliedMs: Int = 250,
   val gpsNavMode: Int = 0,
+  val gpsNavAppliedHz: Int = 0,
+  val spiffsTotalBytes: Long = 0L,
+  val spiffsUsedBytes: Long = 0L,
+  val spiffsFreeBytes: Long = 0L,
+  val blobActive: Boolean = false,
+  val blobSessionId: Long = 0L,
+  val blobBytesSent: Long = 0L,
+  val blobBytesTotal: Long = 0L,
   val phoneGpsPushActive: Boolean = false,
   val downloadBacklogActive: Boolean = false,
   val loggingEnabled: Boolean = false,
@@ -117,6 +136,11 @@ class ScannerService : Service(), EspBleClient.Listener {
     private const val PREF_AUTO_HOP_ENABLED = "auto_hop_enabled"
     private const val PREF_AUTO_HOP_BASE_MS = "auto_hop_base_ms"
     private const val PREF_GPS_NAV_MODE = "gps_nav_mode"
+    private const val BLOB_BLOCK_SIZE = 1024
+    private const val BLOB_BLOCK_MAGIC = 0x314B4257L
+    private const val BLOB_BLOCK_VERSION = 1
+    private const val BLOB_BLOCK_HEADER_SIZE = 28
+    private const val BLOB_RECORD_HEADER_SIZE = 2
 
     internal fun normalizeGpsNavMode(mode: Int): Int = when (mode) {
       0, 1, 2, 4 -> mode
@@ -148,6 +172,21 @@ class ScannerService : Service(), EspBleClient.Listener {
     var lastSent: Long = 0L,
     var lastSentMs: Long = 0L,
     val gaps: TreeSet<Long> = TreeSet(),
+  )
+
+  private data class BacklogBlobReceiver(
+    val sessionId: Long,
+    val totalBytes: Long,
+    val writtenSeq: Long,
+    val file: File,
+    val out: BufferedOutputStream,
+    var receivedBytes: Long = 0L,
+  )
+
+  private data class BacklogImportResult(
+    val records: Int,
+    val highestSeq: Long,
+    val badBlocks: Int,
   )
 
   inner class LocalBinder : Binder() {
@@ -188,6 +227,7 @@ class ScannerService : Service(), EspBleClient.Listener {
   @Volatile private var phoneGpsPushActive: Boolean = false
   @Volatile private var downloadBacklogAutoStop: Boolean = false
   @Volatile private var visibleTimeoutSec: Int = 25
+  @Volatile private var backlogBlobRx: BacklogBlobReceiver? = null
 
   override fun onCreate() {
     super.onCreate()
@@ -205,7 +245,9 @@ class ScannerService : Service(), EspBleClient.Listener {
     // Periodic sighting pruning + age refresh + notification update
     scope.launch {
       while (isActive) {
-        delay(1000L)
+        val snapshot = _state.value
+        val idle = !snapshot.connected && snapshot.sightings.isEmpty() && !snapshot.downloadBacklogActive
+        delay(if (idle) 3000L else 1000L)
         pruneSightingsAndRefreshAges()
       }
     }
@@ -260,6 +302,7 @@ class ScannerService : Service(), EspBleClient.Listener {
     super.onDestroy()
     scope.cancel()
     try { bleClient.sendGpsClear() } catch (_: Exception) {}
+    resetBacklogBlobReceiver(discardFile = true)
     bleClient.disconnect()
     gpsTracker.stop()
     csvLogger.stopSession()
@@ -305,11 +348,12 @@ class ScannerService : Service(), EspBleClient.Listener {
   fun doDisconnect() {
     phoneGpsPushActive = false
     if (controlLinkReadySilent()) {
-      bleClient.setReplayEnabled(false)
+      bleClient.setBacklogBlobEnabled(false)
     }
     val shouldAutoStopCsv = downloadBacklogAutoStop
     downloadBacklogAutoStop = false
     bleClient.sendGpsClear()
+    resetBacklogBlobReceiver(discardFile = true)
     bleClient.disconnect()
     gpsTracker.stop()
     synchronized(ackLock) {
@@ -391,6 +435,13 @@ class ScannerService : Service(), EspBleClient.Listener {
         replayActive = false,
         replayCursor = 0L,
         queueFull = false,
+        spiffsTotalBytes = 0L,
+        spiffsUsedBytes = 0L,
+        spiffsFreeBytes = 0L,
+        blobActive = false,
+        blobSessionId = 0L,
+        blobBytesSent = 0L,
+        blobBytesTotal = 0L,
       )
     }
     appendLog("ESP storage clear requested")
@@ -422,11 +473,12 @@ class ScannerService : Service(), EspBleClient.Listener {
       return false
     }
     if (_state.value.downloadBacklogActive) {
-      val ok = bleClient.setReplayEnabled(false)
+      val ok = bleClient.setBacklogBlobEnabled(false)
       if (!ok) {
         appendLog("Backlog stop command failed")
         return false
       }
+      resetBacklogBlobReceiver(discardFile = true)
       _state.update { it.copy(downloadBacklogActive = false) }
       appendLog("Backlog download stopped")
       val shouldAutoStopCsv = downloadBacklogAutoStop
@@ -443,8 +495,8 @@ class ScannerService : Service(), EspBleClient.Listener {
     synchronized(ackLock) {
       sessionAcks.clear()
     }
-    val okReplay = bleClient.setReplayEnabled(true)
-    if (!okReplay) {
+    val okBlob = bleClient.setBacklogBlobEnabled(true)
+    if (!okBlob) {
       _state.update { it.copy(downloadBacklogActive = false) }
       appendLog("Backlog download request failed")
       if (downloadBacklogAutoStop && csvLogger.isActive) {
@@ -631,6 +683,7 @@ class ScannerService : Service(), EspBleClient.Listener {
       synchronized(ackLock) {
         sessionAcks.clear()
       }
+      resetBacklogBlobReceiver(discardFile = true)
       val shouldAutoStopCsv = downloadBacklogAutoStop
       downloadBacklogAutoStop = false
       if (shouldAutoStopCsv && csvLogger.isActive) {
@@ -665,6 +718,14 @@ class ScannerService : Service(), EspBleClient.Listener {
         queueFull = if (!connected) false else current.queueFull,
         droppedFlashFull = if (!connected) 0L else current.droppedFlashFull,
         nodeCount = if (!connected) 0 else current.nodeCount,
+        gpsNavAppliedHz = if (!connected) 0 else current.gpsNavAppliedHz,
+        spiffsTotalBytes = if (!connected) 0L else current.spiffsTotalBytes,
+        spiffsUsedBytes = if (!connected) 0L else current.spiffsUsedBytes,
+        spiffsFreeBytes = if (!connected) 0L else current.spiffsFreeBytes,
+        blobActive = if (!connected) false else current.blobActive,
+        blobSessionId = if (!connected) 0L else current.blobSessionId,
+        blobBytesSent = if (!connected) 0L else current.blobBytesSent,
+        blobBytesTotal = if (!connected) 0L else current.blobBytesTotal,
         phoneGpsPushActive = if (!connected) false else current.phoneGpsPushActive,
         downloadBacklogActive = if (!connected) false else current.downloadBacklogActive,
       )
@@ -679,6 +740,9 @@ class ScannerService : Service(), EspBleClient.Listener {
       WgProtocol.MessageType.GPS -> handleGpsFrame(frame.payload)
       WgProtocol.MessageType.SIGHTING -> handleSightingFrame(frame.payload)
       WgProtocol.MessageType.REPLAY_BATCH -> handleReplayBatchFrame(frame.payload)
+      WgProtocol.MessageType.BACKLOG_BLOB_META -> handleBacklogBlobMetaFrame(frame.payload)
+      WgProtocol.MessageType.BACKLOG_BLOB_CHUNK -> handleBacklogBlobChunkFrame(frame.payload)
+      WgProtocol.MessageType.BACKLOG_BLOB_DONE -> handleBacklogBlobDoneFrame(frame.payload)
       WgProtocol.MessageType.ACK -> handleAckFrame(frame.payload)
       WgProtocol.MessageType.ERROR -> handleErrorFrame(frame.payload)
       WgProtocol.MessageType.SNAPSHOT_END -> appendLog("Snapshot complete")
@@ -735,6 +799,14 @@ class ScannerService : Service(), EspBleClient.Listener {
         droppedFlashFull = status.droppedFlashFull,
         nodeCount = status.nodeCount,
         autoHopAppliedMs = status.hopMs,
+        gpsNavAppliedHz = status.gpsNavAppliedHz,
+        spiffsTotalBytes = status.spiffsTotalBytes,
+        spiffsUsedBytes = status.spiffsUsedBytes,
+        spiffsFreeBytes = status.spiffsFreeBytes,
+        blobActive = status.blobActive,
+        blobSessionId = status.blobSessionId,
+        blobBytesSent = status.blobBytesSent,
+        blobBytesTotal = status.blobBytesTotal,
       )
     }
 
@@ -746,11 +818,16 @@ class ScannerService : Service(), EspBleClient.Listener {
       if (shouldAutoStopCsv && csvLogger.isActive) {
         stopLogging()
       }
-    } else if (_state.value.downloadBacklogActive && status.queuedRecords == 0L && !status.replayActive) {
+    } else if (_state.value.downloadBacklogActive &&
+      (
+        (status.queuedRecords == 0L && !status.replayActive) ||
+          (status.blobBytesTotal > 0L && !status.blobActive && status.blobBytesSent >= status.blobBytesTotal)
+      )) {
       _state.update { it.copy(downloadBacklogActive = false) }
       if (controlLinkReadySilent()) {
-        bleClient.setReplayEnabled(false)
+        bleClient.setBacklogBlobEnabled(false)
       }
+      resetBacklogBlobReceiver(discardFile = true)
       appendLog("Backlog download complete")
       val shouldAutoStopCsv = downloadBacklogAutoStop
       downloadBacklogAutoStop = false
@@ -832,6 +909,10 @@ class ScannerService : Service(), EspBleClient.Listener {
       if (!trackReplayRecord(sighting.sessionId, sighting.recordSeq)) {
         return
       }
+      if (_state.value.downloadBacklogActive) {
+        appendCsvFromBacklogSighting(sighting, System.currentTimeMillis())
+        return
+      }
     }
 
     val now = System.currentTimeMillis()
@@ -870,6 +951,262 @@ class ScannerService : Service(), EspBleClient.Listener {
     for (record in records) {
       handleSightingFrame(record)
     }
+  }
+
+  @Synchronized
+  private fun resetBacklogBlobReceiver(discardFile: Boolean) {
+    val rx = backlogBlobRx ?: return
+    try {
+      rx.out.flush()
+    } catch (_: Exception) {}
+    try {
+      rx.out.close()
+    } catch (_: Exception) {}
+    if (discardFile) {
+      try {
+        rx.file.delete()
+      } catch (_: Exception) {}
+    }
+    backlogBlobRx = null
+  }
+
+  private fun handleBacklogBlobMetaFrame(payload: ByteArray) {
+    val meta: BacklogBlobMetaPayload = try {
+      WgProtocol.decodeBacklogBlobMetaPayload(payload)
+    } catch (e: Exception) {
+      appendLog("Backlog meta decode error: ${e.message}")
+      return
+    }
+    if (meta.sessionId <= 0L || meta.totalBytes <= 0L) {
+      appendLog("Backlog meta rejected: bad session or size")
+      return
+    }
+
+    synchronized(this) {
+      resetBacklogBlobReceiver(discardFile = true)
+      val dir = File(cacheDir, "backlog_blob")
+      if (!dir.exists()) {
+        dir.mkdirs()
+      }
+      val file = File(dir, "session-${java.lang.Long.toUnsignedString(meta.sessionId, 16)}.dat")
+      val out = BufferedOutputStream(FileOutputStream(file, false), 64 * 1024)
+      backlogBlobRx =
+        BacklogBlobReceiver(
+          sessionId = meta.sessionId,
+          totalBytes = meta.totalBytes,
+          writtenSeq = meta.writtenSeq,
+          file = file,
+          out = out,
+        )
+    }
+
+    appendLog(
+      "Backlog blob session 0x${java.lang.Long.toUnsignedString(meta.sessionId, 16)} size=${meta.totalBytes}B acked=${meta.ackedSeq} written=${meta.writtenSeq}",
+    )
+  }
+
+  private fun handleBacklogBlobChunkFrame(payload: ByteArray) {
+    val chunk: BacklogBlobChunkPayload = try {
+      WgProtocol.decodeBacklogBlobChunkPayload(payload)
+    } catch (e: Exception) {
+      appendLog("Backlog chunk decode error: ${e.message}")
+      return
+    }
+
+    synchronized(this) {
+      val rx = backlogBlobRx
+      if (rx == null) {
+        appendLog("Backlog chunk ignored: no active session")
+        return
+      }
+      if (rx.sessionId != chunk.sessionId) {
+        appendLog("Backlog chunk session mismatch; restarting receiver")
+        resetBacklogBlobReceiver(discardFile = true)
+        return
+      }
+      if (chunk.offset != rx.receivedBytes) {
+        appendLog("Backlog chunk offset mismatch; expected=${rx.receivedBytes} got=${chunk.offset}")
+        resetBacklogBlobReceiver(discardFile = true)
+        return
+      }
+      try {
+        rx.out.write(chunk.data)
+      } catch (e: Exception) {
+        appendLog("Backlog chunk write failed: ${e.message}")
+        resetBacklogBlobReceiver(discardFile = true)
+        return
+      }
+      rx.receivedBytes += chunk.data.size.toLong()
+      if (rx.receivedBytes % (64L * 1024L) < chunk.data.size.toLong() || rx.receivedBytes == rx.totalBytes) {
+        appendLog("Backlog blob progress ${rx.receivedBytes}/${rx.totalBytes}B")
+      }
+    }
+  }
+
+  private fun handleBacklogBlobDoneFrame(payload: ByteArray) {
+    val done: BacklogBlobDonePayload = try {
+      WgProtocol.decodeBacklogBlobDonePayload(payload)
+    } catch (e: Exception) {
+      appendLog("Backlog done decode error: ${e.message}")
+      return
+    }
+
+    val completed: BacklogBlobReceiver = synchronized(this) {
+      val rx = backlogBlobRx
+      if (rx == null) {
+        appendLog("Backlog done ignored: no active session")
+        return
+      }
+      if (rx.sessionId != done.sessionId) {
+        appendLog("Backlog done session mismatch")
+        resetBacklogBlobReceiver(discardFile = true)
+        return
+      }
+      if (rx.receivedBytes != rx.totalBytes || done.totalBytes != rx.totalBytes) {
+        appendLog("Backlog done size mismatch")
+        resetBacklogBlobReceiver(discardFile = true)
+        return
+      }
+      try {
+        rx.out.flush()
+      } catch (_: Exception) {}
+      try {
+        rx.out.close()
+      } catch (_: Exception) {}
+      backlogBlobRx = null
+      rx
+    }
+
+    appendLog(
+      "Backlog blob received session 0x${java.lang.Long.toUnsignedString(done.sessionId, 16)} (${done.totalBytes}B), importing...",
+    )
+    importBacklogBlobSessionAsync(
+      file = completed.file,
+      sessionId = done.sessionId,
+      writtenSeq = if (done.writtenSeq > 0L) done.writtenSeq else completed.writtenSeq,
+    )
+  }
+
+  private fun importBacklogBlobSessionAsync(file: File, sessionId: Long, writtenSeq: Long) {
+    scope.launch {
+      val result = parseBacklogBlobFile(file, sessionId)
+      val ackSeq = maxOf(writtenSeq, result.highestSeq)
+      appendLog(
+        "Backlog import done sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)} records=${result.records} bad_blocks=${result.badBlocks}",
+      )
+      if (ackSeq > 0L && controlLinkReadySilent()) {
+        if (!bleClient.sendReplayAck(sessionId, ackSeq)) {
+          appendLog("Backlog ack send failed sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)}")
+        }
+      }
+      try {
+        file.delete()
+      } catch (_: Exception) {}
+      if (controlLinkReadySilent()) {
+        bleClient.requestStatus()
+      }
+    }
+  }
+
+  private fun parseBacklogBlobFile(file: File, expectedSessionId: Long): BacklogImportResult {
+    if (!file.exists()) {
+      return BacklogImportResult(records = 0, highestSeq = 0L, badBlocks = 1)
+    }
+
+    var records = 0
+    var highestSeq = 0L
+    var badBlocks = 0
+    val block = ByteArray(BLOB_BLOCK_SIZE)
+
+    BufferedInputStream(FileInputStream(file), 64 * 1024).use { input ->
+      while (true) {
+        val read = readFullBlock(input, block)
+        if (read < 0) break
+        if (read != BLOB_BLOCK_SIZE) {
+          badBlocks += 1
+          break
+        }
+
+        val bb = ByteBuffer.wrap(block).order(ByteOrder.LITTLE_ENDIAN)
+        val magic = bb.int.toLong() and 0xFFFF_FFFFL
+        val version = bb.short.toInt() and 0xFFFF
+        val headerSize = bb.short.toInt() and 0xFFFF
+        val sessionId = bb.long
+        val firstSeq = bb.int.toLong() and 0xFFFF_FFFFL
+        val recordCount = bb.short.toInt() and 0xFFFF
+        val payloadLen = bb.short.toInt() and 0xFFFF
+        val expectedCrc = bb.int.toLong() and 0xFFFF_FFFFL
+
+        if (magic != BLOB_BLOCK_MAGIC ||
+            version != BLOB_BLOCK_VERSION ||
+            headerSize != BLOB_BLOCK_HEADER_SIZE ||
+            sessionId != expectedSessionId ||
+            recordCount == 0 ||
+            payloadLen == 0 ||
+            payloadLen > BLOB_BLOCK_SIZE - headerSize) {
+          badBlocks += 1
+          continue
+        }
+
+        val crc = CRC32()
+        crc.update(block, headerSize, payloadLen)
+        val actualCrc = crc.value and 0xFFFF_FFFFL
+        if (actualCrc != expectedCrc) {
+          badBlocks += 1
+          continue
+        }
+
+        var payloadPos = headerSize
+        val payloadEnd = headerSize + payloadLen
+        var blockValid = true
+        for (index in 0 until recordCount) {
+          if (payloadPos + BLOB_RECORD_HEADER_SIZE > payloadEnd) {
+            blockValid = false
+            break
+          }
+          val recordLen =
+            (block[payloadPos].toInt() and 0xFF) or
+              ((block[payloadPos + 1].toInt() and 0xFF) shl 8)
+          payloadPos += BLOB_RECORD_HEADER_SIZE
+          if (recordLen <= 0 || payloadPos + recordLen > payloadEnd) {
+            blockValid = false
+            break
+          }
+          val recordBytes = block.copyOfRange(payloadPos, payloadPos + recordLen)
+          payloadPos += recordLen
+
+          val sighting = try {
+            WgProtocol.decodeSightingPayload(recordBytes)
+          } catch (_: Exception) {
+            continue
+          }
+          appendCsvFromBacklogSighting(sighting, System.currentTimeMillis())
+          records += 1
+
+          val seq = if (sighting.recordSeq > 0L) sighting.recordSeq else firstSeq + index
+          if (seq > highestSeq) {
+            highestSeq = seq
+          }
+        }
+        if (!blockValid) {
+          badBlocks += 1
+        }
+      }
+    }
+
+    return BacklogImportResult(records = records, highestSeq = highestSeq, badBlocks = badBlocks)
+  }
+
+  private fun readFullBlock(input: BufferedInputStream, target: ByteArray): Int {
+    var offset = 0
+    while (offset < target.size) {
+      val read = input.read(target, offset, target.size - offset)
+      if (read < 0) {
+        return if (offset == 0) -1 else offset
+      }
+      offset += read
+    }
+    return offset
   }
 
   private fun handleAckFrame(payload: ByteArray) {
@@ -950,20 +1287,29 @@ class ScannerService : Service(), EspBleClient.Listener {
   private suspend fun pruneSightingsAndRefreshAges() {
     val now = System.currentTimeMillis()
     val timeoutMs = visibleTimeoutSec * 1000L
+    var removed = false
 
     sightingsMutex.withLock {
-      val iter = sightings.entries.iterator()
-      while (iter.hasNext()) {
-        val entry = iter.next().value
-        if (now - entry.lastSeenMs > timeoutMs) {
-          iter.remove()
+      if (sightings.isNotEmpty()) {
+        val iter = sightings.entries.iterator()
+        while (iter.hasNext()) {
+          val entry = iter.next().value
+          if (now - entry.lastSeenMs > timeoutMs) {
+            iter.remove()
+            removed = true
+          }
+        }
+        if (removed) {
+          publishSightingsLocked()
         }
       }
-      publishSightingsLocked()
     }
 
     val phoneAge = if (lastPhoneFixMs <= 0L) -1 else ((now - lastPhoneFixMs) / 1000L).toInt()
-    _state.update { current -> current.copy(phoneGpsAgeS = phoneAge.coerceAtLeast(-1)) }
+    val normalizedPhoneAge = phoneAge.coerceAtLeast(-1)
+    if (normalizedPhoneAge != _state.value.phoneGpsAgeS) {
+      _state.update { current -> current.copy(phoneGpsAgeS = normalizedPhoneAge) }
+    }
     flushReplayAcks(force = false)
   }
 
@@ -1069,19 +1415,55 @@ class ScannerService : Service(), EspBleClient.Listener {
     }
     lastCsvWriteByBssid[sighting.bssid] = rowTsMs
 
-    appendCsvRow(sighting, rowTsMs, sample.location)
+    appendCsvRowValues(
+      bssid = sighting.bssid,
+      ssid = sighting.ssid,
+      auth = sighting.auth,
+      channel = sighting.channel,
+      rssi = sighting.rssi,
+      rowTs = rowTsMs,
+      location = sample.location,
+    )
   }
 
-  private fun appendCsvRow(sighting: SightingUi, rowTs: Long, location: CsvLocation) {
+  private fun appendCsvFromBacklogSighting(sighting: SightingPayload, nowMs: Long) {
+    if (!csvLogger.isActive) return
+    if ((sighting.flags and WgProtocol.SIGHTING_FLAG_SNAPSHOT) != 0) return
+
+    val sample = resolveCsvSample(sighting, nowMs) ?: return
+    if (sighting.ssid.isNotBlank()) {
+      ssidMemory[sighting.bssid] = sighting.ssid
+    }
+    val resolvedSsid = if (sighting.ssid.isNotBlank()) sighting.ssid else (ssidMemory[sighting.bssid] ?: "")
+    appendCsvRowValues(
+      bssid = sighting.bssid,
+      ssid = resolvedSsid,
+      auth = sighting.auth,
+      channel = sighting.channel,
+      rssi = sighting.rssi,
+      rowTs = sample.rowTimestampMs,
+      location = sample.location,
+    )
+  }
+
+  private fun appendCsvRowValues(
+    bssid: String,
+    ssid: String,
+    auth: String,
+    channel: Int,
+    rssi: Int,
+    rowTs: Long,
+    location: CsvLocation,
+  ) {
     try {
       csvLogger.append(
         WigleWifiRow(
-          mac = sighting.bssid,
-          ssid = sighting.ssid,
-          authMode = sighting.auth,
+          mac = bssid,
+          ssid = ssid,
+          authMode = auth,
           firstSeenEpochMs = rowTs,
-          channel = sighting.channel,
-          rssi = sighting.rssi,
+          channel = channel,
+          rssi = rssi,
           latitude = location.latitude,
           longitude = location.longitude,
           altitudeMeters = location.altitudeMeters,

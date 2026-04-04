@@ -190,6 +190,47 @@ private fun gpsNavModeLabel(mode: Int): String = when (mode) {
   else -> "Auto"
 }
 
+private fun gpsNavModeWithAppliedLabel(mode: Int, appliedHz: Int): String {
+  val applied = if (appliedHz > 0) appliedHz else 1
+  return when (mode) {
+    1, 2, 4 -> "${gpsNavModeLabel(mode)} (applied ${applied} Hz)"
+    else -> "Auto @ ${applied} Hz"
+  }
+}
+
+private fun formatBytesShort(bytes: Long): String {
+  val safe = bytes.coerceAtLeast(0L).toDouble()
+  val units = arrayOf("B", "KB", "MB", "GB")
+  var value = safe
+  var idx = 0
+  while (value >= 1024.0 && idx < units.lastIndex) {
+    value /= 1024.0
+    idx++
+  }
+  return if (idx == 0) {
+    "${value.toLong()} ${units[idx]}"
+  } else {
+    "${"%.1f".format(value)} ${units[idx]}"
+  }
+}
+
+private fun transferStatusLabel(state: AppUiState): String {
+  if (state.downloadBacklogActive && state.blobActive && state.blobBytesTotal > 0L) {
+    val pct = ((state.blobBytesSent * 100L) / state.blobBytesTotal).coerceIn(0L, 100L)
+    return "Blob ${formatBytesShort(state.blobBytesSent)} / ${formatBytesShort(state.blobBytesTotal)} (${pct}%)"
+  }
+  if (state.downloadBacklogActive) {
+    return "Downloading ${state.queuedRecords} rec / ${formatBytesShort(state.queuedBytes)}"
+  }
+  if (state.replayActive) {
+    return "Active @ ${state.replayCursor}"
+  }
+  if (state.queuedRecords > 0L || state.queuedBytes > 0L) {
+    return "Idle (${state.queuedRecords} rec / ${formatBytesShort(state.queuedBytes)})"
+  }
+  return "Idle"
+}
+
 // ---------------------------------------------------------------------------
 // Main screen
 // ---------------------------------------------------------------------------
@@ -686,11 +727,13 @@ private fun GeneralStatusDetails(state: AppUiState) {
         "-"
       },
     )
-    KvRow("Queue", "${state.queuedRecords} rec / ${state.queuedBytes} B")
-    KvRow("Replay", "${if (state.replayActive) "Active" else "Idle"} @ ${state.replayCursor}")
-    KvRow("Backlog Download", if (state.downloadBacklogActive) "Active" else "Idle")
+    KvRow("Backlog", transferStatusLabel(state))
     KvRow(
-      "Queue Full",
+      "SPIFFS",
+      "${formatBytesShort(state.spiffsUsedBytes)} used / ${formatBytesShort(state.spiffsTotalBytes)} total (${formatBytesShort(state.spiffsFreeBytes)} free)",
+    )
+    KvRow(
+      "Queue Pressure",
       if (state.queueFull) "YES (drops=${state.droppedFlashFull})" else "No (drops=${state.droppedFlashFull})",
     )
     KvRow("Visible Rows", state.sightings.size.toString())
@@ -730,7 +773,7 @@ private fun GpsStatusDetails(state: AppUiState) {
     KvRow("ESP Satellites", satText)
     KvRow("ESP HDOP", hdopText)
     KvRow("ESP PDOP", pdopText)
-    KvRow("Nav Rate Mode", gpsNavModeLabel(state.gpsNavMode))
+    KvRow("Nav Rate Mode", gpsNavModeWithAppliedLabel(state.gpsNavMode, state.gpsNavAppliedHz))
     KvRow(
       "Phone GPS",
       if (state.phoneGpsAgeS >= 0) {

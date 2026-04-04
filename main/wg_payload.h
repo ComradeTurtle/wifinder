@@ -46,7 +46,7 @@ typedef struct {
   uint8_t current_channel;
   uint16_t hop_ms;
   uint16_t channel_mask;
-  uint16_t unique_bssid_count;
+  uint32_t unique_bssids_estimate;
   uint16_t packets_per_sec;
   uint16_t dropped_notifies;
   uint8_t boot_mode;
@@ -68,6 +68,14 @@ typedef struct {
   bool queue_full;
   uint32_t dropped_flash_full;
   uint8_t node_count;
+  uint8_t gps_nav_applied_hz;
+  uint32_t spiffs_total_bytes;
+  uint32_t spiffs_used_bytes;
+  uint32_t spiffs_free_bytes;
+  bool blob_active;
+  uint64_t blob_session_id;
+  uint32_t blob_bytes_sent;
+  uint32_t blob_bytes_total;
 } wg_status_payload_t;
 
 typedef struct {
@@ -114,7 +122,7 @@ typedef struct {
   uint16_t pdop_centi;
 } wg_gps_payload_t;
 
-#define WG_STATUS_PAYLOAD_SIZE 57
+#define WG_STATUS_PAYLOAD_SIZE 91
 #define WG_GPS_PAYLOAD_SIZE 33
 
 size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, size_t out_size);

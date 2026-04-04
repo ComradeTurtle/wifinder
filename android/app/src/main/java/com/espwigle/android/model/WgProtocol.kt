@@ -22,6 +22,9 @@ object WgProtocol {
     const val REPLAY_BATCH = 0x08
     const val REPLAY_ACK = REPLAY_BATCH
     const val NODE_TABLE = 0x09
+    const val BACKLOG_BLOB_META = 0x0A
+    const val BACKLOG_BLOB_CHUNK = 0x0B
+    const val BACKLOG_BLOB_DONE = 0x0C
     const val COMMAND = 0x81
   }
 
@@ -38,6 +41,7 @@ object WgProtocol {
     const val SET_REPLAY = 0x0A
     const val CLEAR_STORAGE = 0x0B
     const val SET_GPS_NAV_RATE = 0x0C
+    const val SET_BACKLOG_BLOB = 0x0D
   }
 
   const val GPS_FLAG_VALID = 1 shl 0
@@ -120,7 +124,9 @@ object WgProtocol {
     val currentChannel = payload[2].toInt() and 0xFF
     val hopMs = bb.getShort(3).toInt() and 0xFFFF
     val channelMask = bb.getShort(5).toInt() and 0xFFFF
-    val uniqueBssids = bb.getShort(7).toInt() and 0xFFFF
+    val legacyUniqueBssids = bb.getShort(7).toInt() and 0xFFFF
+    val uniqueBssids =
+      if (payload.size >= 61) bb.getInt(57) else legacyUniqueBssids
     val packetsPerSec = bb.getShort(9).toInt() and 0xFFFF
     val droppedNotifies = bb.getShort(11).toInt() and 0xFFFF
     val bootMode = payload[13].toInt() and 0xFF
@@ -142,6 +148,14 @@ object WgProtocol {
     val queueFull = payload.size >= 52 && (payload[51].toInt() and 0xFF) == 1
     val droppedFlashFull = if (payload.size >= 56) bb.getInt(52).toLong() and 0xFFFF_FFFFL else 0L
     val nodeCount = if (payload.size >= 57) payload[56].toInt() and 0xFF else 0
+    val gpsNavAppliedHz = if (payload.size >= 62) payload[61].toInt() and 0xFF else 0
+    val spiffsTotalBytes = if (payload.size >= 66) bb.getInt(62).toLong() and 0xFFFF_FFFFL else 0L
+    val spiffsUsedBytes = if (payload.size >= 70) bb.getInt(66).toLong() and 0xFFFF_FFFFL else 0L
+    val spiffsFreeBytes = if (payload.size >= 74) bb.getInt(70).toLong() and 0xFFFF_FFFFL else 0L
+    val blobActive = payload.size >= 75 && (payload[74].toInt() and 0xFF) == 1
+    val blobSessionId = if (payload.size >= 83) bb.getLong(75) else 0L
+    val blobBytesSent = if (payload.size >= 87) bb.getInt(83).toLong() and 0xFFFF_FFFFL else 0L
+    val blobBytesTotal = if (payload.size >= 91) bb.getInt(87).toLong() and 0xFFFF_FFFFL else 0L
     return StatusPayload(
       scanning = scanning,
       bleEncrypted = bleEncrypted,
@@ -170,6 +184,14 @@ object WgProtocol {
       queueFull = queueFull,
       droppedFlashFull = droppedFlashFull,
       nodeCount = nodeCount,
+      gpsNavAppliedHz = gpsNavAppliedHz,
+      spiffsTotalBytes = spiffsTotalBytes,
+      spiffsUsedBytes = spiffsUsedBytes,
+      spiffsFreeBytes = spiffsFreeBytes,
+      blobActive = blobActive,
+      blobSessionId = blobSessionId,
+      blobBytesSent = blobBytesSent,
+      blobBytesTotal = blobBytesTotal,
     )
   }
 
@@ -313,6 +335,45 @@ object WgProtocol {
   fun encodeReplayTogglePayload(enabled: Boolean): ByteArray =
     byteArrayOf(if (enabled) 1 else 0)
 
+  fun encodeBacklogBlobTogglePayload(enabled: Boolean): ByteArray =
+    byteArrayOf(if (enabled) 1 else 0)
+
+  fun decodeBacklogBlobMetaPayload(payload: ByteArray): BacklogBlobMetaPayload {
+    require(payload.size >= 20) { "Bad backlog blob meta payload" }
+    val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+    return BacklogBlobMetaPayload(
+      sessionId = bb.getLong(0),
+      totalBytes = bb.getInt(8).toLong() and 0xFFFF_FFFFL,
+      ackedSeq = bb.getInt(12).toLong() and 0xFFFF_FFFFL,
+      writtenSeq = bb.getInt(16).toLong() and 0xFFFF_FFFFL,
+    )
+  }
+
+  fun decodeBacklogBlobChunkPayload(payload: ByteArray): BacklogBlobChunkPayload {
+    require(payload.size >= 14) { "Bad backlog blob chunk payload" }
+    val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+    val sessionId = bb.getLong(0)
+    val offset = bb.getInt(8).toLong() and 0xFFFF_FFFFL
+    val len = bb.getShort(12).toInt() and 0xFFFF
+    require(len > 0) { "Backlog blob chunk has zero length" }
+    require(payload.size == 14 + len) { "Backlog blob chunk length mismatch" }
+    return BacklogBlobChunkPayload(
+      sessionId = sessionId,
+      offset = offset,
+      data = payload.copyOfRange(14, 14 + len),
+    )
+  }
+
+  fun decodeBacklogBlobDonePayload(payload: ByteArray): BacklogBlobDonePayload {
+    require(payload.size >= 16) { "Bad backlog blob done payload" }
+    val bb = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+    return BacklogBlobDonePayload(
+      sessionId = bb.getLong(0),
+      totalBytes = bb.getInt(8).toLong() and 0xFFFF_FFFFL,
+      writtenSeq = bb.getInt(12).toLong() and 0xFFFF_FFFFL,
+    )
+  }
+
   fun formatSecurity(authCode: Int, protoFlags: Int, akmFlags: Int, cipherFlags: Int): String {
     val parts = mutableListOf<String>()
 
@@ -396,6 +457,14 @@ data class StatusPayload(
   val queueFull: Boolean,
   val droppedFlashFull: Long,
   val nodeCount: Int,
+  val gpsNavAppliedHz: Int,
+  val spiffsTotalBytes: Long,
+  val spiffsUsedBytes: Long,
+  val spiffsFreeBytes: Long,
+  val blobActive: Boolean,
+  val blobSessionId: Long,
+  val blobBytesSent: Long,
+  val blobBytesTotal: Long,
 )
 
 data class SightingPayload(
@@ -446,4 +515,23 @@ data class EspGpsPayload(
   val satCount: Int,
   val hdopCenti: Int,
   val pdopCenti: Int,
+)
+
+data class BacklogBlobMetaPayload(
+  val sessionId: Long,
+  val totalBytes: Long,
+  val ackedSeq: Long,
+  val writtenSeq: Long,
+)
+
+data class BacklogBlobChunkPayload(
+  val sessionId: Long,
+  val offset: Long,
+  val data: ByteArray,
+)
+
+data class BacklogBlobDonePayload(
+  val sessionId: Long,
+  val totalBytes: Long,
+  val writtenSeq: Long,
 )

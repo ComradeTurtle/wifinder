@@ -26,6 +26,9 @@ typedef enum {
   WG_MSG_REPLAY_BATCH = 0x08,
   WG_MSG_REPLAY_ACK = WG_MSG_REPLAY_BATCH,
   WG_MSG_NODE_TABLE = 0x09,
+  WG_MSG_BACKLOG_BLOB_META = 0x0A,
+  WG_MSG_BACKLOG_BLOB_CHUNK = 0x0B,
+  WG_MSG_BACKLOG_BLOB_DONE = 0x0C,
   WG_MSG_COMMAND = 0x81,
 } wg_message_type_t;
 
@@ -42,6 +45,7 @@ typedef enum {
   WG_CMD_SET_REPLAY = 0x0A,
   WG_CMD_CLEAR_STORAGE = 0x0B,
   WG_CMD_SET_GPS_NAV_RATE = 0x0C,
+  WG_CMD_SET_BACKLOG_BLOB = 0x0D,
 } wg_command_id_t;
 
 typedef enum {
@@ -55,6 +59,7 @@ typedef enum {
 #define WG_REPLAY_ACK_PAYLOAD_SIZE 12
 #define WG_REPLAY_TOGGLE_PAYLOAD_SIZE 1
 #define WG_GPS_NAV_RATE_PAYLOAD_SIZE 1
+#define WG_BACKLOG_BLOB_TOGGLE_PAYLOAD_SIZE 1
 
 typedef struct {
   uint8_t version;
@@ -82,6 +87,7 @@ typedef struct {
   uint32_t replay_highest_seq;
   uint8_t replay_enable;
   uint8_t gps_nav_mode;
+  uint8_t backlog_blob_enable;
 } wg_command_t;
 
 wg_result_t wg_frame_encode(const wg_frame_t *frame, uint8_t *out, size_t out_capacity,

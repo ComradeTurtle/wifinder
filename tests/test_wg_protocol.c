@@ -184,6 +184,19 @@ static void test_clear_storage_command_decode(void) {
   assert_true(cmd.id == WG_CMD_CLEAR_STORAGE, "clear storage command id should match");
 }
 
+static void test_set_backlog_blob_command_decode(void) {
+  uint8_t payload[] = {
+      WG_CMD_SET_BACKLOG_BLOB,
+      0x01,
+  };
+
+  wg_command_t cmd = {0};
+  assert_true(wg_command_decode(payload, sizeof(payload), &cmd) == WG_OK,
+              "set backlog blob command decode should succeed");
+  assert_true(cmd.id == WG_CMD_SET_BACKLOG_BLOB, "set backlog blob command id should match");
+  assert_true(cmd.backlog_blob_enable == 1, "set backlog blob enable should decode");
+}
+
 int main(void) {
   test_frame_roundtrip();
   test_command_decode();
@@ -194,6 +207,7 @@ int main(void) {
   test_set_replay_command_decode();
   test_set_replay_command_bad_length();
   test_clear_storage_command_decode();
+  test_set_backlog_blob_command_decode();
   printf("PASS: %d tests\n", tests_run);
   return 0;
 }

@@ -104,6 +104,7 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
   out->replay_highest_seq = 0;
   out->replay_enable = 0;
   out->gps_nav_mode = 0;
+  out->backlog_blob_enable = 0;
 
   switch (out->id) {
     case WG_CMD_START:
@@ -164,6 +165,12 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
         return WG_ERR_INVALID_FRAME;
       }
       out->gps_nav_mode = payload[1];
+      return WG_OK;
+    case WG_CMD_SET_BACKLOG_BLOB:
+      if (payload_len != (size_t)(1 + WG_BACKLOG_BLOB_TOGGLE_PAYLOAD_SIZE)) {
+        return WG_ERR_INVALID_FRAME;
+      }
+      out->backlog_blob_enable = payload[1];
       return WG_OK;
     default:
       return WG_ERR_UNSUPPORTED;

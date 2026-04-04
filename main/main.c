@@ -69,16 +69,17 @@ extern void ble_store_config_init(void);
 #define WG_DEFAULT_CHANNEL_MASK 0x1FFFU
 #define WG_SIGHTING_NOTIFY_INTERVAL_MS 5000
 #define WG_SEEN_CAPACITY 512
-#define WG_UNIQUE_BSSID_HASH_SLOTS 8192
+#define WG_UNIQUE_HLL_P 12
+#define WG_UNIQUE_HLL_REGISTERS (1U << WG_UNIQUE_HLL_P)
 #define WG_SCAN_SEED_MAX_APS 128
 #define WG_BLE_PASSKEY 123456U
-#define WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD 170
+#define WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD 220
 #define WG_BLE_CONN_ITVL_MIN_1P25MS 6
 #define WG_BLE_CONN_ITVL_MAX_1P25MS 12
 #define WG_BLE_CONN_LATENCY 0
 #define WG_BLE_CONN_SUPERVISION_TIMEOUT_10MS 400
-_Static_assert((WG_UNIQUE_BSSID_HASH_SLOTS & (WG_UNIQUE_BSSID_HASH_SLOTS - 1)) == 0,
-               "WG_UNIQUE_BSSID_HASH_SLOTS must be power-of-two");
+_Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
+               "WG_UNIQUE_HLL_REGISTERS must be power-of-two");
 
 #define WG_GPS_UART_NUM UART_NUM_1
 #define WG_GPS_UART_TX_GPIO 10
@@ -108,11 +109,16 @@ _Static_assert((WG_UNIQUE_BSSID_HASH_SLOTS & (WG_UNIQUE_BSSID_HASH_SLOTS - 1)) =
 #define WG_STORAGE_VERSION 1
 #define WG_STORAGE_BLOCK_FLUSH_MS 1200
 #define WG_STORAGE_RECORD_HDR_SIZE 2
-#define WG_STORAGE_REPLAY_BUDGET_PER_TICK 4
+#define WG_STORAGE_REPLAY_BUDGET_PER_TICK 8
+#define WG_STORAGE_BLOB_BUDGET_PER_TICK 8
 #define WG_REPLAY_TASK_INTERVAL_MS 20
 #define WG_REPLAY_BATCH_MAX_RECORDS 8
 #define WG_REPLAY_BATCH_HEADER_SIZE 1
 #define WG_REPLAY_BATCH_RECORD_HDR_SIZE 2
+#define WG_BLOB_META_PAYLOAD_SIZE 20
+#define WG_BLOB_CHUNK_HEADER_SIZE 14
+#define WG_BLOB_DONE_PAYLOAD_SIZE 16
+#define WG_BLOB_CHUNK_DATA_MAX (WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD - WG_BLOB_CHUNK_HEADER_SIZE)
 #define WG_STORAGE_MIN_FREE_BYTES (WG_STORAGE_BLOCK_SIZE * 4)
 #define WG_STORAGE_PERSIST_MIN_STATIONARY_MS 30000
 #define WG_STORAGE_PERSIST_MIN_MOVING_MS 8000
@@ -131,7 +137,7 @@ _Static_assert((WG_UNIQUE_BSSID_HASH_SLOTS & (WG_UNIQUE_BSSID_HASH_SLOTS - 1)) =
 #define WG_NODE_FRAME_MAX_PAYLOAD 96
 #define WG_NODE_STALE_MS 3000
 
-#define WG_HOST_FRAME_MAX_PAYLOAD 196
+#define WG_HOST_FRAME_MAX_PAYLOAD 244
 #define WG_HOST_RX_BUF_SIZE (WG_FRAME_HEADER_SIZE + WG_HOST_FRAME_MAX_PAYLOAD)
 #define WG_HOST_SERIAL_READ_MS 30
 #define WG_FRAME_MAGIC0 0x57
@@ -281,9 +287,9 @@ typedef struct __attribute__((packed)) {
 static const char *TAG = "espwigle";
 
 static ap_entry_t s_seen[WG_SEEN_CAPACITY];
-static uint32_t s_unique_bssid_hashes[WG_UNIQUE_BSSID_HASH_SLOTS];
-static uint16_t s_unique_bssid_count = 0;
-static uint32_t s_unique_hash_table_full_events = 0;
+static uint8_t s_unique_hll_regs[WG_UNIQUE_HLL_REGISTERS] = {0};
+static bool s_unique_hll_dirty = false;
+static uint32_t s_unique_bssid_estimate = 0;
 
 static bool s_scanning = false;
 static uint16_t s_hop_ms = WG_DEFAULT_HOP_MS;
@@ -426,6 +432,23 @@ static uint16_t s_replay_prefetch_len = 0;
 static uint64_t s_replay_prefetch_session_id = 0;
 static uint32_t s_replay_prefetch_seq = 0;
 
+static bool s_blob_active = false;
+static bool s_blob_requested = false;
+static bool s_blob_meta_sent = false;
+static bool s_blob_done_sent = false;
+static bool s_blob_waiting_ack = false;
+static uint64_t s_blob_session_id = 0;
+static uint32_t s_blob_file_bytes = 0;
+static uint32_t s_blob_bytes_sent = 0;
+static uint32_t s_blob_written_seq = 0;
+static uint32_t s_blob_acked_seq = 0;
+static FILE *s_blob_fp = NULL;
+static bool s_blob_pending_valid = false;
+static uint8_t s_blob_pending_msg_type = WG_MSG_BACKLOG_BLOB_META;
+static uint8_t s_blob_pending_payload[WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD] = {0};
+static uint16_t s_blob_pending_len = 0;
+static uint16_t s_blob_pending_chunk_len = 0;
+
 #if CONFIG_WG_RGB_LED_ENABLE
 typedef struct {
   uint8_t r;
@@ -533,11 +556,17 @@ static void storage_refresh_backlog(bool reclaim);
 static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq);
 static void storage_run_replay_tick(void);
 static void storage_set_replay_enabled(bool enabled);
+static void storage_run_blob_tick(void);
+static void storage_set_blob_enabled(bool enabled);
 static bool storage_clear_sessions(void);
 static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len, uint8_t source_flags);
 static void request_fast_ble_conn_params(uint16_t conn_handle);
 static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_tag);
 static void request_link_security(uint16_t conn_handle, const char *reason_tag);
+static uint16_t rd_u16_le(const uint8_t *in);
+static void wr_u16_le(uint8_t *out, uint16_t value);
+static void wr_u32_le(uint8_t *out, uint32_t value);
+static void wr_u64_le(uint8_t *out, uint64_t value);
 
 static const struct ble_gatt_svc_def gatt_services[] = {
     {
@@ -697,39 +726,72 @@ static bool send_ack_host(uint8_t cmd_id, uint8_t code) {
                                    sizeof(payload));
 }
 
-static uint32_t bssid_hash32(const uint8_t bssid[6]) {
-  uint32_t h = 2166136261u;  // FNV-1a 32-bit
+static uint64_t bssid_hash64(const uint8_t bssid[6]) {
+  uint64_t h = 1469598103934665603ULL;  // FNV-1a 64-bit
   for (int i = 0; i < 6; ++i) {
-    h ^= (uint32_t)bssid[i];
-    h *= 16777619u;
+    h ^= (uint64_t)bssid[i];
+    h *= 1099511628211ULL;
   }
-  return h == 0 ? 1u : h;
+  return h == 0 ? 1ULL : h;
 }
 
-static bool unique_bssid_track(const uint8_t bssid[6]) {
-  const uint32_t mask = WG_UNIQUE_BSSID_HASH_SLOTS - 1u;
-  uint32_t hash = bssid_hash32(bssid);
-  uint32_t idx = hash & mask;
-
-  for (uint32_t probe = 0; probe < WG_UNIQUE_BSSID_HASH_SLOTS; ++probe) {
-    uint32_t slot = s_unique_bssid_hashes[idx];
-    if (slot == hash) {
-      return false;
-    }
-    if (slot == 0) {
-      s_unique_bssid_hashes[idx] = hash;
-      if (s_unique_bssid_count < UINT16_MAX) {
-        s_unique_bssid_count++;
-      }
-      return true;
-    }
-    idx = (idx + 1u) & mask;
+static void unique_bssid_refresh_estimate(void) {
+  if (!s_unique_hll_dirty) {
+    return;
   }
-
-  if (s_unique_hash_table_full_events < UINT32_MAX) {
-    s_unique_hash_table_full_events++;
+  const double m = (double)WG_UNIQUE_HLL_REGISTERS;
+  const double alpha = 0.7213 / (1.0 + 1.079 / m);
+  double sum = 0.0;
+  uint32_t zero_regs = 0;
+  for (uint32_t i = 0; i < WG_UNIQUE_HLL_REGISTERS; ++i) {
+    uint8_t reg = s_unique_hll_regs[i];
+    if (reg == 0) {
+      zero_regs++;
+    }
+    sum += ldexp(1.0, -(int)reg);
   }
-  return false;
+  if (sum <= 0.0) {
+    s_unique_bssid_estimate = UINT32_MAX;
+    s_unique_hll_dirty = false;
+    return;
+  }
+  double estimate = alpha * m * m / sum;
+  if (estimate <= (2.5 * m) && zero_regs > 0) {
+    estimate = m * log(m / (double)zero_regs);
+  }
+  if (estimate < 0.0) {
+    estimate = 0.0;
+  } else if (estimate > (double)UINT32_MAX) {
+    estimate = (double)UINT32_MAX;
+  }
+  s_unique_bssid_estimate = (uint32_t)(estimate + 0.5);
+  s_unique_hll_dirty = false;
+}
+
+static void unique_bssid_track(const uint8_t bssid[6]) {
+  const uint64_t hash = bssid_hash64(bssid);
+  const uint32_t idx = (uint32_t)(hash & (WG_UNIQUE_HLL_REGISTERS - 1u));
+  const uint64_t w = hash >> WG_UNIQUE_HLL_P;
+  const uint8_t max_rank = (uint8_t)((64 - WG_UNIQUE_HLL_P) + 1);
+  uint8_t rank = 0;
+  if (w == 0) {
+    rank = max_rank;
+  } else {
+    unsigned leading = (unsigned)__builtin_clzll(w);
+    if (leading > WG_UNIQUE_HLL_P) {
+      leading -= WG_UNIQUE_HLL_P;
+    } else {
+      leading = 0;
+    }
+    rank = (uint8_t)(leading + 1u);
+    if (rank > max_rank) {
+      rank = max_rank;
+    }
+  }
+  if (rank > s_unique_hll_regs[idx]) {
+    s_unique_hll_regs[idx] = rank;
+    s_unique_hll_dirty = true;
+  }
 }
 
 #if CONFIG_WG_RGB_LED_ENABLE
@@ -753,7 +815,7 @@ static void led_sync_runtime_state(void) {
   s_led_state.scanning = s_scanning;
   s_led_state.gps_valid = s_latest_gps.valid;
   s_led_state.gps_source = s_latest_gps.valid ? (uint8_t)s_gps_source : 0;
-  s_led_state.replay_active = s_replay_active;
+  s_led_state.replay_active = s_replay_active || s_blob_active;
   s_led_state.backlog_present = s_queue_backlog_records > 0;
 }
 
@@ -1525,7 +1587,7 @@ static bool storage_select_next_replay_session_locked(uint64_t *session_id_out,
 }
 
 static bool storage_replay_allowed_locked(void) {
-  if (!s_storage_ready || !s_replay_requested) {
+  if (!s_storage_ready || !s_replay_requested || s_blob_requested) {
     return false;
   }
   if (s_scanning) {
@@ -1749,8 +1811,210 @@ static bool storage_prepare_replay_pending_locked(void) {
   return storage_prepare_replay_single_pending_locked();
 }
 
+static bool storage_blob_allowed_locked(void) {
+  if (!s_storage_ready || !s_blob_requested) {
+    return false;
+  }
+  if (s_scanning) {
+    return false;
+  }
+  if (!s_sighting_notify_enabled) {
+    return false;
+  }
+  return true;
+}
+
+static void storage_clear_blob_pending_locked(void) {
+  s_blob_pending_valid = false;
+  s_blob_pending_msg_type = WG_MSG_BACKLOG_BLOB_META;
+  s_blob_pending_len = 0;
+  s_blob_pending_chunk_len = 0;
+}
+
+static void storage_reset_blob_locked(void) {
+  if (s_blob_fp != NULL) {
+    fclose(s_blob_fp);
+    s_blob_fp = NULL;
+  }
+  s_blob_active = false;
+  s_blob_meta_sent = false;
+  s_blob_done_sent = false;
+  s_blob_waiting_ack = false;
+  s_blob_session_id = 0;
+  s_blob_file_bytes = 0;
+  s_blob_bytes_sent = 0;
+  s_blob_written_seq = 0;
+  s_blob_acked_seq = 0;
+  storage_clear_blob_pending_locked();
+}
+
+static void storage_maybe_start_blob_locked(void) {
+  if (s_blob_active || !storage_blob_allowed_locked()) {
+    return;
+  }
+  (void)storage_flush_pending_locked(true);
+
+  uint64_t sid = 0;
+  wg_session_manifest_t manifest = {0};
+  if (!storage_select_next_replay_session_locked(&sid, &manifest)) {
+    return;
+  }
+
+  char data_path[96] = {0};
+  storage_session_paths(sid, NULL, 0, data_path, sizeof(data_path));
+  struct stat st = {0};
+  if (stat(data_path, &st) != 0 || st.st_size <= 0 || st.st_size > UINT32_MAX) {
+    ESP_LOGW(TAG, "blob export stat failed sid=%016llX errno=%d", (unsigned long long)sid, errno);
+    return;
+  }
+
+  FILE *fp = fopen(data_path, "rb");
+  if (fp == NULL) {
+    ESP_LOGW(TAG, "blob export open failed sid=%016llX errno=%d", (unsigned long long)sid, errno);
+    return;
+  }
+
+  storage_reset_blob_locked();
+  s_blob_fp = fp;
+  s_blob_active = true;
+  s_blob_session_id = sid;
+  s_blob_file_bytes = (uint32_t)st.st_size;
+  s_blob_written_seq = manifest.last_seq_written;
+  s_blob_acked_seq = manifest.last_seq_acked;
+  ESP_LOGI(TAG, "blob export start sid=%016llX bytes=%lu acked=%lu written=%lu",
+           (unsigned long long)sid, (unsigned long)s_blob_file_bytes,
+           (unsigned long)s_blob_acked_seq, (unsigned long)s_blob_written_seq);
+}
+
+static bool storage_prepare_blob_pending_locked(void) {
+  if (s_blob_pending_valid) {
+    return true;
+  }
+  if (!s_blob_active) {
+    return false;
+  }
+
+  if (s_blob_waiting_ack) {
+    wg_session_manifest_t manifest = {0};
+    if (storage_read_manifest(s_blob_session_id, &manifest)) {
+      s_blob_acked_seq = manifest.last_seq_acked;
+      if (manifest.last_seq_acked >= s_blob_written_seq) {
+        ESP_LOGI(TAG, "blob export acked sid=%016llX seq=%lu",
+                 (unsigned long long)s_blob_session_id, (unsigned long)manifest.last_seq_acked);
+        storage_reset_blob_locked();
+        storage_maybe_start_blob_locked();
+      }
+    }
+    return false;
+  }
+
+  if (!s_blob_meta_sent) {
+    uint8_t payload[WG_BLOB_META_PAYLOAD_SIZE] = {0};
+    wr_u64_le(&payload[0], s_blob_session_id);
+    wr_u32_le(&payload[8], s_blob_file_bytes);
+    wr_u32_le(&payload[12], s_blob_acked_seq);
+    wr_u32_le(&payload[16], s_blob_written_seq);
+    memcpy(s_blob_pending_payload, payload, sizeof(payload));
+    s_blob_pending_msg_type = WG_MSG_BACKLOG_BLOB_META;
+    s_blob_pending_len = sizeof(payload);
+    s_blob_pending_chunk_len = 0;
+    s_blob_pending_valid = true;
+    return true;
+  }
+
+  if (s_blob_bytes_sent < s_blob_file_bytes) {
+    uint32_t remaining = s_blob_file_bytes - s_blob_bytes_sent;
+    uint16_t chunk_len =
+        (remaining > WG_BLOB_CHUNK_DATA_MAX) ? WG_BLOB_CHUNK_DATA_MAX : (uint16_t)remaining;
+    size_t n = fread(&s_blob_pending_payload[WG_BLOB_CHUNK_HEADER_SIZE], 1, chunk_len, s_blob_fp);
+    if (n != chunk_len) {
+      ESP_LOGW(TAG, "blob export read failed sid=%016llX sent=%lu wanted=%u got=%u",
+               (unsigned long long)s_blob_session_id, (unsigned long)s_blob_bytes_sent,
+               (unsigned)chunk_len, (unsigned)n);
+      storage_reset_blob_locked();
+      return false;
+    }
+    wr_u64_le(&s_blob_pending_payload[0], s_blob_session_id);
+    wr_u32_le(&s_blob_pending_payload[8], s_blob_bytes_sent);
+    wr_u16_le(&s_blob_pending_payload[12], chunk_len);
+    s_blob_pending_msg_type = WG_MSG_BACKLOG_BLOB_CHUNK;
+    s_blob_pending_len = (uint16_t)(WG_BLOB_CHUNK_HEADER_SIZE + chunk_len);
+    s_blob_pending_chunk_len = chunk_len;
+    s_blob_pending_valid = true;
+    return true;
+  }
+
+  if (!s_blob_done_sent) {
+    uint8_t payload[WG_BLOB_DONE_PAYLOAD_SIZE] = {0};
+    wr_u64_le(&payload[0], s_blob_session_id);
+    wr_u32_le(&payload[8], s_blob_file_bytes);
+    wr_u32_le(&payload[12], s_blob_written_seq);
+    memcpy(s_blob_pending_payload, payload, sizeof(payload));
+    s_blob_pending_msg_type = WG_MSG_BACKLOG_BLOB_DONE;
+    s_blob_pending_len = sizeof(payload);
+    s_blob_pending_chunk_len = 0;
+    s_blob_pending_valid = true;
+    return true;
+  }
+
+  return false;
+}
+
+static void storage_run_blob_tick(void) {
+  if (!s_storage_ready) {
+    return;
+  }
+  for (uint32_t budget = 0; budget < WG_STORAGE_BLOB_BUDGET_PER_TICK; ++budget) {
+    if (!storage_lock(pdMS_TO_TICKS(20))) {
+      return;
+    }
+    if (!storage_blob_allowed_locked()) {
+      storage_reset_blob_locked();
+      storage_unlock();
+      break;
+    }
+    storage_maybe_start_blob_locked();
+    if (!storage_prepare_blob_pending_locked()) {
+      storage_unlock();
+      break;
+    }
+    uint8_t msg_type = s_blob_pending_msg_type;
+    uint16_t payload_len = s_blob_pending_len;
+    uint16_t chunk_len = s_blob_pending_chunk_len;
+    uint8_t payload[WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD] = {0};
+    if (payload_len > sizeof(payload)) {
+      storage_clear_blob_pending_locked();
+      storage_unlock();
+      continue;
+    }
+    memcpy(payload, s_blob_pending_payload, payload_len);
+    storage_unlock();
+
+    if (!ble_notify_framed(s_sighting_handle, msg_type, payload, payload_len)) {
+      break;
+    }
+
+    if (!storage_lock(pdMS_TO_TICKS(20))) {
+      return;
+    }
+    if (msg_type == WG_MSG_BACKLOG_BLOB_META) {
+      s_blob_meta_sent = true;
+    } else if (msg_type == WG_MSG_BACKLOG_BLOB_CHUNK) {
+      s_blob_bytes_sent += chunk_len;
+    } else if (msg_type == WG_MSG_BACKLOG_BLOB_DONE) {
+      s_blob_done_sent = true;
+      s_blob_waiting_ack = true;
+    }
+    storage_clear_blob_pending_locked();
+    storage_unlock();
+  }
+}
+
 static void storage_run_replay_tick(void) {
   if (!s_storage_ready) {
+    return;
+  }
+  if (s_blob_requested) {
     return;
   }
   for (uint32_t budget = 0; budget < WG_STORAGE_REPLAY_BUDGET_PER_TICK; ++budget) {
@@ -1814,6 +2078,10 @@ static void storage_set_replay_enabled(bool enabled) {
   if (!storage_lock(pdMS_TO_TICKS(80))) {
     return;
   }
+  if (enabled) {
+    s_blob_requested = false;
+    storage_reset_blob_locked();
+  }
   s_replay_requested = enabled;
   if (!enabled) {
     storage_reset_replay_locked();
@@ -1829,6 +2097,29 @@ static void storage_set_replay_enabled(bool enabled) {
   storage_unlock();
 }
 
+static void storage_set_blob_enabled(bool enabled) {
+  if (!storage_lock(pdMS_TO_TICKS(80))) {
+    return;
+  }
+  if (enabled) {
+    s_replay_requested = false;
+    storage_reset_replay_locked();
+  }
+  s_blob_requested = enabled;
+  if (!enabled) {
+    storage_reset_blob_locked();
+    storage_unlock();
+    return;
+  }
+  if (!storage_blob_allowed_locked()) {
+    storage_reset_blob_locked();
+    storage_unlock();
+    return;
+  }
+  storage_maybe_start_blob_locked();
+  storage_unlock();
+}
+
 static bool storage_clear_sessions(void) {
   if (!s_storage_ready) {
     return false;
@@ -1840,6 +2131,8 @@ static bool storage_clear_sessions(void) {
   (void)storage_flush_pending_locked(true);
   s_replay_requested = false;
   storage_reset_replay_locked();
+  s_blob_requested = false;
+  storage_reset_blob_locked();
 
   if (s_session_open) {
     storage_close_session_locked(WG_SESSION_STATE_ABORTED);
@@ -1993,6 +2286,10 @@ static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq) 
       s_replay_prefetch_session_id = 0;
       s_replay_prefetch_seq = 0;
     }
+    if (s_blob_active && s_blob_session_id == session_id &&
+        manifest.last_seq_acked > s_blob_acked_seq) {
+      s_blob_acked_seq = manifest.last_seq_acked;
+    }
     storage_unlock();
     return true;
   }
@@ -2010,6 +2307,9 @@ static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq) 
   }
   if (s_replay_active && s_replay_session_id == session_id && highest_seq > s_replay_acked_seq) {
     s_replay_acked_seq = highest_seq;
+  }
+  if (s_blob_active && s_blob_session_id == session_id && highest_seq > s_blob_acked_seq) {
+    s_blob_acked_seq = highest_seq;
   }
   if (s_replay_pending_valid && s_replay_pending_session_id == session_id &&
       highest_seq >= s_replay_pending_seq) {
@@ -2204,7 +2504,7 @@ static void log_bridge_diagnostics(bool force) {
            "diag gps src=%s valid=%d baud=%d nav_hz=%u nav_mode=%s uart_rx_bytes=%lu rx_age_ms=%lld "
            "fix_age_ms=%lld rate_age_ms=%lld "
            "lines=%lu gga=%lu rmc=%lu gsa=%lu gsv=%lu other=%lu fix_updates=%lu "
-           "unique_total=%u hash_full=%lu lat=%ld lon=%ld acc_cm=%u sats=%u hdop=%.2f pdop=%.2f "
+           "unique_est=%lu lat=%ld lon=%ld acc_cm=%u sats=%u hdop=%.2f pdop=%.2f "
            "gga_rej_latlon=%lu gga_rej_fix=%lu rmc_rej_status=%lu rmc_rej_latlon=%lu "
            "last_fixq=%d last_sats=%d last_rmc=%c",
            gps_source_name(s_gps_source), s_latest_gps.valid ? 1 : 0, s_gps_uart_baud_active,
@@ -2215,8 +2515,8 @@ static void log_bridge_diagnostics(bool force) {
            (unsigned long)s_gps_nmea_gga, (unsigned long)s_gps_nmea_rmc,
            (unsigned long)s_gps_nmea_gsa, (unsigned long)s_gps_nmea_gsv,
            (unsigned long)s_gps_nmea_other,
-           (unsigned long)s_gps_fix_updates, (unsigned)s_unique_bssid_count,
-           (unsigned long)s_unique_hash_table_full_events, (long)s_latest_gps.lat_e7,
+           (unsigned long)s_gps_fix_updates, (unsigned long)s_unique_bssid_estimate,
+           (long)s_latest_gps.lat_e7,
            (long)s_latest_gps.lon_e7, s_latest_gps.accuracy_cm, (unsigned)s_latest_gps.sat_count,
            (double)s_latest_gps.hdop_centi / 100.0, (double)s_latest_gps.pdop_centi / 100.0,
            (unsigned long)s_gps_gga_reject_latlon, (unsigned long)s_gps_gga_reject_fix,
@@ -2244,12 +2544,18 @@ static void log_bridge_diagnostics(bool force) {
 
   ESP_LOGI(TAG,
            "diag store ready=%d open=%d sid=%016llX backlog_records=%lu backlog_bytes=%lu "
-           "replay_req=%d replay=%d replay_sid=%016llX replay_cursor=%lu queue_full=%d dropped_full=%lu",
+           "replay_req=%d replay=%d replay_sid=%016llX replay_cursor=%lu "
+           "blob_req=%d blob=%d blob_sid=%016llX blob_bytes=%lu/%lu "
+           "queue_full=%d dropped_full=%lu",
            s_storage_ready ? 1 : 0, s_session_open ? 1 : 0, (unsigned long long)s_session_id,
            (unsigned long)s_queue_backlog_records, (unsigned long)s_queue_backlog_bytes,
            s_replay_requested ? 1 : 0, s_replay_active ? 1 : 0,
            (unsigned long long)s_replay_session_id,
-           (unsigned long)s_replay_cursor_seq, s_queue_full ? 1 : 0,
+           (unsigned long)s_replay_cursor_seq,
+           s_blob_requested ? 1 : 0, s_blob_active ? 1 : 0,
+           (unsigned long long)s_blob_session_id,
+           (unsigned long)s_blob_bytes_sent, (unsigned long)s_blob_file_bytes,
+           s_queue_full ? 1 : 0,
            (unsigned long)s_dropped_flash_full);
 
   if (!s_node_seen_hello && s_node_uart_rx_bytes == 0 && s_node_tx_frames >= 20 &&
@@ -2292,13 +2598,26 @@ static uint16_t current_gps_accuracy_dm(void) {
 }
 
 static void build_status_payload(wg_status_payload_t *payload) {
+  unique_bssid_refresh_estimate();
+  size_t spiffs_total = 0;
+  size_t spiffs_used = 0;
+  if (s_storage_ready) {
+    if (esp_spiffs_info("spiffs", &spiffs_total, &spiffs_used) != ESP_OK) {
+      spiffs_total = 0;
+      spiffs_used = 0;
+    }
+  }
+  uint32_t spiffs_total_u32 = (spiffs_total > UINT32_MAX) ? UINT32_MAX : (uint32_t)spiffs_total;
+  uint32_t spiffs_used_u32 = (spiffs_used > UINT32_MAX) ? UINT32_MAX : (uint32_t)spiffs_used;
+  uint32_t spiffs_free_u32 =
+      (spiffs_total_u32 > spiffs_used_u32) ? (spiffs_total_u32 - spiffs_used_u32) : 0;
   *payload = (wg_status_payload_t){
       .scanning = s_scanning,
       .ble_encrypted = s_ble_encrypted,
       .current_channel = s_current_channel,
       .hop_ms = s_hop_ms,
       .channel_mask = s_channel_mask,
-      .unique_bssid_count = s_unique_bssid_count,
+      .unique_bssids_estimate = s_unique_bssid_estimate,
       .packets_per_sec = s_packets_per_sec,
       .dropped_notifies = s_notify_drops,
       .boot_mode = s_boot_mode,
@@ -2315,11 +2634,19 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .session_id = s_session_open ? s_session_id : s_last_session_id,
       .queued_records = s_queue_backlog_records,
       .queued_bytes = s_queue_backlog_bytes,
-      .replay_active = s_replay_active,
-      .replay_cursor = s_replay_cursor_seq,
+      .replay_active = s_replay_active || s_blob_active,
+      .replay_cursor = s_blob_active ? s_blob_bytes_sent : s_replay_cursor_seq,
       .queue_full = s_queue_full,
       .dropped_flash_full = s_dropped_flash_full,
       .node_count = 2,
+      .gps_nav_applied_hz = s_gps_nav_rate_hz,
+      .spiffs_total_bytes = spiffs_total_u32,
+      .spiffs_used_bytes = spiffs_used_u32,
+      .spiffs_free_bytes = spiffs_free_u32,
+      .blob_active = s_blob_active,
+      .blob_session_id = s_blob_session_id,
+      .blob_bytes_sent = s_blob_bytes_sent,
+      .blob_bytes_total = s_blob_file_bytes,
   };
 }
 
@@ -3427,6 +3754,23 @@ static bool send_snapshot_end(void) {
 
 static uint16_t rd_u16_le(const uint8_t *in) { return (uint16_t)in[0] | ((uint16_t)in[1] << 8); }
 
+static void wr_u16_le(uint8_t *out, uint16_t value) {
+  out[0] = (uint8_t)(value & 0xFF);
+  out[1] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+static void wr_u32_le(uint8_t *out, uint32_t value) {
+  out[0] = (uint8_t)(value & 0xFF);
+  out[1] = (uint8_t)((value >> 8) & 0xFF);
+  out[2] = (uint8_t)((value >> 16) & 0xFF);
+  out[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static void wr_u64_le(uint8_t *out, uint64_t value) {
+  wr_u32_le(out, (uint32_t)(value & 0xFFFFFFFFULL));
+  wr_u32_le(out + 4, (uint32_t)((value >> 32) & 0xFFFFFFFFULL));
+}
+
 static uint8_t rsn_cipher_flags_from_suite(const uint8_t *suite) {
   if (suite[0] != 0x00 || suite[1] != 0x0F || suite[2] != 0xAC) {
     return 0;
@@ -4187,7 +4531,7 @@ static void publish_sighting_event(ap_entry_t *entry, uint8_t flags, uint8_t nod
     storage_unlock();
   }
 
-  if (persisted && s_replay_active) {
+  if (persisted && (s_replay_active || s_blob_active)) {
     return;
   }
 
@@ -4209,6 +4553,7 @@ static void channel_hopper_cb(void *arg) {
 
 static void status_tick_once(void) {
   rate_counter_tick(now_ms());
+  unique_bssid_refresh_estimate();
   (void)storage_flush_pending(false);
   storage_refresh_backlog(false);
   if (s_node_status.link_up && (now_ms() - s_node_status.last_rx_ms) > WG_NODE_STALE_MS) {
@@ -4232,6 +4577,7 @@ static void replay_task(void *arg) {
   (void)arg;
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(WG_REPLAY_TASK_INTERVAL_MS));
+    storage_run_blob_tick();
     storage_run_replay_tick();
   }
 }
@@ -4246,6 +4592,7 @@ static esp_err_t start_scan(void) {
   }
 
   storage_set_replay_enabled(false);
+  storage_set_blob_enabled(false);
   seed_ap_cache_from_active_scan();
   if (s_storage_ready && !storage_open_session()) {
     ESP_LOGW(TAG, "Scan start blocked: storage session open failed");
@@ -4413,6 +4760,16 @@ static uint8_t apply_command(const wg_command_t *cmd) {
       storage_set_replay_enabled(cmd->replay_enable == 1);
       notify_status_frame();
       return WG_ACK_OK;
+    case WG_CMD_SET_BACKLOG_BLOB:
+      if (cmd->backlog_blob_enable > 1) {
+        return WG_ERR_BAD_ARG;
+      }
+      if (cmd->backlog_blob_enable == 1 && s_scanning) {
+        return WG_ERR_BUSY;
+      }
+      storage_set_blob_enabled(cmd->backlog_blob_enable == 1);
+      notify_status_frame();
+      return WG_ACK_OK;
     case WG_CMD_CLEAR_STORAGE:
       if (s_scanning) {
         return WG_ERR_BUSY;
@@ -4563,10 +4920,10 @@ static int handle_gatt_write(uint16_t conn_handle, uint16_t attr_handle,
   }
 
   const uint16_t incoming_len = OS_MBUF_PKTLEN(ctxt->om);
-  if (incoming_len > 196) {
+  if (incoming_len > WG_HOST_FRAME_MAX_PAYLOAD) {
     return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
   }
-  uint8_t incoming[196] = {0};
+  uint8_t incoming[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
   uint16_t copied = 0;
   if (ble_hs_mbuf_to_flat(ctxt->om, incoming, sizeof(incoming), &copied) != 0) {
     return BLE_ATT_ERR_UNLIKELY;
@@ -4718,6 +5075,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       s_gps_notify_enabled = false;
       s_sighting_notify_enabled = false;
       storage_set_replay_enabled(false);
+      storage_set_blob_enabled(false);
       led_sync_link_state();
       ble_advertise();
       return 0;

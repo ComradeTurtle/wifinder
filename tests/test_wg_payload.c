@@ -65,7 +65,7 @@ static void test_status_payload_encoding(void) {
       .current_channel = 6,
       .hop_ms = 250,
       .channel_mask = 0x1001,
-      .unique_bssid_count = 77,
+      .unique_bssids_estimate = 70000,
       .packets_per_sec = 120,
       .dropped_notifies = 2,
       .boot_mode = WG_BOOT_AUTO,
@@ -87,9 +87,17 @@ static void test_status_payload_encoding(void) {
       .queue_full = false,
       .dropped_flash_full = 7,
       .node_count = 2,
+      .gps_nav_applied_hz = 4,
+      .spiffs_total_bytes = 16 * 1024 * 1024,
+      .spiffs_used_bytes = 9 * 1024 * 1024,
+      .spiffs_free_bytes = 7 * 1024 * 1024,
+      .blob_active = true,
+      .blob_session_id = 0x8877665544332211ULL,
+      .blob_bytes_sent = 123456,
+      .blob_bytes_total = 456789,
   };
 
-  uint8_t out[64] = {0};
+  uint8_t out[WG_STATUS_PAYLOAD_SIZE] = {0};
   size_t written = wg_build_status_payload(&status, out, sizeof(out));
   assert_true(written == WG_STATUS_PAYLOAD_SIZE, "status payload should have fixed size");
   assert_u8(out[0], 1, "scanning flag should be encoded");
@@ -97,6 +105,7 @@ static void test_status_payload_encoding(void) {
   assert_u8(out[2], 6, "current channel should be encoded");
   assert_u16(rd_u16(&out[3]), 250, "hop interval should be little-endian");
   assert_u16(rd_u16(&out[5]), 0x1001, "channel mask should be little-endian");
+  assert_u16(rd_u16(&out[7]), 0xFFFF, "legacy unique bssid count should clamp to u16");
   assert_u8(out[14], 1, "gps_valid flag should be encoded");
   assert_u16(rd_u16(&out[15]), 7, "gps age should be little-endian");
   assert_u16(rd_u16(&out[17]), 14, "gps accuracy should be little-endian");
@@ -115,6 +124,15 @@ static void test_status_payload_encoding(void) {
   assert_u8(out[51], 0, "queue_full should be encoded");
   assert_u32(rd_u32(&out[52]), 7, "dropped_flash_full should be little-endian");
   assert_u8(out[56], 2, "node_count should be encoded");
+  assert_u32(rd_u32(&out[57]), 70000, "extended unique bssid estimate should be encoded");
+  assert_u8(out[61], 4, "gps nav applied hz should be encoded");
+  assert_u32(rd_u32(&out[62]), 16 * 1024 * 1024, "spiffs total bytes should be encoded");
+  assert_u32(rd_u32(&out[66]), 9 * 1024 * 1024, "spiffs used bytes should be encoded");
+  assert_u32(rd_u32(&out[70]), 7 * 1024 * 1024, "spiffs free bytes should be encoded");
+  assert_u8(out[74], 1, "blob active should be encoded");
+  assert_u64(rd_u64(&out[75]), 0x8877665544332211ULL, "blob session id should be encoded");
+  assert_u32(rd_u32(&out[83]), 123456, "blob bytes sent should be encoded");
+  assert_u32(rd_u32(&out[87]), 456789, "blob bytes total should be encoded");
 }
 
 static void test_sighting_payload_encoding(void) {

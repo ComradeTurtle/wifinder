@@ -29,7 +29,10 @@ size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, 
   out[2] = status->current_channel;
   wr_u16(&out[3], status->hop_ms);
   wr_u16(&out[5], status->channel_mask);
-  wr_u16(&out[7], status->unique_bssid_count);
+  const uint16_t unique_legacy =
+      status->unique_bssids_estimate > UINT16_MAX ? UINT16_MAX
+                                                  : (uint16_t)status->unique_bssids_estimate;
+  wr_u16(&out[7], unique_legacy);
   wr_u16(&out[9], status->packets_per_sec);
   wr_u16(&out[11], status->dropped_notifies);
   out[13] = status->boot_mode;
@@ -51,6 +54,15 @@ size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, 
   out[51] = status->queue_full ? 1 : 0;
   wr_u32(&out[52], status->dropped_flash_full);
   out[56] = status->node_count;
+  wr_u32(&out[57], status->unique_bssids_estimate);
+  out[61] = status->gps_nav_applied_hz;
+  wr_u32(&out[62], status->spiffs_total_bytes);
+  wr_u32(&out[66], status->spiffs_used_bytes);
+  wr_u32(&out[70], status->spiffs_free_bytes);
+  out[74] = status->blob_active ? 1 : 0;
+  wr_u64(&out[75], status->blob_session_id);
+  wr_u32(&out[83], status->blob_bytes_sent);
+  wr_u32(&out[87], status->blob_bytes_total);
 
   return WG_STATUS_PAYLOAD_SIZE;
 }
