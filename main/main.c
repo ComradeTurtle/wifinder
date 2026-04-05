@@ -111,7 +111,9 @@ _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
 #define WG_STORAGE_BLOCK_SIZE 1024
 #define WG_STORAGE_BLOCK_MAGIC 0x314B4257U
 #define WG_STORAGE_META_MAGIC 0x314D5157U
+#define WG_STORAGE_META_SLOT_B_SUFFIX ".b"
 #define WG_STORAGE_VERSION 1
+#define WG_STORAGE_MANIFEST_GEN_MAGIC 0xA5
 #define WG_STORAGE_BLOCK_FLUSH_MS 1200
 #define WG_STORAGE_RECORD_HDR_SIZE 2
 #define WG_STORAGE_REPLAY_BUDGET_PER_TICK 8
@@ -413,6 +415,7 @@ static SemaphoreHandle_t s_store_mutex = NULL;
 static bool s_storage_ready = false;
 static wg_storage_backend_t s_storage_backend = WG_STORAGE_BACKEND_NONE;
 static sdmmc_card_t *s_storage_sd_card = NULL;
+static bool s_storage_fsync_unsupported_warned = false;
 static bool s_session_open = false;
 static uint64_t s_session_id = 0;
 static uint64_t s_last_session_id = 0;
@@ -1236,6 +1239,18 @@ static void storage_session_paths(uint64_t session_id, char *meta_path, size_t m
   }
 }
 
+static void storage_manifest_paths(uint64_t session_id, char *slot_a_path, size_t slot_a_size,
+                                   char *slot_b_path, size_t slot_b_size) {
+  char primary[96] = {0};
+  storage_session_paths(session_id, primary, sizeof(primary), NULL, 0);
+  if (slot_a_path != NULL && slot_a_size > 0) {
+    snprintf(slot_a_path, slot_a_size, "%s", primary);
+  }
+  if (slot_b_path != NULL && slot_b_size > 0) {
+    snprintf(slot_b_path, slot_b_size, "%s" WG_STORAGE_META_SLOT_B_SUFFIX, primary);
+  }
+}
+
 static bool storage_parse_meta_filename(const char *name, uint64_t *session_id_out) {
   if (name == NULL || session_id_out == NULL) {
     return false;
@@ -1256,6 +1271,72 @@ static bool storage_parse_meta_filename(const char *name, uint64_t *session_id_o
   }
   *session_id_out = (uint64_t)parsed;
   return true;
+}
+
+static uint32_t storage_manifest_generation_get(const wg_session_manifest_t *manifest,
+                                                bool *valid_out) {
+  bool valid = (manifest != NULL && manifest->reserved1[2] == WG_STORAGE_MANIFEST_GEN_MAGIC);
+  if (valid_out != NULL) {
+    *valid_out = valid;
+  }
+  if (!valid) {
+    return 0;
+  }
+  return (uint32_t)manifest->reserved0 | ((uint32_t)manifest->reserved1[0] << 16) |
+         ((uint32_t)manifest->reserved1[1] << 24);
+}
+
+static void storage_manifest_generation_set(wg_session_manifest_t *manifest, uint32_t generation) {
+  if (manifest == NULL) {
+    return;
+  }
+  manifest->reserved0 = (uint16_t)(generation & 0xFFFFU);
+  manifest->reserved1[0] = (uint8_t)((generation >> 16) & 0xFFU);
+  manifest->reserved1[1] = (uint8_t)((generation >> 24) & 0xFFU);
+  manifest->reserved1[2] = WG_STORAGE_MANIFEST_GEN_MAGIC;
+}
+
+static int storage_manifest_generation_cmp(uint32_t lhs, uint32_t rhs) {
+  if (lhs == rhs) {
+    return 0;
+  }
+  uint32_t delta = lhs - rhs;
+  return (delta < 0x80000000U) ? 1 : -1;
+}
+
+static int storage_manifest_compare_freshness(const wg_session_manifest_t *lhs,
+                                              const wg_session_manifest_t *rhs) {
+  if (lhs == NULL || rhs == NULL) {
+    return 0;
+  }
+  bool lhs_has_gen = false;
+  bool rhs_has_gen = false;
+  uint32_t lhs_gen = storage_manifest_generation_get(lhs, &lhs_has_gen);
+  uint32_t rhs_gen = storage_manifest_generation_get(rhs, &rhs_has_gen);
+  if (lhs_has_gen || rhs_has_gen) {
+    if (lhs_has_gen && rhs_has_gen) {
+      int cmp = storage_manifest_generation_cmp(lhs_gen, rhs_gen);
+      if (cmp != 0) {
+        return cmp;
+      }
+    } else {
+      return lhs_has_gen ? 1 : -1;
+    }
+  }
+
+  if (lhs->last_seq_written != rhs->last_seq_written) {
+    return (lhs->last_seq_written > rhs->last_seq_written) ? 1 : -1;
+  }
+  if (lhs->records_written != rhs->records_written) {
+    return (lhs->records_written > rhs->records_written) ? 1 : -1;
+  }
+  if (lhs->records_acked != rhs->records_acked) {
+    return (lhs->records_acked > rhs->records_acked) ? 1 : -1;
+  }
+  if (lhs->state != rhs->state) {
+    return (lhs->state > rhs->state) ? 1 : -1;
+  }
+  return 0;
 }
 
 static bool storage_read_manifest_path(const char *meta_path, wg_session_manifest_t *out) {
@@ -1285,9 +1366,98 @@ static bool storage_read_manifest_path(const char *meta_path, wg_session_manifes
 }
 
 static bool storage_read_manifest(uint64_t session_id, wg_session_manifest_t *out) {
-  char meta_path[96] = {0};
-  storage_session_paths(session_id, meta_path, sizeof(meta_path), NULL, 0);
-  return storage_read_manifest_path(meta_path, out);
+  if (out == NULL || session_id == 0) {
+    return false;
+  }
+  char meta_a_path[96] = {0};
+  char meta_b_path[100] = {0};
+  storage_manifest_paths(session_id, meta_a_path, sizeof(meta_a_path), meta_b_path, sizeof(meta_b_path));
+
+  wg_session_manifest_t slot_a_manifest = {0};
+  wg_session_manifest_t slot_b_manifest = {0};
+  bool has_a = storage_read_manifest_path(meta_a_path, &slot_a_manifest) &&
+               slot_a_manifest.session_id == session_id;
+  bool has_b = storage_read_manifest_path(meta_b_path, &slot_b_manifest) &&
+               slot_b_manifest.session_id == session_id;
+  if (!has_a && !has_b) {
+    return false;
+  }
+  if (has_a && has_b) {
+    *out = (storage_manifest_compare_freshness(&slot_a_manifest, &slot_b_manifest) >= 0)
+               ? slot_a_manifest
+               : slot_b_manifest;
+    return true;
+  }
+  *out = has_a ? slot_a_manifest : slot_b_manifest;
+  return true;
+}
+
+static bool storage_commit_file(FILE *fp, const char *kind, uint64_t session_id) {
+  if (fp == NULL || kind == NULL) {
+    return false;
+  }
+  if (fflush(fp) != 0) {
+    ESP_LOGW(TAG, "%s flush failed sid=%016llX errno=%d", kind, (unsigned long long)session_id, errno);
+    return false;
+  }
+  int fd = fileno(fp);
+  if (fd < 0) {
+    ESP_LOGW(TAG, "%s fileno failed sid=%016llX errno=%d", kind, (unsigned long long)session_id, errno);
+    return false;
+  }
+  if (fsync(fd) != 0) {
+    int saved_errno = errno;
+    if (saved_errno == EINVAL || saved_errno == ENOSYS
+#ifdef ENOTSUP
+        || saved_errno == ENOTSUP
+#endif
+#ifdef EOPNOTSUPP
+        || saved_errno == EOPNOTSUPP
+#endif
+    ) {
+      if (!s_storage_fsync_unsupported_warned) {
+        s_storage_fsync_unsupported_warned = true;
+        ESP_LOGW(TAG, "%s fsync unsupported sid=%016llX errno=%d", kind,
+                 (unsigned long long)session_id, saved_errno);
+      }
+      return true;
+    }
+    ESP_LOGW(TAG, "%s fsync failed sid=%016llX errno=%d", kind, (unsigned long long)session_id,
+             saved_errno);
+    return false;
+  }
+  return true;
+}
+
+static bool storage_write_manifest_path(const char *meta_path, const wg_session_manifest_t *manifest) {
+  if (meta_path == NULL || manifest == NULL) {
+    return false;
+  }
+  FILE *fp = fopen(meta_path, "r+b");
+  if (fp == NULL) {
+    fp = fopen(meta_path, "wb");
+  }
+  if (fp == NULL) {
+    ESP_LOGW(TAG, "manifest write open failed sid=%016llX path=%s errno=%d",
+             (unsigned long long)manifest->session_id, meta_path, errno);
+    return false;
+  }
+  if (fseek(fp, 0, SEEK_SET) != 0) {
+    ESP_LOGW(TAG, "manifest seek failed sid=%016llX path=%s errno=%d",
+             (unsigned long long)manifest->session_id, meta_path, errno);
+    fclose(fp);
+    return false;
+  }
+  size_t written = fwrite(manifest, 1, sizeof(*manifest), fp);
+  bool committed = (written == sizeof(*manifest)) &&
+                   storage_commit_file(fp, "manifest write", manifest->session_id);
+  fclose(fp);
+  if (!committed) {
+    ESP_LOGW(TAG, "manifest write failed sid=%016llX path=%s errno=%d",
+             (unsigned long long)manifest->session_id, meta_path, errno);
+    return false;
+  }
+  return true;
 }
 
 static bool storage_write_manifest(const wg_session_manifest_t *manifest_in) {
@@ -1298,37 +1468,49 @@ static bool storage_write_manifest(const wg_session_manifest_t *manifest_in) {
   manifest.magic = WG_STORAGE_META_MAGIC;
   manifest.version = WG_STORAGE_VERSION;
   manifest.size = sizeof(manifest);
+  char meta_a_path[96] = {0};
+  char meta_b_path[100] = {0};
+  storage_manifest_paths(manifest.session_id, meta_a_path, sizeof(meta_a_path), meta_b_path,
+                         sizeof(meta_b_path));
+
+  wg_session_manifest_t slot_a_manifest = {0};
+  wg_session_manifest_t slot_b_manifest = {0};
+  bool has_a = storage_read_manifest_path(meta_a_path, &slot_a_manifest) &&
+               slot_a_manifest.session_id == manifest.session_id;
+  bool has_b = storage_read_manifest_path(meta_b_path, &slot_b_manifest) &&
+               slot_b_manifest.session_id == manifest.session_id;
+
+  bool write_slot_a = true;
+  uint32_t next_generation = 1;
+  if (has_a || has_b) {
+    bool newer_is_a = has_a;
+    wg_session_manifest_t newer_manifest = {0};
+    if (has_a && has_b) {
+      newer_is_a = (storage_manifest_compare_freshness(&slot_a_manifest, &slot_b_manifest) >= 0);
+      newer_manifest = newer_is_a ? slot_a_manifest : slot_b_manifest;
+    } else {
+      newer_manifest = has_a ? slot_a_manifest : slot_b_manifest;
+    }
+    bool has_gen = false;
+    uint32_t current_generation = storage_manifest_generation_get(&newer_manifest, &has_gen);
+    if (has_gen) {
+      next_generation = current_generation + 1U;
+      if (next_generation == 0) {
+        next_generation = 1;
+      }
+    }
+    write_slot_a = !newer_is_a;
+  }
+  storage_manifest_generation_set(&manifest, next_generation);
   manifest.crc32 = 0;
   manifest.crc32 = crc32_ieee((const uint8_t *)&manifest, sizeof(manifest));
 
-  char meta_path[96] = {0};
-  storage_session_paths(manifest.session_id, meta_path, sizeof(meta_path), NULL, 0);
-  FILE *fp = fopen(meta_path, "r+b");
-  if (fp == NULL) {
-    fp = fopen(meta_path, "wb");
+  const char *primary_path = write_slot_a ? meta_a_path : meta_b_path;
+  const char *fallback_path = write_slot_a ? meta_b_path : meta_a_path;
+  if (storage_write_manifest_path(primary_path, &manifest)) {
+    return true;
   }
-  if (fp == NULL) {
-    ESP_LOGW(TAG, "manifest write open failed sid=%016llX errno=%d",
-             (unsigned long long)manifest.session_id, errno);
-    return false;
-  }
-  if (fseek(fp, 0, SEEK_SET) != 0) {
-    ESP_LOGW(TAG, "manifest seek failed sid=%016llX errno=%d", (unsigned long long)manifest.session_id,
-             errno);
-    fclose(fp);
-    return false;
-  }
-  size_t written = fwrite(&manifest, 1, sizeof(manifest), fp);
-  if (written == sizeof(manifest) && fflush(fp) != 0) {
-    written = 0;
-  }
-  fclose(fp);
-  if (written != sizeof(manifest)) {
-    ESP_LOGW(TAG, "manifest write failed sid=%016llX errno=%d", (unsigned long long)manifest.session_id,
-             errno);
-    return false;
-  }
-  return true;
+  return storage_write_manifest_path(fallback_path, &manifest);
 }
 
 static uint64_t storage_generate_session_id(void) {
@@ -1362,9 +1544,11 @@ static uint32_t storage_reclaim_acked_sessions_locked(void) {
     }
     wg_session_manifest_t manifest = {0};
     char meta_path[96] = {0};
+    char meta_path_b[100] = {0};
     char data_path[96] = {0};
-    storage_session_paths(sid, meta_path, sizeof(meta_path), data_path, sizeof(data_path));
-    if (!storage_read_manifest_path(meta_path, &manifest)) {
+    storage_manifest_paths(sid, meta_path, sizeof(meta_path), meta_path_b, sizeof(meta_path_b));
+    storage_session_paths(sid, NULL, 0, data_path, sizeof(data_path));
+    if (!storage_read_manifest(sid, &manifest)) {
       continue;
     }
     if (manifest.state == WG_SESSION_STATE_OPEN) {
@@ -1373,7 +1557,14 @@ static uint32_t storage_reclaim_acked_sessions_locked(void) {
     if (manifest.records_written == 0 || manifest.records_acked < manifest.records_written) {
       continue;
     }
+    bool removed_any = false;
     if (unlink(meta_path) == 0) {
+      removed_any = true;
+    }
+    if (unlink(meta_path_b) == 0) {
+      removed_any = true;
+    }
+    if (removed_any) {
       reclaimed++;
     }
     (void)unlink(data_path);
@@ -1447,8 +1638,9 @@ static bool storage_flush_pending_locked(bool force) {
   memcpy(block, &header, sizeof(header));
   memcpy(block + sizeof(header), s_store_block_payload, s_store_block_payload_len);
   size_t written = fwrite(block, 1, sizeof(block), fp);
+  bool committed = (written == sizeof(block)) && storage_commit_file(fp, "block flush", s_session_id);
   fclose(fp);
-  if (written != sizeof(block)) {
+  if (!committed) {
     ESP_LOGW(TAG, "block flush write failed sid=%016llX", (unsigned long long)s_session_id);
     return false;
   }
@@ -2403,7 +2595,8 @@ static bool storage_clear_sessions(void) {
       continue;
     }
     size_t name_len = strlen(ent->d_name);
-    bool is_meta = name_len > 5 && strcmp(ent->d_name + name_len - 5, ".meta") == 0;
+    bool is_meta = (name_len > 5 && strcmp(ent->d_name + name_len - 5, ".meta") == 0) ||
+                   (name_len > 7 && strcmp(ent->d_name + name_len - 7, ".meta.b") == 0);
     bool is_data = name_len > 4 && strcmp(ent->d_name + name_len - 4, ".dat") == 0;
     if (!is_meta && !is_data) {
       continue;
