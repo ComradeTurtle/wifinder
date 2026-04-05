@@ -150,9 +150,12 @@ object WgProtocol {
     val droppedFlashFull = if (payload.size >= 56) bb.getInt(52).toLong() and 0xFFFF_FFFFL else 0L
     val nodeCount = if (payload.size >= 57) payload[56].toInt() and 0xFF else 0
     val gpsNavAppliedHz = if (payload.size >= 62) payload[61].toInt() and 0xFF else 0
-    val spiffsTotalBytes = if (payload.size >= 66) bb.getInt(62).toLong() and 0xFFFF_FFFFL else 0L
-    val spiffsUsedBytes = if (payload.size >= 70) bb.getInt(66).toLong() and 0xFFFF_FFFFL else 0L
-    val spiffsFreeBytes = if (payload.size >= 74) bb.getInt(70).toLong() and 0xFFFF_FFFFL else 0L
+    val spiffsTotalLegacy = if (payload.size >= 66) bb.getInt(62).toLong() and 0xFFFF_FFFFL else 0L
+    val spiffsUsedLegacy = if (payload.size >= 70) bb.getInt(66).toLong() and 0xFFFF_FFFFL else 0L
+    val spiffsFreeLegacy = if (payload.size >= 74) bb.getInt(70).toLong() and 0xFFFF_FFFFL else 0L
+    val spiffsTotalBytes = if (payload.size >= 99) bb.getLong(91) else spiffsTotalLegacy
+    val spiffsUsedBytes = if (payload.size >= 107) bb.getLong(99) else spiffsUsedLegacy
+    val spiffsFreeBytes = if (payload.size >= 115) bb.getLong(107) else spiffsFreeLegacy
     val blobActive = payload.size >= 75 && (payload[74].toInt() and 0xFF) == 1
     val blobSessionId = if (payload.size >= 83) bb.getLong(75) else 0L
     val blobBytesSent = if (payload.size >= 87) bb.getInt(83).toLong() and 0xFFFF_FFFFL else 0L

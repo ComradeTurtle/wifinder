@@ -19,6 +19,8 @@
 #include "freertos/task.h"
 
 #include "driver/rmt_tx.h"
+#include "driver/sdspi_host.h"
+#include "driver/spi_master.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_err.h"
@@ -26,12 +28,14 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_vfs_fat.h"
 #include "esp_spiffs.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "sdmmc_cmd.h"
 
 #include "nimble/ble.h"
 #include "nimble/nimble_port.h"
@@ -101,7 +105,8 @@ _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
 #define WG_GPS_NAV_MODE_2HZ 2
 #define WG_GPS_NAV_MODE_4HZ 4
 
-#define WG_STORAGE_BASE_PATH "/spiffs"
+#define WG_STORAGE_SPIFFS_BASE_PATH "/spiffs"
+#define WG_STORAGE_SD_BASE_PATH "/sdcard"
 #define WG_STORAGE_FILE_PREFIX "wq_"
 #define WG_STORAGE_BLOCK_SIZE 1024
 #define WG_STORAGE_BLOCK_MAGIC 0x314B4257U
@@ -128,6 +133,10 @@ _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
 #define WG_STORAGE_PERSIST_MAX_INTERVAL_MS 120000
 #define WG_STORAGE_PERSIST_RSSI_DELTA_DB 6
 #define WG_STORAGE_MOVING_SPEED_MMPS 2000
+#define WG_SD_SPI_CS_GPIO GPIO_NUM_20
+#define WG_SD_SPI_SCK_GPIO GPIO_NUM_21
+#define WG_SD_SPI_MOSI_GPIO GPIO_NUM_22
+#define WG_SD_SPI_MISO_GPIO GPIO_NUM_23
 
 #define WG_NODE_UART_NUM LP_UART_NUM_0
 #define WG_NODE_UART_TX_GPIO 5
@@ -251,6 +260,12 @@ typedef enum {
   WG_SESSION_STATE_CLOSED = 2,
   WG_SESSION_STATE_ABORTED = 3,
 } wg_session_state_t;
+
+typedef enum {
+  WG_STORAGE_BACKEND_NONE = 0,
+  WG_STORAGE_BACKEND_SD = 1,
+  WG_STORAGE_BACKEND_SPIFFS = 2,
+} wg_storage_backend_t;
 
 typedef struct __attribute__((packed)) {
   uint32_t magic;
@@ -396,6 +411,8 @@ static SemaphoreHandle_t s_host_tx_mutex = NULL;
 
 static SemaphoreHandle_t s_store_mutex = NULL;
 static bool s_storage_ready = false;
+static wg_storage_backend_t s_storage_backend = WG_STORAGE_BACKEND_NONE;
+static sdmmc_card_t *s_storage_sd_card = NULL;
 static bool s_session_open = false;
 static uint64_t s_session_id = 0;
 static uint64_t s_last_session_id = 0;
@@ -552,6 +569,8 @@ static ap_entry_t *upsert_ap_entry(const uint8_t bssid[6], const char *ssid, uin
                                    bool *is_updated);
 static bool should_notify_entry(ap_entry_t *entry, bool is_new, bool is_updated, int64_t ts_ms);
 static bool storage_has_output_link(void);
+static const char *storage_base_path(void);
+static bool storage_get_fs_info(uint64_t *total_bytes_out, uint64_t *used_bytes_out);
 static bool storage_open_session(void);
 static bool storage_open_session_locked(void);
 static void storage_close_session(wg_session_state_t final_state);
@@ -1150,14 +1169,69 @@ static void storage_unlock(void) {
 
 static bool storage_has_output_link(void) { return s_sighting_notify_enabled || s_host_serial_active; }
 
+static const char *storage_backend_name(wg_storage_backend_t backend) {
+  switch (backend) {
+    case WG_STORAGE_BACKEND_SD:
+      return "sd";
+    case WG_STORAGE_BACKEND_SPIFFS:
+      return "spiffs";
+    case WG_STORAGE_BACKEND_NONE:
+    default:
+      return "none";
+  }
+}
+
+static const char *storage_base_path(void) {
+  if (s_storage_backend == WG_STORAGE_BACKEND_SD) {
+    return WG_STORAGE_SD_BASE_PATH;
+  }
+  return WG_STORAGE_SPIFFS_BASE_PATH;
+}
+
+static bool storage_get_fs_info(uint64_t *total_bytes_out, uint64_t *used_bytes_out) {
+  if (total_bytes_out == NULL || used_bytes_out == NULL) {
+    return false;
+  }
+  *total_bytes_out = 0;
+  *used_bytes_out = 0;
+  if (!s_storage_ready) {
+    return false;
+  }
+
+  if (s_storage_backend == WG_STORAGE_BACKEND_SPIFFS) {
+    size_t total = 0;
+    size_t used = 0;
+    if (esp_spiffs_info("spiffs", &total, &used) != ESP_OK) {
+      return false;
+    }
+    *total_bytes_out = total;
+    *used_bytes_out = used;
+    return true;
+  }
+
+  if (s_storage_backend == WG_STORAGE_BACKEND_SD) {
+    uint64_t total = 0;
+    uint64_t free = 0;
+    if (esp_vfs_fat_info(WG_STORAGE_SD_BASE_PATH, &total, &free) != ESP_OK) {
+      return false;
+    }
+    *total_bytes_out = total;
+    *used_bytes_out = (total >= free) ? (total - free) : 0;
+    return true;
+  }
+
+  return false;
+}
+
 static void storage_session_paths(uint64_t session_id, char *meta_path, size_t meta_size,
                                   char *data_path, size_t data_size) {
+  const char *base_path = storage_base_path();
   if (meta_path != NULL && meta_size > 0) {
-    snprintf(meta_path, meta_size, WG_STORAGE_BASE_PATH "/" WG_STORAGE_FILE_PREFIX "%016llX.meta",
+    snprintf(meta_path, meta_size, "%s/" WG_STORAGE_FILE_PREFIX "%016llX.meta", base_path,
              (unsigned long long)session_id);
   }
   if (data_path != NULL && data_size > 0) {
-    snprintf(data_path, data_size, WG_STORAGE_BASE_PATH "/" WG_STORAGE_FILE_PREFIX "%016llX.dat",
+    snprintf(data_path, data_size, "%s/" WG_STORAGE_FILE_PREFIX "%016llX.dat", base_path,
              (unsigned long long)session_id);
   }
 }
@@ -1275,7 +1349,7 @@ static void storage_reset_pending_block_locked(void) {
 static void storage_refresh_backlog_locked(bool reclaim);
 
 static uint32_t storage_reclaim_acked_sessions_locked(void) {
-  DIR *dir = opendir(WG_STORAGE_BASE_PATH);
+  DIR *dir = opendir(storage_base_path());
   if (dir == NULL) {
     return 0;
   }
@@ -1323,15 +1397,15 @@ static bool storage_flush_pending_locked(bool force) {
     }
   }
 
-  size_t total = 0;
-  size_t used = 0;
-  if (esp_spiffs_info("spiffs", &total, &used) != ESP_OK) {
+  uint64_t total = 0;
+  uint64_t used = 0;
+  if (!storage_get_fs_info(&total, &used)) {
     return false;
   }
-  size_t free_bytes = (total > used) ? (total - used) : 0;
+  uint64_t free_bytes = (total > used) ? (total - used) : 0;
   if (free_bytes < WG_STORAGE_MIN_FREE_BYTES) {
     (void)storage_reclaim_acked_sessions_locked();
-    if (esp_spiffs_info("spiffs", &total, &used) == ESP_OK) {
+    if (storage_get_fs_info(&total, &used)) {
       free_bytes = (total > used) ? (total - used) : 0;
     }
   }
@@ -1722,7 +1796,7 @@ static bool storage_select_next_replay_session_locked(uint64_t *session_id_out,
                                                       wg_session_manifest_t *manifest_out) {
   uint64_t best_sid = 0;
   wg_session_manifest_t best_manifest = {0};
-  DIR *dir = opendir(WG_STORAGE_BASE_PATH);
+  DIR *dir = opendir(storage_base_path());
   if (dir == NULL) {
     return false;
   }
@@ -2312,7 +2386,7 @@ static bool storage_clear_sessions(void) {
     storage_close_session_locked(WG_SESSION_STATE_ABORTED);
   }
 
-  DIR *dir = opendir(WG_STORAGE_BASE_PATH);
+  DIR *dir = opendir(storage_base_path());
   if (dir == NULL) {
     storage_refresh_backlog_locked(false);
     storage_unlock();
@@ -2334,9 +2408,8 @@ static bool storage_clear_sessions(void) {
     if (!is_meta && !is_data) {
       continue;
     }
-    // WG_STORAGE_BASE_PATH + '/' + max dirent filename + NUL
-    char path[sizeof(WG_STORAGE_BASE_PATH) + 1 + 255 + 1] = {0};
-    int path_len = snprintf(path, sizeof(path), WG_STORAGE_BASE_PATH "/%s", ent->d_name);
+    char path[PATH_MAX] = {0};
+    int path_len = snprintf(path, sizeof(path), "%s/%s", storage_base_path(), ent->d_name);
     if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
       ok = false;
       ESP_LOGW(TAG, "storage clear path too long for '%s'", ent->d_name);
@@ -2381,7 +2454,7 @@ static void storage_refresh_backlog_locked(bool reclaim) {
   }
   uint64_t records_total = 0;
   uint64_t bytes_total = 0;
-  DIR *dir = opendir(WG_STORAGE_BASE_PATH);
+  DIR *dir = opendir(storage_base_path());
   if (dir == NULL) {
     s_queue_backlog_records = 0;
     s_queue_backlog_bytes = 0;
@@ -2559,7 +2632,7 @@ static bool storage_flush_pending(bool force) {
 }
 
 static void storage_abort_stale_open_sessions(void) {
-  DIR *dir = opendir(WG_STORAGE_BASE_PATH);
+  DIR *dir = opendir(storage_base_path());
   if (dir == NULL) {
     return;
   }
@@ -2589,33 +2662,96 @@ static void storage_abort_stale_open_sessions(void) {
   }
 }
 
-static void init_storage(void) {
-  s_store_mutex = xSemaphoreCreateMutex();
-  if (s_store_mutex == NULL) {
-    ESP_LOGW(TAG, "storage disabled: mutex allocation failed");
-    return;
+static bool storage_mount_sd(void) {
+  sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+  spi_bus_config_t bus_cfg = {
+      .mosi_io_num = WG_SD_SPI_MOSI_GPIO,
+      .miso_io_num = WG_SD_SPI_MISO_GPIO,
+      .sclk_io_num = WG_SD_SPI_SCK_GPIO,
+      .quadwp_io_num = -1,
+      .quadhd_io_num = -1,
+      .max_transfer_sz = 4096,
+  };
+
+  esp_err_t rc = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "storage sd spi bus init failed rc=%s", esp_err_to_name(rc));
+    return false;
   }
+
+  sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
+  slot_cfg.host_id = host.slot;
+  slot_cfg.gpio_cs = WG_SD_SPI_CS_GPIO;
+
+  esp_vfs_fat_mount_config_t mount_cfg = {
+      .format_if_mount_failed = false,
+      .max_files = 8,
+      .allocation_unit_size = 16 * 1024,
+      .disk_status_check_enable = false,
+      .use_one_fat = false,
+  };
+
+  sdmmc_card_t *card = NULL;
+  rc = esp_vfs_fat_sdspi_mount(WG_STORAGE_SD_BASE_PATH, &host, &slot_cfg, &mount_cfg, &card);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "storage sd mount failed rc=%s", esp_err_to_name(rc));
+    (void)spi_bus_free(host.slot);
+    return false;
+  }
+
+  s_storage_sd_card = card;
+  s_storage_backend = WG_STORAGE_BACKEND_SD;
+  return true;
+}
+
+static bool storage_mount_spiffs(void) {
   esp_vfs_spiffs_conf_t conf = {
-      .base_path = WG_STORAGE_BASE_PATH,
+      .base_path = WG_STORAGE_SPIFFS_BASE_PATH,
       .partition_label = "spiffs",
       .max_files = 8,
       .format_if_mount_failed = true,
   };
   esp_err_t rc = esp_vfs_spiffs_register(&conf);
   if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-    ESP_LOGW(TAG, "storage disabled: spiffs mount failed rc=%s", esp_err_to_name(rc));
+    ESP_LOGW(TAG, "storage spiffs mount failed rc=%s", esp_err_to_name(rc));
+    return false;
+  }
+  s_storage_backend = WG_STORAGE_BACKEND_SPIFFS;
+  return true;
+}
+
+static void init_storage(void) {
+  s_store_mutex = xSemaphoreCreateMutex();
+  if (s_store_mutex == NULL) {
+    ESP_LOGW(TAG, "storage disabled: mutex allocation failed");
     return;
   }
+  s_storage_backend = WG_STORAGE_BACKEND_NONE;
+  s_storage_sd_card = NULL;
+
+  bool mounted = storage_mount_sd();
+  if (!mounted) {
+    ESP_LOGW(TAG, "storage fallback: using SPIFFS backend");
+    mounted = storage_mount_spiffs();
+  }
+  if (!mounted) {
+    ESP_LOGW(TAG, "storage disabled: no backend available");
+    return;
+  }
+
   s_storage_ready = true;
   storage_abort_stale_open_sessions();
   storage_refresh_backlog(true);
-  size_t total = 0;
-  size_t used = 0;
-  if (esp_spiffs_info("spiffs", &total, &used) == ESP_OK) {
-    ESP_LOGI(TAG, "storage ready total=%lu used=%lu free=%lu", (unsigned long)total,
-             (unsigned long)used, (unsigned long)((total > used) ? (total - used) : 0));
+  uint64_t total = 0;
+  uint64_t used = 0;
+  if (storage_get_fs_info(&total, &used)) {
+    uint64_t free = (total > used) ? (total - used) : 0;
+    ESP_LOGI(TAG, "storage ready backend=%s base=%s total=%llu used=%llu free=%llu",
+             storage_backend_name(s_storage_backend), storage_base_path(),
+             (unsigned long long)total, (unsigned long long)used, (unsigned long long)free);
   } else {
-    ESP_LOGI(TAG, "storage ready");
+    ESP_LOGI(TAG, "storage ready backend=%s base=%s",
+             storage_backend_name(s_storage_backend), storage_base_path());
   }
 }
 
@@ -2746,11 +2882,12 @@ static void log_bridge_diagnostics(bool force) {
            (unsigned long)s_host_tx_frames, (unsigned long)s_host_rx_errors);
 
   ESP_LOGI(TAG,
-           "diag store ready=%d open=%d sid=%016llX backlog_records=%lu backlog_bytes=%lu "
+           "diag store ready=%d backend=%s open=%d sid=%016llX backlog_records=%lu backlog_bytes=%lu "
            "replay_req=%d replay=%d replay_sid=%016llX replay_cursor=%lu "
            "blob_req=%d blob=%d blob_sid=%016llX blob_bytes=%lu/%lu "
            "queue_full=%d dropped_full=%lu",
-           s_storage_ready ? 1 : 0, s_session_open ? 1 : 0, (unsigned long long)s_session_id,
+           s_storage_ready ? 1 : 0, storage_backend_name(s_storage_backend),
+           s_session_open ? 1 : 0, (unsigned long long)s_session_id,
            (unsigned long)s_queue_backlog_records, (unsigned long)s_queue_backlog_bytes,
            s_replay_requested ? 1 : 0, s_replay_active ? 1 : 0,
            (unsigned long long)s_replay_session_id,
@@ -2802,16 +2939,14 @@ static uint16_t current_gps_accuracy_dm(void) {
 
 static void build_status_payload(wg_status_payload_t *payload) {
   unique_bssid_refresh_estimate();
-  size_t spiffs_total = 0;
-  size_t spiffs_used = 0;
-  if (s_storage_ready) {
-    if (esp_spiffs_info("spiffs", &spiffs_total, &spiffs_used) != ESP_OK) {
-      spiffs_total = 0;
-      spiffs_used = 0;
-    }
+  uint64_t storage_total = 0;
+  uint64_t storage_used = 0;
+  if (!storage_get_fs_info(&storage_total, &storage_used)) {
+    storage_total = 0;
+    storage_used = 0;
   }
-  uint32_t spiffs_total_u32 = (spiffs_total > UINT32_MAX) ? UINT32_MAX : (uint32_t)spiffs_total;
-  uint32_t spiffs_used_u32 = (spiffs_used > UINT32_MAX) ? UINT32_MAX : (uint32_t)spiffs_used;
+  uint32_t spiffs_total_u32 = (storage_total > UINT32_MAX) ? UINT32_MAX : (uint32_t)storage_total;
+  uint32_t spiffs_used_u32 = (storage_used > UINT32_MAX) ? UINT32_MAX : (uint32_t)storage_used;
   uint32_t spiffs_free_u32 =
       (spiffs_total_u32 > spiffs_used_u32) ? (spiffs_total_u32 - spiffs_used_u32) : 0;
   *payload = (wg_status_payload_t){
@@ -2846,6 +2981,9 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .spiffs_total_bytes = spiffs_total_u32,
       .spiffs_used_bytes = spiffs_used_u32,
       .spiffs_free_bytes = spiffs_free_u32,
+      .storage_total_bytes = storage_total,
+      .storage_used_bytes = storage_used,
+      .storage_free_bytes = (storage_total >= storage_used) ? (storage_total - storage_used) : 0,
       .blob_active = s_blob_active,
       .blob_session_id = s_blob_session_id,
       .blob_bytes_sent = s_blob_bytes_sent,

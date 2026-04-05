@@ -72,6 +72,9 @@ typedef struct {
   uint32_t spiffs_total_bytes;
   uint32_t spiffs_used_bytes;
   uint32_t spiffs_free_bytes;
+  uint64_t storage_total_bytes;
+  uint64_t storage_used_bytes;
+  uint64_t storage_free_bytes;
   bool blob_active;
   uint64_t blob_session_id;
   uint32_t blob_bytes_sent;
@@ -122,7 +125,7 @@ typedef struct {
   uint16_t pdop_centi;
 } wg_gps_payload_t;
 
-#define WG_STATUS_PAYLOAD_SIZE 91
+#define WG_STATUS_PAYLOAD_SIZE 115
 #define WG_GPS_PAYLOAD_SIZE 33
 
 size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, size_t out_size);

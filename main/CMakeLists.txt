@@ -16,7 +16,11 @@ idf_component_register(
     esp_netif
     esp_timer
     spiffs
+    fatfs
+    sdmmc
     esp_driver_rmt
+    esp_driver_sdspi
+    esp_driver_spi
     esp_driver_uart
     esp_driver_usb_serial_jtag
 )

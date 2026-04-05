@@ -59,6 +59,9 @@ size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, 
   wr_u32(&out[62], status->spiffs_total_bytes);
   wr_u32(&out[66], status->spiffs_used_bytes);
   wr_u32(&out[70], status->spiffs_free_bytes);
+  wr_u64(&out[91], status->storage_total_bytes);
+  wr_u64(&out[99], status->storage_used_bytes);
+  wr_u64(&out[107], status->storage_free_bytes);
   out[74] = status->blob_active ? 1 : 0;
   wr_u64(&out[75], status->blob_session_id);
   wr_u32(&out[83], status->blob_bytes_sent);

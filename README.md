@@ -14,7 +14,7 @@ an `ESP32-C6` master (optionally with an `ESP8266` wired slave node), with:
 - BLE status + AP sighting notifications (binary framed protocol)
 - WG protocol transport over USB serial (desktop client path)
 - WG protocol v2 with session metadata on sightings/status
-- SPIFFS-backed store-and-forward queue with explicit replay control + host ACK cursor
+- SD-backed store-and-forward queue (SDSPI) with SPIFFS fallback, explicit replay control + host ACK cursor
 - Live local web UI (Chromium) showing:
   - connection and scanner status
   - visible `(B)SSIDs`
@@ -202,8 +202,17 @@ Current defaults in firmware:
   - TX: `GPIO10`
   - RX: `GPIO11`
   - boot baud: `9600` (firmware probes and may switch module to higher runtime baud)
+- C6 SD card (SDSPI):
+  - CS: `GPIO20`
+  - SCK: `GPIO21`
+  - MOSI: `GPIO22`
+  - MISO: `GPIO23`
 - 8266 node UART:
   - TX0 (`GPIO1`) -> C6 RX (`GPIO4`)
   - RX0 (`GPIO3`) <- C6 TX (`GPIO5`)
 
 Also connect common GND between boards.
+
+Storage backend behavior:
+- firmware tries SD first at `/sdcard` (no auto-format)
+- if SD mount fails or card is missing, firmware falls back to SPIFFS at `/spiffs`

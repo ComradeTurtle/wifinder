@@ -8,7 +8,7 @@ import org.junit.Test
 class WgProtocolTest {
   @Test
   fun `decode status payload parses gps fields and extended storage stats`() {
-    val payload = ByteArray(91)
+    val payload = ByteArray(115)
     payload[0] = 1
     payload[1] = 1
     payload[2] = 11
@@ -56,18 +56,18 @@ class WgProtocolTest {
     payload[59] = 0x01
     payload[60] = 0x00
     payload[61] = 2
-    payload[62] = 0x00
-    payload[63] = 0x00
-    payload[64] = 0x80.toByte()
-    payload[65] = 0x00
-    payload[66] = 0x00
-    payload[67] = 0x00
-    payload[68] = 0x30
-    payload[69] = 0x00
-    payload[70] = 0x00
-    payload[71] = 0x00
-    payload[72] = 0x50
-    payload[73] = 0x00
+    payload[62] = 0xFF.toByte()
+    payload[63] = 0xFF.toByte()
+    payload[64] = 0xFF.toByte()
+    payload[65] = 0xFF.toByte()
+    payload[66] = 0xFF.toByte()
+    payload[67] = 0xFF.toByte()
+    payload[68] = 0xFF.toByte()
+    payload[69] = 0xFF.toByte()
+    payload[70] = 0xFF.toByte()
+    payload[71] = 0xFF.toByte()
+    payload[72] = 0xFF.toByte()
+    payload[73] = 0xFF.toByte()
     payload[74] = 1
     val blobSessionId = 0x0102030405060708L
     for (i in 0 until 8) {
@@ -77,6 +77,14 @@ class WgProtocolTest {
     payload[84] = 0x10
     payload[87] = 0x00
     payload[88] = 0x20
+    val totalStorage = 32L * 1024L * 1024L * 1024L
+    val usedStorage = 12L * 1024L * 1024L * 1024L
+    val freeStorage = 20L * 1024L * 1024L * 1024L
+    for (i in 0 until 8) {
+      payload[91 + i] = ((totalStorage ushr (8 * i)) and 0xFF).toByte()
+      payload[99 + i] = ((usedStorage ushr (8 * i)) and 0xFF).toByte()
+      payload[107 + i] = ((freeStorage ushr (8 * i)) and 0xFF).toByte()
+    }
 
     val status = WgProtocol.decodeStatusPayload(payload)
 
@@ -108,9 +116,9 @@ class WgProtocolTest {
     assertEquals(7L, status.droppedFlashFull)
     assertEquals(2, status.nodeCount)
     assertEquals(2, status.gpsNavAppliedHz)
-    assertEquals(8L * 1024L * 1024L, status.spiffsTotalBytes)
-    assertEquals(3L * 1024L * 1024L, status.spiffsUsedBytes)
-    assertEquals(5L * 1024L * 1024L, status.spiffsFreeBytes)
+    assertEquals(totalStorage, status.spiffsTotalBytes)
+    assertEquals(usedStorage, status.spiffsUsedBytes)
+    assertEquals(freeStorage, status.spiffsFreeBytes)
     assertTrue(status.blobActive)
     assertEquals(blobSessionId, status.blobSessionId)
     assertEquals(4096L, status.blobBytesSent)

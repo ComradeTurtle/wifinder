@@ -91,6 +91,9 @@ static void test_status_payload_encoding(void) {
       .spiffs_total_bytes = 16 * 1024 * 1024,
       .spiffs_used_bytes = 9 * 1024 * 1024,
       .spiffs_free_bytes = 7 * 1024 * 1024,
+      .storage_total_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL,
+      .storage_used_bytes = 12ULL * 1024ULL * 1024ULL * 1024ULL,
+      .storage_free_bytes = 20ULL * 1024ULL * 1024ULL * 1024ULL,
       .blob_active = true,
       .blob_session_id = 0x8877665544332211ULL,
       .blob_bytes_sent = 123456,
@@ -129,6 +132,12 @@ static void test_status_payload_encoding(void) {
   assert_u32(rd_u32(&out[62]), 16 * 1024 * 1024, "spiffs total bytes should be encoded");
   assert_u32(rd_u32(&out[66]), 9 * 1024 * 1024, "spiffs used bytes should be encoded");
   assert_u32(rd_u32(&out[70]), 7 * 1024 * 1024, "spiffs free bytes should be encoded");
+  assert_u64(rd_u64(&out[91]), 32ULL * 1024ULL * 1024ULL * 1024ULL,
+             "extended storage total bytes should be encoded");
+  assert_u64(rd_u64(&out[99]), 12ULL * 1024ULL * 1024ULL * 1024ULL,
+             "extended storage used bytes should be encoded");
+  assert_u64(rd_u64(&out[107]), 20ULL * 1024ULL * 1024ULL * 1024ULL,
+             "extended storage free bytes should be encoded");
   assert_u8(out[74], 1, "blob active should be encoded");
   assert_u64(rd_u64(&out[75]), 0x8877665544332211ULL, "blob session id should be encoded");
   assert_u32(rd_u32(&out[83]), 123456, "blob bytes sent should be encoded");

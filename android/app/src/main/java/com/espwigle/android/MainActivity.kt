@@ -744,7 +744,7 @@ private fun GeneralStatusDetails(state: AppUiState) {
     )
     KvRow("Backlog", transferStatusLabel(state))
     KvRow(
-      "SPIFFS",
+      "Storage",
       "${formatBytesShort(state.spiffsUsedBytes)} used / ${formatBytesShort(state.spiffsTotalBytes)} total (${formatBytesShort(state.spiffsFreeBytes)} free)",
     )
     KvRow(
