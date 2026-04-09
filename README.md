@@ -1,7 +1,7 @@
 # espwigle (ESP32 scanner + Web/Android/Desktop clients)
 
 This project runs a BLE-controlled Wi-Fi wardriving scanner stack centered on
-an `ESP32-C6` master (optionally with an `ESP8266` wired slave node), with:
+an `ESP32-C6` master (optionally with an `ESP8266` or `BW16` wired slave node), with:
 - a self-contained local web app
 - an Android app that adds GPS ingestion and Wigle CSV logging on phone
 - a desktop app (Python + Qt) for direct USB serial debugging/control
@@ -99,7 +99,7 @@ Features:
 - GPS push fallback to ESP (`SET_GPS_FIX`) when phone fix exists
 - ESP-originated GPS telemetry (`WG_MSG_GPS`) reception
 - GPS nav-rate mode control (`Auto` / forced `1/2/4 Hz`) for field testing
-- node-link telemetry from secondary scanner (ESP8266)
+- node-link telemetry from secondary scanner (ESP8266 or BW16)
 - Wigle CSV logging generated on phone storage (prefers fresh ESP GPS, phone fallback)
 - Explicit `Download ESP` backlog flow (`SET_REPLAY` on/off, blocked while scanner is active)
 
@@ -171,6 +171,7 @@ python -m unittest discover -s desktop/tests -v
 ## Notes
 
 - ESP32 scanning in this project is 2.4 GHz only.
+- 5 GHz scanning is available via an attached slave node (for example BW16).
 
 ## ESP8266 slave node firmware (for C6 master)
 
@@ -189,6 +190,17 @@ Build/upload:
 cd esp8266
 pio run
 pio run -t upload --upload-port /dev/ttyUSB0
+```
+
+## BW16 slave node firmware (for C6 master)
+
+The `bw16/` firmware provides the same node UART protocol but forwards
+2.4 GHz + 5 GHz sightings from RTL8720DN/BW16 hardware.
+
+Details and wiring notes:
+
+```bash
+cat bw16/README.md
 ```
 
 ## C6 + 8266 wiring
@@ -210,6 +222,18 @@ Current defaults in firmware:
 - 8266 node UART:
   - TX0 (`GPIO1`) -> C6 RX (`GPIO4`)
   - RX0 (`GPIO3`) <- C6 TX (`GPIO5`)
+
+Also connect common GND between boards.
+
+## C6 + BW16 wiring
+
+- C6 node UART (LP UART):
+  - TX: `GPIO5`
+  - RX: `GPIO4`
+  - baud: `115200`
+- BW16 node UART:
+  - `LOG_TX (PA7, Serial TX)` -> C6 RX (`GPIO4`)
+  - `LOG_RX (PA8, Serial RX)` <- C6 TX (`GPIO5`)
 
 Also connect common GND between boards.
 
