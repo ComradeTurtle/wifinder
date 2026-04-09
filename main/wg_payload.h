@@ -46,6 +46,9 @@ typedef struct {
   uint8_t current_channel;
   uint16_t hop_ms;
   uint16_t channel_mask;
+  uint16_t local_channel_mask;
+  uint16_t node_channel_mask_24;
+  uint64_t node_channel_mask_5ghz;
   uint32_t unique_bssids_estimate;
   uint16_t packets_per_sec;
   uint16_t dropped_notifies;
@@ -125,7 +128,7 @@ typedef struct {
   uint16_t pdop_centi;
 } wg_gps_payload_t;
 
-#define WG_STATUS_PAYLOAD_SIZE 115
+#define WG_STATUS_PAYLOAD_SIZE 127
 #define WG_GPS_PAYLOAD_SIZE 33
 
 size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, size_t out_size);

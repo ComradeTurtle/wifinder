@@ -91,6 +91,9 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
   out->id = (wg_command_id_t)payload[0];
   out->hop_ms = 0;
   out->channel_mask = 0;
+  out->local_channel_mask = 0;
+  out->node_channel_mask = 0;
+  out->node_channel_mask_5ghz = 0;
   out->boot_mode = 0;
   out->gps_flags = 0;
   out->gps_lat_e7 = 0;
@@ -106,6 +109,10 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
   out->gps_nav_mode = 0;
   out->backlog_blob_enable = 0;
   out->debug_seed_target_bytes = 0;
+  out->backlog_blob_session_id = 0;
+  out->backlog_blob_chunk_offset = 0;
+  out->backlog_blob_chunk_len = 0;
+  out->backlog_blob_chunk_reply = WG_BACKLOG_BLOB_CHUNK_REPLY_NAK;
 
   switch (out->id) {
     case WG_CMD_START:
@@ -178,6 +185,23 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
         return WG_ERR_INVALID_FRAME;
       }
       out->debug_seed_target_bytes = rd_u32(&payload[1]);
+      return WG_OK;
+    case WG_CMD_SET_CHANNEL_PLAN:
+      if (payload_len != (size_t)(1 + WG_CHANNEL_PLAN_PAYLOAD_SIZE)) {
+        return WG_ERR_INVALID_FRAME;
+      }
+      out->local_channel_mask = rd_u16(&payload[1]);
+      out->node_channel_mask = rd_u16(&payload[3]);
+      out->node_channel_mask_5ghz = rd_u64(&payload[5]);
+      return WG_OK;
+    case WG_CMD_BACKLOG_BLOB_CHUNK_REPLY:
+      if (payload_len != (size_t)(1 + WG_BACKLOG_BLOB_CHUNK_REPLY_PAYLOAD_SIZE)) {
+        return WG_ERR_INVALID_FRAME;
+      }
+      out->backlog_blob_session_id = rd_u64(&payload[1]);
+      out->backlog_blob_chunk_offset = rd_u32(&payload[9]);
+      out->backlog_blob_chunk_len = rd_u16(&payload[13]);
+      out->backlog_blob_chunk_reply = payload[15];
       return WG_OK;
     default:
       return WG_ERR_UNSUPPORTED;

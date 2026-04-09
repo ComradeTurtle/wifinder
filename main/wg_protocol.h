@@ -47,6 +47,8 @@ typedef enum {
   WG_CMD_SET_GPS_NAV_RATE = 0x0C,
   WG_CMD_SET_BACKLOG_BLOB = 0x0D,
   WG_CMD_DEBUG_SEED_STORAGE = 0x0E,
+  WG_CMD_SET_CHANNEL_PLAN = 0x0F,
+  WG_CMD_BACKLOG_BLOB_CHUNK_REPLY = 0x10,
 } wg_command_id_t;
 
 typedef enum {
@@ -62,6 +64,10 @@ typedef enum {
 #define WG_GPS_NAV_RATE_PAYLOAD_SIZE 1
 #define WG_BACKLOG_BLOB_TOGGLE_PAYLOAD_SIZE 1
 #define WG_DEBUG_SEED_STORAGE_PAYLOAD_SIZE 4
+#define WG_CHANNEL_PLAN_PAYLOAD_SIZE 12
+#define WG_BACKLOG_BLOB_CHUNK_REPLY_PAYLOAD_SIZE 15
+#define WG_BACKLOG_BLOB_CHUNK_REPLY_NAK 0
+#define WG_BACKLOG_BLOB_CHUNK_REPLY_ACK 1
 
 typedef struct {
   uint8_t version;
@@ -76,6 +82,9 @@ typedef struct {
   wg_command_id_t id;
   uint16_t hop_ms;
   uint16_t channel_mask;
+  uint16_t local_channel_mask;
+  uint16_t node_channel_mask;
+  uint64_t node_channel_mask_5ghz;
   uint8_t boot_mode;
   uint8_t gps_flags;
   int32_t gps_lat_e7;
@@ -91,6 +100,10 @@ typedef struct {
   uint8_t gps_nav_mode;
   uint8_t backlog_blob_enable;
   uint32_t debug_seed_target_bytes;
+  uint64_t backlog_blob_session_id;
+  uint32_t backlog_blob_chunk_offset;
+  uint16_t backlog_blob_chunk_len;
+  uint8_t backlog_blob_chunk_reply;
 } wg_command_t;
 
 wg_result_t wg_frame_encode(const wg_frame_t *frame, uint8_t *out, size_t out_capacity,

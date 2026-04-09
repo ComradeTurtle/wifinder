@@ -210,6 +210,29 @@ static void test_debug_seed_storage_command_decode(void) {
   assert_u32(cmd.debug_seed_target_bytes, 786432U, "debug seed storage target bytes should decode");
 }
 
+static void test_backlog_blob_chunk_reply_command_decode(void) {
+  uint8_t payload[] = {
+      WG_CMD_BACKLOG_BLOB_CHUNK_REPLY,
+      0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,  // session id (little-endian)
+      0x78, 0x56, 0x34, 0x12,                          // chunk offset = 0x12345678
+      0xF4, 0x01,                                      // chunk len = 500
+      WG_BACKLOG_BLOB_CHUNK_REPLY_ACK,
+  };
+
+  wg_command_t cmd = {0};
+  assert_true(wg_command_decode(payload, sizeof(payload), &cmd) == WG_OK,
+              "backlog blob chunk reply command decode should succeed");
+  assert_true(cmd.id == WG_CMD_BACKLOG_BLOB_CHUNK_REPLY,
+              "backlog blob chunk reply command id should match");
+  assert_true(cmd.backlog_blob_session_id == 0x0123456789ABCDEFULL,
+              "backlog blob chunk reply session id should decode");
+  assert_u32(cmd.backlog_blob_chunk_offset, 0x12345678U,
+             "backlog blob chunk reply offset should decode");
+  assert_u16(cmd.backlog_blob_chunk_len, 500, "backlog blob chunk reply len should decode");
+  assert_true(cmd.backlog_blob_chunk_reply == WG_BACKLOG_BLOB_CHUNK_REPLY_ACK,
+              "backlog blob chunk reply code should decode");
+}
+
 int main(void) {
   test_frame_roundtrip();
   test_command_decode();
@@ -222,6 +245,7 @@ int main(void) {
   test_clear_storage_command_decode();
   test_set_backlog_blob_command_decode();
   test_debug_seed_storage_command_decode();
+  test_backlog_blob_chunk_reply_command_decode();
   printf("PASS: %d tests\n", tests_run);
   return 0;
 }

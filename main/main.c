@@ -41,6 +41,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_att.h"
 #include "host/ble_sm.h"
 #include "host/ble_store.h"
 #include "host/util/util.h"
@@ -71,19 +72,28 @@ extern void ble_store_config_init(void);
 #define WG_MIN_HOP_MS 50
 #define WG_MAX_HOP_MS 2000
 #define WG_DEFAULT_CHANNEL_MASK 0x1FFFU
+#define WG_NODE_5GHZ_MASK_BIT_COUNT 43U
+#define WG_NODE_5GHZ_MASK_ALL ((1ULL << WG_NODE_5GHZ_MASK_BIT_COUNT) - 1ULL)
 #define WG_SIGHTING_NOTIFY_INTERVAL_MS 5000
 #define WG_SEEN_CAPACITY 512
 #define WG_UNIQUE_HLL_P 12
 #define WG_UNIQUE_HLL_REGISTERS (1U << WG_UNIQUE_HLL_P)
 #define WG_SCAN_SEED_MAX_APS 128
 #define WG_BLE_PASSKEY 123456U
-#define WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD 220
+#define WG_BLE_ATT_PREFERRED_MTU 517
+#define WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX \
+  (WG_BLE_ATT_PREFERRED_MTU - 3 - WG_FRAME_HEADER_SIZE)
 #define WG_BLE_CONN_ITVL_MIN_1P25MS 6
-#define WG_BLE_CONN_ITVL_MAX_1P25MS 12
+#define WG_BLE_CONN_ITVL_MAX_1P25MS 6
 #define WG_BLE_CONN_LATENCY 0
 #define WG_BLE_CONN_SUPERVISION_TIMEOUT_10MS 400
+#define WG_BLE_DATA_LEN_OCTETS 251
+#define WG_BLE_DATA_LEN_TIME_US 2120
+_Static_assert(WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX > 0,
+               "WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX must be positive");
 _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
                "WG_UNIQUE_HLL_REGISTERS must be power-of-two");
+_Static_assert(WG_NODE_5GHZ_MASK_BIT_COUNT < 64, "WG_NODE_5GHZ_MASK_BIT_COUNT must be <64");
 
 #define WG_GPS_UART_NUM UART_NUM_1
 #define WG_GPS_UART_TX_GPIO 10
@@ -117,8 +127,9 @@ _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
 #define WG_STORAGE_BLOCK_FLUSH_MS 1200
 #define WG_STORAGE_RECORD_HDR_SIZE 2
 #define WG_STORAGE_REPLAY_BUDGET_PER_TICK 8
-#define WG_STORAGE_BLOB_BUDGET_PER_TICK 8
-#define WG_REPLAY_TASK_INTERVAL_MS 20
+#define WG_STORAGE_BLOB_BUDGET_PER_TICK 16
+#define WG_REPLAY_TASK_INTERVAL_MS 2
+#define WG_REPLAY_TASK_PUMP_ROUNDS 4
 #define WG_REPLAY_BATCH_MAX_RECORDS 8
 #define WG_REPLAY_BATCH_HEADER_SIZE 1
 #define WG_REPLAY_BATCH_RECORD_HDR_SIZE 2
@@ -128,7 +139,10 @@ _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
 #define WG_BLOB_META_PAYLOAD_SIZE 20
 #define WG_BLOB_CHUNK_HEADER_SIZE 14
 #define WG_BLOB_DONE_PAYLOAD_SIZE 16
-#define WG_BLOB_CHUNK_DATA_MAX (WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD - WG_BLOB_CHUNK_HEADER_SIZE)
+#define WG_BLOB_CHUNK_DATA_MAX_MAX \
+  (WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX - WG_BLOB_CHUNK_HEADER_SIZE)
+#define WG_BLOB_CHUNK_ACK_TIMEOUT_MS 350
+#define WG_BLOB_CHUNK_WINDOW_BYTES 2048
 #define WG_STORAGE_MIN_FREE_BYTES (WG_STORAGE_BLOCK_SIZE * 8)
 #define WG_STORAGE_PERSIST_MIN_STATIONARY_MS 30000
 #define WG_STORAGE_PERSIST_MIN_MOVING_MS 8000
@@ -143,7 +157,7 @@ _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
 #define WG_NODE_UART_NUM LP_UART_NUM_0
 #define WG_NODE_UART_TX_GPIO 5
 #define WG_NODE_UART_RX_GPIO 4
-#define WG_NODE_UART_BAUD 460800
+#define WG_NODE_UART_BAUD 115200
 #define WG_NODE_FRAME_SYNC0 0xA5
 #define WG_NODE_FRAME_SYNC1 0x5A
 #define WG_NODE_FRAME_VERSION 1
@@ -154,6 +168,10 @@ _Static_assert((WG_UNIQUE_HLL_REGISTERS & (WG_UNIQUE_HLL_REGISTERS - 1)) == 0,
 #define WG_HOST_FRAME_MAX_PAYLOAD 244
 #define WG_HOST_RX_BUF_SIZE (WG_FRAME_HEADER_SIZE + WG_HOST_FRAME_MAX_PAYLOAD)
 #define WG_HOST_SERIAL_READ_MS 30
+#define WG_HOST_UART_NUM UART_NUM_0
+#define WG_HOST_UART_BAUD 115200
+#define WG_HOST_UART_RX_BUF_SIZE 4096
+#define WG_HOST_UART_TX_BUF_SIZE 4096
 #define WG_FRAME_MAGIC0 0x57
 #define WG_FRAME_MAGIC1 0x47
 
@@ -254,6 +272,7 @@ typedef struct {
   uint16_t forwarded_sightings;
   uint8_t channel;
   uint16_t channel_mask;
+  uint64_t channel_mask_5ghz;
   int64_t last_rx_ms;
 } node_link_status_t;
 
@@ -326,6 +345,12 @@ static int64_t s_rate_window_start_ms = 0;
 static uint32_t s_rate_packet_acc = 0;
 static uint16_t s_packets_per_sec = 0;
 static uint16_t s_notify_drops = 0;
+static uint32_t s_notify_drop_by_hs_rc[32] = {0};
+static uint32_t s_notify_drop_att = 0;
+static uint32_t s_notify_drop_hci = 0;
+static uint32_t s_notify_drop_l2c = 0;
+static uint32_t s_notify_drop_other = 0;
+static int s_notify_drop_last_rc = 0;
 static uint16_t s_seq = 1;
 static gps_fix_t s_latest_gps = {0};
 static gps_fix_t s_uart_gps = {0};
@@ -357,6 +382,7 @@ static volatile int64_t s_gps_last_rate_change_ms = 0;
 static node_link_status_t s_node_status = {0};
 static uint16_t s_node_seq = 1;
 static uint16_t s_node_channel_mask = 0;
+static uint64_t s_node_channel_mask_5ghz = WG_NODE_5GHZ_MASK_ALL;
 static uint16_t s_local_channel_mask = WG_DEFAULT_CHANNEL_MASK;
 static bool s_node_report_enable = false;
 static bool s_node_seen_hello = false;
@@ -391,6 +417,16 @@ static bool s_status_notify_enabled = false;
 static bool s_sighting_notify_enabled = false;
 static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static bool s_security_retry_attempted = false;
+static uint16_t s_ble_conn_itvl_1p25ms = 0;
+static uint16_t s_ble_conn_latency = 0;
+static uint16_t s_ble_conn_supervision_10ms = 0;
+static uint16_t s_ble_att_mtu = 0;
+static uint8_t s_ble_tx_phy = 0;
+static uint8_t s_ble_rx_phy = 0;
+static uint16_t s_ble_max_tx_octets = 0;
+static uint16_t s_ble_max_tx_time_us = 0;
+static uint16_t s_ble_max_rx_octets = 0;
+static uint16_t s_ble_max_rx_time_us = 0;
 
 static uint16_t s_control_handle;
 static uint16_t s_status_handle;
@@ -398,15 +434,30 @@ static uint16_t s_sighting_handle;
 static uint16_t s_config_handle;
 static uint16_t s_device_info_handle;
 
+typedef enum {
+  WG_HOST_BACKEND_NONE = 0,
+  WG_HOST_BACKEND_UART0 = 1,
+  WG_HOST_BACKEND_USB = 2,
+} wg_host_backend_t;
+typedef struct {
+  uint8_t buf[WG_HOST_RX_BUF_SIZE];
+  size_t pos;
+  size_t expected;
+  uint32_t frames;
+  uint32_t errors;
+} wg_host_rx_parser_t;
 static bool s_host_serial_enabled = false;
 static bool s_host_serial_active = false;
 static bool s_host_frame_only_logs = false;
+static bool s_host_uart_enabled = false;
+static bool s_host_usb_enabled = false;
+static wg_host_backend_t s_host_backend = WG_HOST_BACKEND_NONE;
+static wg_host_backend_t s_host_tx_backend = WG_HOST_BACKEND_NONE;
+static wg_host_rx_parser_t s_host_uart_rx = {0};
+static wg_host_rx_parser_t s_host_usb_rx = {0};
 static uint32_t s_host_rx_frames = 0;
 static uint32_t s_host_tx_frames = 0;
 static uint32_t s_host_rx_errors = 0;
-static uint8_t s_host_rx_buf[WG_HOST_RX_BUF_SIZE] = {0};
-static size_t s_host_rx_pos = 0;
-static size_t s_host_rx_expected = 0;
 
 static int (*s_prev_log_vprintf)(const char *fmt, va_list args) = NULL;
 static SemaphoreHandle_t s_host_tx_mutex = NULL;
@@ -463,12 +514,14 @@ static bool s_blob_waiting_ack = false;
 static uint64_t s_blob_session_id = 0;
 static uint32_t s_blob_file_bytes = 0;
 static uint32_t s_blob_bytes_sent = 0;
+static uint32_t s_blob_bytes_acked = 0;
 static uint32_t s_blob_written_seq = 0;
 static uint32_t s_blob_acked_seq = 0;
+static int64_t s_blob_last_progress_ms = 0;
 static FILE *s_blob_fp = NULL;
 static bool s_blob_pending_valid = false;
 static uint8_t s_blob_pending_msg_type = WG_MSG_BACKLOG_BLOB_META;
-static uint8_t s_blob_pending_payload[WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD] = {0};
+static uint8_t s_blob_pending_payload[WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX] = {0};
 static uint16_t s_blob_pending_len = 0;
 static uint16_t s_blob_pending_chunk_len = 0;
 
@@ -581,15 +634,22 @@ static void storage_close_session_locked(wg_session_state_t final_state);
 static bool storage_flush_pending(bool force);
 static void storage_refresh_backlog(bool reclaim);
 static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq);
-static void storage_run_replay_tick(void);
+static bool storage_apply_blob_chunk_reply(uint64_t session_id, uint32_t offset, uint16_t chunk_len,
+                                           uint8_t reply_code);
+static bool storage_run_replay_tick(void);
 static void storage_set_replay_enabled(bool enabled);
-static void storage_run_blob_tick(void);
+static bool storage_run_blob_tick(void);
 static void storage_set_blob_enabled(bool enabled);
 static bool storage_seed_synthetic(uint32_t target_bytes, uint32_t *records_added_out,
                                    uint32_t *bytes_added_out);
 static bool storage_clear_sessions(void);
 static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len, uint8_t source_flags);
+static uint16_t ble_notify_frame_payload_limit(void);
+static void wake_replay_task(void);
 static void request_fast_ble_conn_params(uint16_t conn_handle);
+static void request_fast_ble_phy_data_len(uint16_t conn_handle);
+static void refresh_ble_link_metrics(uint16_t conn_handle, const char *reason_tag);
+static const char *ble_phy_name(uint8_t phy);
 static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_tag);
 static void request_link_security(uint16_t conn_handle, const char *reason_tag);
 static uint16_t rd_u16_le(const uint8_t *in);
@@ -664,9 +724,36 @@ static int log_mux_vprintf(const char *fmt, va_list args) {
   return vprintf(fmt, args);
 }
 
-static void host_serial_reset_rx(void) {
-  s_host_rx_pos = 0;
-  s_host_rx_expected = 0;
+static const char *host_backend_name(wg_host_backend_t backend) {
+  switch (backend) {
+    case WG_HOST_BACKEND_UART0:
+      return "uart0";
+    case WG_HOST_BACKEND_USB:
+      return "usb";
+    case WG_HOST_BACKEND_NONE:
+    default:
+      return "none";
+  }
+}
+
+static wg_host_rx_parser_t *host_parser_for_backend(wg_host_backend_t backend) {
+  switch (backend) {
+    case WG_HOST_BACKEND_UART0:
+      return &s_host_uart_rx;
+    case WG_HOST_BACKEND_USB:
+      return &s_host_usb_rx;
+    case WG_HOST_BACKEND_NONE:
+    default:
+      return NULL;
+  }
+}
+
+static void host_serial_reset_rx(wg_host_rx_parser_t *parser) {
+  if (parser == NULL) {
+    return;
+  }
+  parser->pos = 0;
+  parser->expected = 0;
 }
 
 static void host_serial_mark_active(void) {
@@ -678,32 +765,81 @@ static void host_serial_mark_active(void) {
   s_host_frame_only_logs = true;
 }
 
-static int host_serial_read_bytes(uint8_t *buf, size_t len, TickType_t wait_ticks) {
-#if SOC_USB_SERIAL_JTAG_SUPPORTED
+static int host_serial_read_bytes(wg_host_backend_t backend, uint8_t *buf, size_t len,
+                                  TickType_t wait_ticks) {
   if (!s_host_serial_enabled) {
     return -1;
   }
-  return usb_serial_jtag_read_bytes(buf, len, wait_ticks);
-#else
-  (void)buf;
-  (void)len;
-  (void)wait_ticks;
-  return -1;
+  switch (backend) {
+    case WG_HOST_BACKEND_UART0:
+      if (!s_host_uart_enabled) {
+        return -1;
+      }
+      return uart_read_bytes(WG_HOST_UART_NUM, buf, len, wait_ticks);
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+    case WG_HOST_BACKEND_USB:
+      if (!s_host_usb_enabled) {
+        return -1;
+      }
+      return usb_serial_jtag_read_bytes(buf, len, wait_ticks);
 #endif
+    case WG_HOST_BACKEND_NONE:
+    default:
+      return -1;
+  }
+}
+
+static int host_serial_write_bytes_backend(wg_host_backend_t backend, const uint8_t *buf, size_t len,
+                                           TickType_t wait_ticks) {
+  if (!s_host_serial_enabled) {
+    return -1;
+  }
+  switch (backend) {
+    case WG_HOST_BACKEND_UART0:
+      if (!s_host_uart_enabled) {
+        return -1;
+      }
+      return uart_write_bytes(WG_HOST_UART_NUM, (const char *)buf, len);
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+    case WG_HOST_BACKEND_USB:
+      if (!s_host_usb_enabled) {
+        return -1;
+      }
+      return usb_serial_jtag_write_bytes((const void *)buf, len, wait_ticks);
+#endif
+    case WG_HOST_BACKEND_NONE:
+    default:
+      return -1;
+  }
 }
 
 static int host_serial_write_bytes(const uint8_t *buf, size_t len, TickType_t wait_ticks) {
-#if SOC_USB_SERIAL_JTAG_SUPPORTED
   if (!s_host_serial_enabled) {
     return -1;
   }
-  return usb_serial_jtag_write_bytes((const void *)buf, len, wait_ticks);
-#else
-  (void)buf;
-  (void)len;
-  (void)wait_ticks;
-  return -1;
+  if (s_host_tx_backend != WG_HOST_BACKEND_NONE) {
+    int n = host_serial_write_bytes_backend(s_host_tx_backend, buf, len, wait_ticks);
+    if (n > 0) {
+      return n;
+    }
+  }
+
+  int best = -1;
+  if (s_host_uart_enabled && s_host_tx_backend != WG_HOST_BACKEND_UART0) {
+    int n = host_serial_write_bytes_backend(WG_HOST_BACKEND_UART0, buf, len, wait_ticks);
+    if (n > best) {
+      best = n;
+    }
+  }
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+  if (s_host_usb_enabled && s_host_tx_backend != WG_HOST_BACKEND_USB) {
+    int n = host_serial_write_bytes_backend(WG_HOST_BACKEND_USB, buf, len, wait_ticks);
+    if (n > best) {
+      best = n;
+    }
+  }
 #endif
+  return best;
 }
 
 static bool host_serial_notify_framed(uint8_t type, const uint8_t *payload, uint16_t payload_len) {
@@ -2124,6 +2260,12 @@ static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len
   return true;
 }
 
+static void wake_replay_task(void) {
+  if (s_replay_task != NULL) {
+    xTaskNotifyGive(s_replay_task);
+  }
+}
+
 static bool storage_prepare_replay_single_pending_locked(void) {
   uint8_t payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
   uint16_t payload_len = 0;
@@ -2157,7 +2299,7 @@ static bool storage_prepare_replay_single_pending_locked(void) {
 
 static bool storage_prepare_replay_batch_pending_locked(void) {
   uint8_t batch_payload[WG_HOST_FRAME_MAX_PAYLOAD] = {0};
-  uint16_t max_batch_payload = WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD;
+  uint16_t max_batch_payload = ble_notify_frame_payload_limit();
   if (max_batch_payload > sizeof(batch_payload)) {
     max_batch_payload = sizeof(batch_payload);
   }
@@ -2264,6 +2406,29 @@ static void storage_clear_blob_pending_locked(void) {
   s_blob_pending_chunk_len = 0;
 }
 
+static bool storage_seek_blob_locked(uint32_t offset) {
+  if (s_blob_fp == NULL) {
+    return false;
+  }
+  if (offset > s_blob_file_bytes) {
+    offset = s_blob_file_bytes;
+  }
+  if (fseek(s_blob_fp, (long)offset, SEEK_SET) != 0) {
+    ESP_LOGW(TAG, "blob export seek failed sid=%016llX off=%lu errno=%d",
+             (unsigned long long)s_blob_session_id, (unsigned long)offset, errno);
+    return false;
+  }
+  s_blob_bytes_sent = offset;
+  if (s_blob_bytes_acked > offset) {
+    s_blob_bytes_acked = offset;
+  }
+  s_blob_done_sent = false;
+  s_blob_waiting_ack = false;
+  s_blob_last_progress_ms = now_ms();
+  storage_clear_blob_pending_locked();
+  return true;
+}
+
 static void storage_reset_blob_locked(void) {
   if (s_blob_fp != NULL) {
     fclose(s_blob_fp);
@@ -2276,8 +2441,10 @@ static void storage_reset_blob_locked(void) {
   s_blob_session_id = 0;
   s_blob_file_bytes = 0;
   s_blob_bytes_sent = 0;
+  s_blob_bytes_acked = 0;
   s_blob_written_seq = 0;
   s_blob_acked_seq = 0;
+  s_blob_last_progress_ms = 0;
   storage_clear_blob_pending_locked();
 }
 
@@ -2312,8 +2479,10 @@ static void storage_maybe_start_blob_locked(void) {
   s_blob_active = true;
   s_blob_session_id = sid;
   s_blob_file_bytes = (uint32_t)st.st_size;
+  s_blob_bytes_acked = 0;
   s_blob_written_seq = manifest.last_seq_written;
   s_blob_acked_seq = manifest.last_seq_acked;
+  s_blob_last_progress_ms = now_ms();
   ESP_LOGI(TAG, "blob export start sid=%016llX bytes=%lu acked=%lu written=%lu",
            (unsigned long long)sid, (unsigned long)s_blob_file_bytes,
            (unsigned long)s_blob_acked_seq, (unsigned long)s_blob_written_seq);
@@ -2348,6 +2517,25 @@ static bool storage_prepare_blob_pending_locked(void) {
     return false;
   }
 
+  if (s_blob_bytes_sent > s_blob_bytes_acked) {
+    const int64_t ms = now_ms();
+    if (s_blob_last_progress_ms > 0 &&
+        (ms - s_blob_last_progress_ms) >= WG_BLOB_CHUNK_ACK_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "blob export chunk ack timeout sid=%016llX sent=%lu acked=%lu; resuming at acked",
+               (unsigned long long)s_blob_session_id, (unsigned long)s_blob_bytes_sent,
+               (unsigned long)s_blob_bytes_acked);
+      if (!storage_seek_blob_locked(s_blob_bytes_acked)) {
+        storage_reset_blob_locked();
+        return false;
+      }
+    }
+    if ((s_blob_bytes_sent - s_blob_bytes_acked) >= WG_BLOB_CHUNK_WINDOW_BYTES) {
+      // Sliding window: allow multiple chunks in flight for throughput, but
+      // cap outstanding bytes to avoid overrunning the BLE TX queue.
+      return false;
+    }
+  }
+
   if (!s_blob_meta_sent) {
     uint8_t payload[WG_BLOB_META_PAYLOAD_SIZE] = {0};
     wr_u64_le(&payload[0], s_blob_session_id);
@@ -2363,9 +2551,17 @@ static bool storage_prepare_blob_pending_locked(void) {
   }
 
   if (s_blob_bytes_sent < s_blob_file_bytes) {
+    uint16_t chunk_data_limit = ble_notify_frame_payload_limit();
+    if (chunk_data_limit <= WG_BLOB_CHUNK_HEADER_SIZE) {
+      return false;
+    }
+    chunk_data_limit = (uint16_t)(chunk_data_limit - WG_BLOB_CHUNK_HEADER_SIZE);
+    if (chunk_data_limit > WG_BLOB_CHUNK_DATA_MAX_MAX) {
+      chunk_data_limit = WG_BLOB_CHUNK_DATA_MAX_MAX;
+    }
     uint32_t remaining = s_blob_file_bytes - s_blob_bytes_sent;
     uint16_t chunk_len =
-        (remaining > WG_BLOB_CHUNK_DATA_MAX) ? WG_BLOB_CHUNK_DATA_MAX : (uint16_t)remaining;
+        (remaining > chunk_data_limit) ? chunk_data_limit : (uint16_t)remaining;
     size_t n = fread(&s_blob_pending_payload[WG_BLOB_CHUNK_HEADER_SIZE], 1, chunk_len, s_blob_fp);
     if (n != chunk_len) {
       ESP_LOGW(TAG, "blob export read failed sid=%016llX sent=%lu wanted=%u got=%u",
@@ -2384,6 +2580,10 @@ static bool storage_prepare_blob_pending_locked(void) {
     return true;
   }
 
+  if (s_blob_bytes_acked < s_blob_file_bytes) {
+    return false;
+  }
+
   if (!s_blob_done_sent) {
     uint8_t payload[WG_BLOB_DONE_PAYLOAD_SIZE] = {0};
     wr_u64_le(&payload[0], s_blob_session_id);
@@ -2400,13 +2600,14 @@ static bool storage_prepare_blob_pending_locked(void) {
   return false;
 }
 
-static void storage_run_blob_tick(void) {
+static bool storage_run_blob_tick(void) {
+  bool sent_any = false;
   if (!s_storage_ready) {
-    return;
+    return false;
   }
   for (uint32_t budget = 0; budget < WG_STORAGE_BLOB_BUDGET_PER_TICK; ++budget) {
     if (!storage_lock(pdMS_TO_TICKS(20))) {
-      return;
+      return sent_any;
     }
     if (!storage_blob_allowed_locked()) {
       storage_reset_blob_locked();
@@ -2421,45 +2622,85 @@ static void storage_run_blob_tick(void) {
     uint8_t msg_type = s_blob_pending_msg_type;
     uint16_t payload_len = s_blob_pending_len;
     uint16_t chunk_len = s_blob_pending_chunk_len;
-    uint8_t payload[WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD] = {0};
+    uint8_t payload[WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX] = {0};
     if (payload_len > sizeof(payload)) {
       storage_clear_blob_pending_locked();
       storage_unlock();
       continue;
     }
     memcpy(payload, s_blob_pending_payload, payload_len);
-    storage_unlock();
 
-    if (!ble_notify_framed(s_sighting_handle, msg_type, payload, payload_len)) {
-      break;
-    }
-
-    if (!storage_lock(pdMS_TO_TICKS(20))) {
-      return;
-    }
+    // Commit counters while still holding the lock so that an ACK arriving
+    // during ble_notify_framed() sees the correct s_blob_bytes_sent value.
+    // Without this, the NimBLE host task can pre-empt the replay task,
+    // process the ACK with s_blob_bytes_sent still at 0, clamp ack_end to 0,
+    // and silently drop the ACK — causing an infinite timeout loop.
+    uint32_t prev_bytes_sent = s_blob_bytes_sent;
     if (msg_type == WG_MSG_BACKLOG_BLOB_META) {
       s_blob_meta_sent = true;
+      s_blob_last_progress_ms = now_ms();
     } else if (msg_type == WG_MSG_BACKLOG_BLOB_CHUNK) {
-      s_blob_bytes_sent += chunk_len;
+      uint32_t next = s_blob_bytes_sent + (uint32_t)chunk_len;
+      if (next < s_blob_bytes_sent || next > s_blob_file_bytes) {
+        next = s_blob_file_bytes;
+      }
+      s_blob_bytes_sent = next;
+      s_blob_last_progress_ms = now_ms();
     } else if (msg_type == WG_MSG_BACKLOG_BLOB_DONE) {
       s_blob_done_sent = true;
       s_blob_waiting_ack = true;
+      s_blob_last_progress_ms = now_ms();
     }
     storage_clear_blob_pending_locked();
     storage_unlock();
+
+    if (!ble_notify_framed(s_sighting_handle, msg_type, payload, payload_len)) {
+      if (s_notify_drops % 50 == 1) {
+        ESP_LOGW(TAG, "blob notify backpressure type=0x%02X len=%u drops=%lu rc=%d",
+                 (unsigned)msg_type, (unsigned)payload_len,
+                 (unsigned long)s_notify_drops, s_notify_drop_last_rc);
+      }
+      // Notification failed — roll back the counters we just committed.
+      if (storage_lock(pdMS_TO_TICKS(20))) {
+        if (msg_type == WG_MSG_BACKLOG_BLOB_CHUNK) {
+          if (!storage_seek_blob_locked(prev_bytes_sent)) {
+            storage_reset_blob_locked();
+          }
+        } else if (msg_type == WG_MSG_BACKLOG_BLOB_META) {
+          s_blob_meta_sent = false;
+        } else if (msg_type == WG_MSG_BACKLOG_BLOB_DONE) {
+          s_blob_done_sent = false;
+          s_blob_waiting_ack = false;
+        }
+        storage_unlock();
+      }
+      break;
+    }
+    sent_any = true;
+
+    // After META or DONE, yield the budget loop so the BLE stack has time to
+    // actually transmit the notification before we queue the next one.
+    // Back-to-back META + CHUNK queuing causes the large CHUNK notification
+    // (514 bytes, requiring LL fragmentation) to be silently lost in transit.
+    if (msg_type == WG_MSG_BACKLOG_BLOB_META ||
+        msg_type == WG_MSG_BACKLOG_BLOB_DONE) {
+      break;
+    }
   }
+  return sent_any;
 }
 
-static void storage_run_replay_tick(void) {
+static bool storage_run_replay_tick(void) {
+  bool sent_any = false;
   if (!s_storage_ready) {
-    return;
+    return false;
   }
   if (s_blob_requested) {
-    return;
+    return false;
   }
   for (uint32_t budget = 0; budget < WG_STORAGE_REPLAY_BUDGET_PER_TICK; ++budget) {
     if (!storage_lock(pdMS_TO_TICKS(20))) {
-      return;
+      return sent_any;
     }
     if (!storage_replay_allowed_locked()) {
       storage_reset_replay_locked();
@@ -2489,7 +2730,7 @@ static void storage_run_replay_tick(void) {
 
     if (payload_len == 0 || payload_len > sizeof(payload)) {
       if (!storage_lock(pdMS_TO_TICKS(20))) {
-        return;
+        return sent_any;
       }
       storage_clear_replay_pending_message_locked();
       storage_unlock();
@@ -2506,12 +2747,14 @@ static void storage_run_replay_tick(void) {
     if (!sent) {
       break;
     }
+    sent_any = true;
     if (!storage_lock(pdMS_TO_TICKS(20))) {
-      return;
+      return sent_any;
     }
     storage_clear_replay_pending_message_locked();
     storage_unlock();
   }
+  return sent_any;
 }
 
 static void storage_set_replay_enabled(bool enabled) {
@@ -2535,6 +2778,7 @@ static void storage_set_replay_enabled(bool enabled) {
   }
   storage_maybe_start_replay_locked();
   storage_unlock();
+  wake_replay_task();
 }
 
 static void storage_set_blob_enabled(bool enabled) {
@@ -2558,6 +2802,7 @@ static void storage_set_blob_enabled(bool enabled) {
   }
   storage_maybe_start_blob_locked();
   storage_unlock();
+  wake_replay_task();
 }
 
 static bool storage_clear_sessions(void) {
@@ -2796,6 +3041,87 @@ static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq) 
   return true;
 }
 
+static bool storage_apply_blob_chunk_reply(uint64_t session_id, uint32_t offset, uint16_t chunk_len,
+                                           uint8_t reply_code) {
+  if (session_id == 0) {
+    return false;
+  }
+  if (reply_code != WG_BACKLOG_BLOB_CHUNK_REPLY_ACK &&
+      reply_code != WG_BACKLOG_BLOB_CHUNK_REPLY_NAK) {
+    return false;
+  }
+  if (!s_storage_ready) {
+    return false;
+  }
+  if (!storage_lock(pdMS_TO_TICKS(60))) {
+    return false;
+  }
+
+  bool ok = true;
+  bool changed = false;
+  if (!s_blob_active || !s_blob_requested || s_blob_session_id != session_id) {
+    ESP_LOGW(TAG,
+             "blob chunk reply ignored sid=%016llX off=%lu len=%u reply=%u active=%d req=%d current_sid=%016llX",
+             (unsigned long long)session_id, (unsigned long)offset, (unsigned)chunk_len,
+             (unsigned)reply_code, s_blob_active ? 1 : 0, s_blob_requested ? 1 : 0,
+             (unsigned long long)s_blob_session_id);
+    storage_unlock();
+    return true;
+  }
+
+  if (reply_code == WG_BACKLOG_BLOB_CHUNK_REPLY_ACK) {
+    if (chunk_len == 0) {
+      ok = false;
+    } else {
+      uint64_t ack_end64 = (uint64_t)offset + (uint64_t)chunk_len;
+      uint32_t ack_end = (ack_end64 > UINT32_MAX) ? UINT32_MAX : (uint32_t)ack_end64;
+      if (ack_end > s_blob_file_bytes) {
+        ack_end = s_blob_file_bytes;
+      }
+      if (offset > s_blob_bytes_sent) {
+        ESP_LOGW(TAG, "blob chunk ack reject sid=%016llX off=%lu > sent=%lu",
+                 (unsigned long long)session_id, (unsigned long)offset,
+                 (unsigned long)s_blob_bytes_sent);
+        ok = false;
+      } else {
+        if (ack_end > s_blob_bytes_sent) {
+          ack_end = s_blob_bytes_sent;
+        }
+        if (offset > s_blob_bytes_acked) {
+          if (!storage_seek_blob_locked(s_blob_bytes_acked)) {
+            ok = false;
+          } else {
+            changed = true;
+          }
+        } else if (ack_end > s_blob_bytes_acked) {
+          s_blob_bytes_acked = ack_end;
+          changed = true;
+          ESP_LOGI(TAG, "blob chunk ack sid=%016llX acked=%lu/%lu",
+                   (unsigned long long)session_id, (unsigned long)s_blob_bytes_acked,
+                   (unsigned long)s_blob_file_bytes);
+        }
+      }
+    }
+  } else {
+    if (!storage_seek_blob_locked(offset)) {
+      ok = false;
+    } else {
+      changed = true;
+      ESP_LOGW(TAG, "blob chunk nak sid=%016llX resume_off=%lu",
+               (unsigned long long)session_id, (unsigned long)offset);
+    }
+  }
+
+  if (changed) {
+    s_blob_last_progress_ms = now_ms();
+  }
+  storage_unlock();
+  if (changed) {
+    wake_replay_task();
+  }
+  return ok;
+}
+
 static bool storage_open_session(void) {
   bool ok = false;
   if (!storage_lock(pdMS_TO_TICKS(120))) {
@@ -2969,6 +3295,26 @@ static void split_channel_mask(uint16_t global_mask, uint16_t *local_mask, uint1
   *node_mask = node;
 }
 
+static bool node_channel_mask_24_is_valid(uint16_t mask) {
+  return (mask & (uint16_t)~0x1FFFU) == 0U;
+}
+
+static bool node_channel_mask_5ghz_is_valid(uint64_t mask) {
+  return (mask & ~WG_NODE_5GHZ_MASK_ALL) == 0ULL;
+}
+
+static bool node_channel_plan_enabled(uint16_t mask24, uint64_t mask5ghz) {
+  return mask24 != 0U || mask5ghz != 0ULL;
+}
+
+static void apply_channel_plan(uint16_t local_mask, uint16_t node_mask_24, uint64_t node_mask_5ghz) {
+  s_local_channel_mask = local_mask;
+  s_node_channel_mask = node_mask_24;
+  s_node_channel_mask_5ghz = node_mask_5ghz;
+  // Keep legacy field aligned with the master's 2.4 GHz mask.
+  s_channel_mask = local_mask;
+}
+
 static const char *gps_source_name(wg_gps_source_t source) {
   switch (source) {
     case WG_GPS_SRC_UART:
@@ -3058,10 +3404,11 @@ static void log_bridge_diagnostics(bool force) {
   const int64_t node_rx_age_ms =
       (s_node_status.last_rx_ms > 0) ? (ms - s_node_status.last_rx_ms) : -1;
   ESP_LOGI(TAG,
-           "diag node link=%d hello=%d report=%d mask=0x%04X rx_bytes=%lu rx_frames=%lu "
+           "diag node link=%d hello=%d report=%d mask24=0x%04X mask5=0x%011llX rx_bytes=%lu rx_frames=%lu "
            "crc_fail=%u rx_last=%s(%u) age_ms=%lld tx_frames=%lu tx_fail=%lu tx_last=%s(%u)",
            s_node_status.link_up ? 1 : 0, s_node_seen_hello ? 1 : 0,
-           s_node_report_enable ? 1 : 0, s_node_channel_mask, (unsigned long)s_node_uart_rx_bytes,
+           s_node_report_enable ? 1 : 0, s_node_channel_mask,
+           (unsigned long long)s_node_channel_mask_5ghz, (unsigned long)s_node_uart_rx_bytes,
            (unsigned long)s_node_rx_frames, s_node_rx_crc_failures,
            node_type_name(s_node_last_rx_type), (unsigned)s_node_last_rx_payload_len,
            (long long)node_rx_age_ms, (unsigned long)s_node_tx_frames,
@@ -3069,15 +3416,31 @@ static void log_bridge_diagnostics(bool force) {
            (unsigned)s_node_last_tx_payload_len);
 
   ESP_LOGI(TAG,
-           "diag host enabled=%d active=%d frame_only=%d rx_frames=%lu tx_frames=%lu rx_errors=%lu",
-           s_host_serial_enabled ? 1 : 0, s_host_serial_active ? 1 : 0,
+           "diag host enabled=%d pref=%s tx=%s avail(uart=%d usb=%d) active=%d frame_only=%d "
+           "rx_frames=%lu tx_frames=%lu rx_errors=%lu",
+           s_host_serial_enabled ? 1 : 0, host_backend_name(s_host_backend),
+           host_backend_name(s_host_tx_backend), s_host_uart_enabled ? 1 : 0, s_host_usb_enabled ? 1 : 0,
+           s_host_serial_active ? 1 : 0,
            s_host_frame_only_logs ? 1 : 0, (unsigned long)s_host_rx_frames,
            (unsigned long)s_host_tx_frames, (unsigned long)s_host_rx_errors);
+  ESP_LOGI(TAG,
+           "diag ble drops=%u rc_last=%d enomem=%lu ebusy=%lu estalled=%lu att=%lu hci=%lu l2c=%lu "
+           "other=%lu link itvl=%u(%.2fms) mtu=%u phy=%s/%s dle tx=%u/%uus rx=%u/%uus",
+           (unsigned)s_notify_drops, s_notify_drop_last_rc,
+           (unsigned long)s_notify_drop_by_hs_rc[BLE_HS_ENOMEM],
+           (unsigned long)s_notify_drop_by_hs_rc[BLE_HS_EBUSY],
+           (unsigned long)s_notify_drop_by_hs_rc[BLE_HS_ESTALLED],
+           (unsigned long)s_notify_drop_att, (unsigned long)s_notify_drop_hci,
+           (unsigned long)s_notify_drop_l2c, (unsigned long)s_notify_drop_other,
+           (unsigned)s_ble_conn_itvl_1p25ms, (double)s_ble_conn_itvl_1p25ms * 1.25,
+           (unsigned)s_ble_att_mtu, ble_phy_name(s_ble_tx_phy), ble_phy_name(s_ble_rx_phy),
+           (unsigned)s_ble_max_tx_octets, (unsigned)s_ble_max_tx_time_us,
+           (unsigned)s_ble_max_rx_octets, (unsigned)s_ble_max_rx_time_us);
 
   ESP_LOGI(TAG,
            "diag store ready=%d backend=%s open=%d sid=%016llX backlog_records=%lu backlog_bytes=%lu "
            "replay_req=%d replay=%d replay_sid=%016llX replay_cursor=%lu "
-           "blob_req=%d blob=%d blob_sid=%016llX blob_bytes=%lu/%lu "
+           "blob_req=%d blob=%d blob_sid=%016llX blob_bytes_ack=%lu blob_bytes_tx=%lu/%lu "
            "queue_full=%d dropped_full=%lu",
            s_storage_ready ? 1 : 0, storage_backend_name(s_storage_backend),
            s_session_open ? 1 : 0, (unsigned long long)s_session_id,
@@ -3087,7 +3450,8 @@ static void log_bridge_diagnostics(bool force) {
            (unsigned long)s_replay_cursor_seq,
            s_blob_requested ? 1 : 0, s_blob_active ? 1 : 0,
            (unsigned long long)s_blob_session_id,
-           (unsigned long)s_blob_bytes_sent, (unsigned long)s_blob_file_bytes,
+           (unsigned long)s_blob_bytes_acked, (unsigned long)s_blob_bytes_sent,
+           (unsigned long)s_blob_file_bytes,
            s_queue_full ? 1 : 0,
            (unsigned long)s_dropped_flash_full);
 
@@ -3095,8 +3459,9 @@ static void log_bridge_diagnostics(bool force) {
       !s_node_no_rx_warned) {
     s_node_no_rx_warned = true;
     ESP_LOGW(TAG,
-             "node RX is silent while TX is active. Check C6 GPIO%d->ESP8266 RX0(GPIO3), "
-             "C6 GPIO%d<-ESP8266 TX0(GPIO1), common GND, and UART baud=%d on both sides.",
+             "node RX is silent while TX is active. Check C6 GPIO%d->node RX "
+             "(ESP8266 GPIO3 or BW16 PB2), C6 GPIO%d<-node TX (ESP8266 GPIO1 or BW16 PB1), "
+             "common GND, and UART baud=%d on both sides.",
              WG_NODE_UART_TX_GPIO, WG_NODE_UART_RX_GPIO, WG_NODE_UART_BAUD);
   }
 }
@@ -3147,7 +3512,10 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .ble_encrypted = s_ble_encrypted,
       .current_channel = s_current_channel,
       .hop_ms = s_hop_ms,
-      .channel_mask = s_channel_mask,
+      .channel_mask = s_local_channel_mask,
+      .local_channel_mask = s_local_channel_mask,
+      .node_channel_mask_24 = s_node_channel_mask,
+      .node_channel_mask_5ghz = s_node_channel_mask_5ghz,
       .unique_bssids_estimate = s_unique_bssid_estimate,
       .packets_per_sec = s_packets_per_sec,
       .dropped_notifies = s_notify_drops,
@@ -3160,13 +3528,13 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .node_packets_per_sec = s_node_status.packets_per_sec,
       .node_forwarded_sightings = s_node_status.forwarded_sightings,
       .node_channel = s_node_status.channel,
-      .node_channel_mask = s_node_status.channel_mask,
+      .node_channel_mask = s_node_channel_mask,
       .session_open = s_session_open,
       .session_id = s_session_open ? s_session_id : s_last_session_id,
       .queued_records = s_queue_backlog_records,
       .queued_bytes = s_queue_backlog_bytes,
       .replay_active = s_replay_active || s_blob_active,
-      .replay_cursor = s_blob_active ? s_blob_bytes_sent : s_replay_cursor_seq,
+      .replay_cursor = s_blob_active ? s_blob_bytes_acked : s_replay_cursor_seq,
       .queue_full = s_queue_full,
       .dropped_flash_full = s_dropped_flash_full,
       .node_count = 2,
@@ -3179,7 +3547,7 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .storage_free_bytes = (storage_total >= storage_used) ? (storage_total - storage_used) : 0,
       .blob_active = s_blob_active,
       .blob_session_id = s_blob_session_id,
-      .blob_bytes_sent = s_blob_bytes_sent,
+      .blob_bytes_sent = s_blob_bytes_acked,
       .blob_bytes_total = s_blob_file_bytes,
   };
 }
@@ -3883,14 +4251,17 @@ static bool node_write_frame(uint8_t type, const uint8_t *payload, uint16_t payl
 }
 
 static bool node_send_config(void) {
-  uint8_t payload[5] = {0};
-  bool scan_enable = s_scanning && s_node_channel_mask != 0;
+  uint8_t payload[13] = {0};
+  bool scan_enable = s_scanning && node_channel_plan_enabled(s_node_channel_mask, s_node_channel_mask_5ghz);
   bool report_enable = scan_enable && s_latest_gps.valid;
   payload[0] = (scan_enable ? 1U : 0U) | (report_enable ? 2U : 0U);
   payload[1] = (uint8_t)(s_hop_ms & 0xFF);
   payload[2] = (uint8_t)((s_hop_ms >> 8) & 0xFF);
   payload[3] = (uint8_t)(s_node_channel_mask & 0xFF);
   payload[4] = (uint8_t)((s_node_channel_mask >> 8) & 0xFF);
+  for (size_t i = 0; i < 8; ++i) {
+    payload[5 + i] = (uint8_t)((s_node_channel_mask_5ghz >> (8U * i)) & 0xFFU);
+  }
   s_node_report_enable = report_enable;
   return node_write_frame(WG_NODE_MSG_CONFIG, payload, sizeof(payload));
 }
@@ -3949,6 +4320,12 @@ static void node_handle_frame(const uint8_t *header, const uint8_t *payload, uin
     bool remote_report = (payload[0] & 0x02U) != 0U;
     s_node_status.channel = payload[1];
     s_node_status.channel_mask = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    s_node_status.channel_mask_5ghz = 0;
+    if (payload_len >= 18) {
+      for (size_t i = 0; i < 8; ++i) {
+        s_node_status.channel_mask_5ghz |= ((uint64_t)payload[10 + i] << (8U * i));
+      }
+    }
     s_node_status.packets_per_sec = (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
     (void)remote_scan;
     (void)remote_report;
@@ -4061,68 +4438,78 @@ static void node_uart_task(void *arg) {
   }
 }
 
-static void host_serial_consume_byte(uint8_t b) {
-  if (s_host_rx_pos == 0) {
+static void host_serial_consume_byte(wg_host_backend_t backend, uint8_t b) {
+  wg_host_rx_parser_t *parser = host_parser_for_backend(backend);
+  if (parser == NULL) {
+    return;
+  }
+
+  if (parser->pos == 0) {
     if (b != WG_FRAME_MAGIC0) {
       return;
     }
-    s_host_rx_expected = 0;
-    s_host_rx_buf[s_host_rx_pos++] = b;
+    parser->expected = 0;
+    parser->buf[parser->pos++] = b;
     return;
   }
 
-  if (s_host_rx_pos == 1) {
+  if (parser->pos == 1) {
     if (b == WG_FRAME_MAGIC1) {
-      s_host_rx_buf[s_host_rx_pos++] = b;
+      parser->buf[parser->pos++] = b;
       return;
     }
-    s_host_rx_pos = (b == WG_FRAME_MAGIC0) ? 1 : 0;
-    s_host_rx_expected = 0;
-    if (s_host_rx_pos == 1) {
-      s_host_rx_buf[0] = WG_FRAME_MAGIC0;
+    parser->pos = (b == WG_FRAME_MAGIC0) ? 1 : 0;
+    parser->expected = 0;
+    if (parser->pos == 1) {
+      parser->buf[0] = WG_FRAME_MAGIC0;
     }
     return;
   }
 
-  if (s_host_rx_pos >= sizeof(s_host_rx_buf)) {
+  if (parser->pos >= sizeof(parser->buf)) {
+    parser->errors++;
     s_host_rx_errors++;
-    host_serial_reset_rx();
+    host_serial_reset_rx(parser);
     return;
   }
 
-  s_host_rx_buf[s_host_rx_pos++] = b;
-  if (s_host_rx_pos == WG_FRAME_HEADER_SIZE) {
-    uint16_t payload_len = (uint16_t)s_host_rx_buf[6] | ((uint16_t)s_host_rx_buf[7] << 8);
+  parser->buf[parser->pos++] = b;
+  if (parser->pos == WG_FRAME_HEADER_SIZE) {
+    uint16_t payload_len = (uint16_t)parser->buf[6] | ((uint16_t)parser->buf[7] << 8);
     if (payload_len > WG_HOST_FRAME_MAX_PAYLOAD) {
+      parser->errors++;
       s_host_rx_errors++;
-      host_serial_reset_rx();
+      host_serial_reset_rx(parser);
       return;
     }
-    s_host_rx_expected = (size_t)WG_FRAME_HEADER_SIZE + (size_t)payload_len;
-    if (s_host_rx_expected > sizeof(s_host_rx_buf)) {
+    parser->expected = (size_t)WG_FRAME_HEADER_SIZE + (size_t)payload_len;
+    if (parser->expected > sizeof(parser->buf)) {
+      parser->errors++;
       s_host_rx_errors++;
-      host_serial_reset_rx();
+      host_serial_reset_rx(parser);
       return;
     }
   }
 
-  if (s_host_rx_expected > 0 && s_host_rx_pos >= s_host_rx_expected) {
+  if (parser->expected > 0 && parser->pos >= parser->expected) {
     wg_frame_t preview = {0};
     if (!s_host_serial_active &&
-        wg_frame_decode(s_host_rx_buf, s_host_rx_expected, &preview) == WG_OK &&
+        wg_frame_decode(parser->buf, parser->expected, &preview) == WG_OK &&
         preview.version == WG_PROTOCOL_VERSION && preview.type == WG_MSG_COMMAND) {
       host_serial_mark_active();
     }
     uint8_t cmd_id = 0;
-    uint8_t result = process_control_frame(s_host_rx_buf, s_host_rx_expected, &cmd_id);
+    uint8_t result = process_control_frame(parser->buf, parser->expected, &cmd_id);
     if (cmd_id != 0) {
       host_serial_mark_active();
+      s_host_tx_backend = backend;
     }
     if (s_host_serial_active) {
       (void)send_ack_host(cmd_id, result);
     }
+    parser->frames++;
     s_host_rx_frames++;
-    host_serial_reset_rx();
+    host_serial_reset_rx(parser);
   }
 }
 
@@ -4130,46 +4517,76 @@ static void host_serial_task(void *arg) {
   (void)arg;
   uint8_t buf[96];
   while (true) {
-    int n = host_serial_read_bytes(buf, sizeof(buf), pdMS_TO_TICKS(WG_HOST_SERIAL_READ_MS));
-    if (n <= 0) {
-      continue;
+    bool got_data = false;
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+    if (s_host_usb_enabled) {
+      int n = host_serial_read_bytes(WG_HOST_BACKEND_USB, buf, sizeof(buf), 0);
+      if (n > 0) {
+        got_data = true;
+        for (int i = 0; i < n; ++i) {
+          host_serial_consume_byte(WG_HOST_BACKEND_USB, buf[i]);
+        }
+      }
     }
-    for (int i = 0; i < n; ++i) {
-      host_serial_consume_byte(buf[i]);
+#endif
+    if (!got_data) {
+      vTaskDelay(pdMS_TO_TICKS(WG_HOST_SERIAL_READ_MS));
     }
   }
 }
 
 static void init_host_serial_bridge(void) {
+  s_host_serial_enabled = false;
+  s_host_uart_enabled = false;
+  s_host_usb_enabled = false;
+  s_host_backend = WG_HOST_BACKEND_NONE;
+  s_host_tx_backend = WG_HOST_BACKEND_NONE;
+
 #if SOC_USB_SERIAL_JTAG_SUPPORTED
+  esp_err_t rc = ESP_FAIL;
   usb_serial_jtag_driver_config_t cfg = {
       .tx_buffer_size = 4096,
       .rx_buffer_size = 1024,
   };
-  esp_err_t rc = usb_serial_jtag_driver_install(&cfg);
-  if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-    ESP_LOGW(TAG, "host serial disabled: usb_serial_jtag_driver_install rc=%s",
-             esp_err_to_name(rc));
-    s_host_serial_enabled = false;
+  rc = usb_serial_jtag_driver_install(&cfg);
+  if (rc == ESP_OK || rc == ESP_ERR_INVALID_STATE) {
+    s_host_usb_enabled = true;
+  } else {
+    ESP_LOGW(TAG, "host serial usb init failed rc=%s", esp_err_to_name(rc));
+  }
+#endif
+
+  s_host_serial_enabled = s_host_usb_enabled;
+  if (s_host_usb_enabled) {
+    s_host_backend = WG_HOST_BACKEND_USB;
+  }
+  if (!s_host_serial_enabled) {
+    ESP_LOGW(TAG, "host serial bridge disabled: no backend");
     return;
   }
+
   s_host_tx_mutex = xSemaphoreCreateMutex();
   if (s_host_tx_mutex == NULL) {
     ESP_LOGW(TAG, "host serial disabled: mutex allocation failed");
     s_host_serial_enabled = false;
+    s_host_uart_enabled = false;
+    s_host_usb_enabled = false;
+    s_host_backend = WG_HOST_BACKEND_NONE;
+    s_host_tx_backend = WG_HOST_BACKEND_NONE;
     return;
   }
-  s_host_serial_enabled = true;
-  host_serial_reset_rx();
+  host_serial_reset_rx(&s_host_uart_rx);
+  host_serial_reset_rx(&s_host_usb_rx);
   if (xTaskCreate(host_serial_task, "wg_host_serial", 4096, NULL, 5, NULL) != pdPASS) {
     ESP_LOGW(TAG, "host serial disabled: task create failed");
     s_host_serial_enabled = false;
+    s_host_uart_enabled = false;
+    s_host_usb_enabled = false;
+    s_host_backend = WG_HOST_BACKEND_NONE;
+    s_host_tx_backend = WG_HOST_BACKEND_NONE;
     return;
   }
   ESP_LOGI(TAG, "host serial bridge ready over USB");
-#else
-  ESP_LOGW(TAG, "host serial bridge unavailable on this target");
-#endif
 }
 
 static void init_uart_bridges(void) {
@@ -4206,9 +4623,8 @@ static void init_uart_bridges(void) {
                                UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
   ESP_ERROR_CHECK(uart_flush_input(WG_NODE_UART_NUM));
 
-  split_channel_mask(s_channel_mask, &s_local_channel_mask, &s_node_channel_mask);
-  ESP_LOGI(TAG, "UART bridges ready local_mask=0x%04X node_mask=0x%04X", s_local_channel_mask,
-           s_node_channel_mask);
+  ESP_LOGI(TAG, "UART bridges ready local_mask=0x%04X node_mask24=0x%04X node_mask5=0x%011llX",
+           s_local_channel_mask, s_node_channel_mask, (unsigned long long)s_node_channel_mask_5ghz);
   node_send_hello();
   log_bridge_diagnostics(true);
 
@@ -4235,8 +4651,9 @@ static bool ble_notify_framed(uint16_t attr_handle, uint8_t type, const uint8_t 
     return false;
   }
 
-  uint8_t frame[WG_FRAME_HEADER_SIZE + WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD];
-  if (payload_len > WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD ||
+  uint8_t frame[WG_FRAME_HEADER_SIZE + WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX];
+  uint16_t max_payload = ble_notify_frame_payload_limit();
+  if (payload_len > max_payload ||
       (size_t)payload_len > sizeof(frame) - WG_FRAME_HEADER_SIZE) {
     return false;
   }
@@ -4263,6 +4680,18 @@ static bool ble_notify_framed(uint16_t attr_handle, uint8_t type, const uint8_t 
   const int rc = ble_gatts_notify_custom(s_conn_handle, attr_handle, om);
   if (rc != 0) {
     s_notify_drops++;
+    s_notify_drop_last_rc = rc;
+    if (rc >= 0 && rc < (int)(sizeof(s_notify_drop_by_hs_rc) / sizeof(s_notify_drop_by_hs_rc[0]))) {
+      s_notify_drop_by_hs_rc[rc]++;
+    } else if (rc >= BLE_HS_ERR_ATT_BASE && rc < (BLE_HS_ERR_ATT_BASE + 0x100)) {
+      s_notify_drop_att++;
+    } else if (rc >= BLE_HS_ERR_HCI_BASE && rc < (BLE_HS_ERR_HCI_BASE + 0x100)) {
+      s_notify_drop_hci++;
+    } else if (rc >= BLE_HS_ERR_L2C_BASE && rc < (BLE_HS_ERR_L2C_BASE + 0x100)) {
+      s_notify_drop_l2c++;
+    } else {
+      s_notify_drop_other++;
+    }
     return false;
   }
   led_note_bt_tx();
@@ -5109,10 +5538,21 @@ static void status_task(void *arg) {
 
 static void replay_task(void *arg) {
   (void)arg;
+  TickType_t delay_ticks = pdMS_TO_TICKS(WG_REPLAY_TASK_INTERVAL_MS);
+  if (delay_ticks < 1) {
+    delay_ticks = 1;
+  }
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(WG_REPLAY_TASK_INTERVAL_MS));
-    storage_run_blob_tick();
-    storage_run_replay_tick();
+    (void)ulTaskNotifyTake(pdTRUE, delay_ticks);
+    for (uint8_t rounds = 0; rounds < WG_REPLAY_TASK_PUMP_ROUNDS; ++rounds) {
+      bool progressed = false;
+      progressed = storage_run_blob_tick() || progressed;
+      progressed = storage_run_replay_tick() || progressed;
+      if (!progressed) {
+        break;
+      }
+      taskYIELD();
+    }
   }
 }
 
@@ -5132,12 +5572,35 @@ static esp_err_t start_scan(void) {
     ESP_LOGW(TAG, "Scan start blocked: storage session open failed");
     return ESP_FAIL;
   }
+
   s_current_channel = pick_first_channel(s_local_channel_mask);
-  ESP_ERROR_CHECK(esp_wifi_set_channel(s_current_channel, WIFI_SECOND_CHAN_NONE));
-  ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+  esp_err_t rc = esp_wifi_set_channel(s_current_channel, WIFI_SECOND_CHAN_NONE);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "Scan start failed: set channel rc=%s", esp_err_to_name(rc));
+    if (s_storage_ready) {
+      storage_close_session(WG_SESSION_STATE_ABORTED);
+    }
+    return rc;
+  }
+  rc = esp_wifi_set_promiscuous(true);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "Scan start failed: enable promiscuous rc=%s", esp_err_to_name(rc));
+    if (s_storage_ready) {
+      storage_close_session(WG_SESSION_STATE_ABORTED);
+    }
+    return rc;
+  }
 
   if (!s_hop_timer_started) {
-    ESP_ERROR_CHECK(esp_timer_start_periodic(s_hop_timer, (uint64_t)s_hop_ms * 1000ULL));
+    rc = esp_timer_start_periodic(s_hop_timer, (uint64_t)s_hop_ms * 1000ULL);
+    if (rc != ESP_OK) {
+      ESP_LOGW(TAG, "Scan start failed: hop timer start rc=%s", esp_err_to_name(rc));
+      (void)esp_wifi_set_promiscuous(false);
+      if (s_storage_ready) {
+        storage_close_session(WG_SESSION_STATE_ABORTED);
+      }
+      return rc;
+    }
     s_hop_timer_started = true;
   }
   s_scanning = true;
@@ -5151,11 +5614,31 @@ static esp_err_t stop_scan(void) {
   if (!s_scanning) {
     return ESP_OK;
   }
+  bool timer_stopped = false;
   if (s_hop_timer_started) {
-    esp_timer_stop(s_hop_timer);
-    s_hop_timer_started = false;
+    esp_err_t timer_rc = esp_timer_stop(s_hop_timer);
+    if (timer_rc == ESP_OK || timer_rc == ESP_ERR_INVALID_STATE) {
+      s_hop_timer_started = false;
+      timer_stopped = true;
+    } else {
+      ESP_LOGW(TAG, "Scan stop warning: hop timer stop rc=%s", esp_err_to_name(timer_rc));
+    }
   }
-  ESP_ERROR_CHECK(esp_wifi_set_promiscuous(false));
+
+  esp_err_t rc = esp_wifi_set_promiscuous(false);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "Scan stop failed: disable promiscuous rc=%s", esp_err_to_name(rc));
+    if (timer_stopped && !s_hop_timer_started) {
+      esp_err_t restart_rc = esp_timer_start_periodic(s_hop_timer, (uint64_t)s_hop_ms * 1000ULL);
+      if (restart_rc == ESP_OK) {
+        s_hop_timer_started = true;
+      } else {
+        ESP_LOGW(TAG, "Scan stop rollback warning: timer restart rc=%s", esp_err_to_name(restart_rc));
+      }
+    }
+    return rc;
+  }
+
   s_scanning = false;
   if (s_storage_ready) {
     storage_close_session(WG_SESSION_STATE_CLOSED);
@@ -5173,7 +5656,10 @@ static void save_runtime_config(void) {
     return;
   }
   nvs_set_u16(h, "hop_ms", s_hop_ms);
-  nvs_set_u16(h, "chanmask", s_channel_mask);
+  nvs_set_u16(h, "chanmask", s_local_channel_mask);
+  nvs_set_u16(h, "chanmask_l", s_local_channel_mask);
+  nvs_set_u16(h, "chanmask_n", s_node_channel_mask);
+  nvs_set_u64(h, "chanmask5n", s_node_channel_mask_5ghz);
   nvs_set_u8(h, "bootmode", s_boot_mode);
   nvs_commit(h);
   nvs_close(h);
@@ -5183,32 +5669,62 @@ static void load_runtime_config(void) {
   s_hop_ms = WG_DEFAULT_HOP_MS;
   s_channel_mask = WG_DEFAULT_CHANNEL_MASK;
   s_boot_mode = WG_BOOT_MANUAL;
+  s_node_channel_mask_5ghz = WG_NODE_5GHZ_MASK_ALL;
+  split_channel_mask(s_channel_mask, &s_local_channel_mask, &s_node_channel_mask);
 
   nvs_handle_t h = 0;
   if (nvs_open("espwigle", NVS_READONLY, &h) != ESP_OK) {
+    apply_channel_plan(s_local_channel_mask, s_node_channel_mask, s_node_channel_mask_5ghz);
     return;
   }
 
   uint16_t hop_ms = 0;
-  uint16_t channel_mask = 0;
+  uint16_t legacy_channel_mask = 0;
+  uint16_t local_channel_mask = 0;
+  uint16_t node_channel_mask = 0;
+  uint64_t node_channel_mask_5ghz = 0;
   uint8_t boot_mode = 0;
+  bool have_local_channel_mask = false;
+  bool have_node_channel_mask = false;
+  bool have_node_channel_mask_5ghz = false;
 
   if (nvs_get_u16(h, "hop_ms", &hop_ms) == ESP_OK && hop_ms >= WG_MIN_HOP_MS &&
       hop_ms <= WG_MAX_HOP_MS) {
     s_hop_ms = hop_ms;
   }
-  if (nvs_get_u16(h, "chanmask", &channel_mask) == ESP_OK &&
-      wg_channel_mask_is_valid(channel_mask)) {
-    s_channel_mask = channel_mask;
+  if (nvs_get_u16(h, "chanmask_l", &local_channel_mask) == ESP_OK &&
+      wg_channel_mask_is_valid(local_channel_mask)) {
+    have_local_channel_mask = true;
+  }
+  if (nvs_get_u16(h, "chanmask_n", &node_channel_mask) == ESP_OK &&
+      node_channel_mask_24_is_valid(node_channel_mask)) {
+    have_node_channel_mask = true;
+  }
+  if (nvs_get_u64(h, "chanmask5n", &node_channel_mask_5ghz) == ESP_OK &&
+      node_channel_mask_5ghz_is_valid(node_channel_mask_5ghz)) {
+    have_node_channel_mask_5ghz = true;
+  }
+  if (nvs_get_u16(h, "chanmask", &legacy_channel_mask) == ESP_OK &&
+      wg_channel_mask_is_valid(legacy_channel_mask)) {
+    s_channel_mask = legacy_channel_mask;
   }
   if (nvs_get_u8(h, "bootmode", &boot_mode) == ESP_OK &&
       (boot_mode == WG_BOOT_MANUAL || boot_mode == WG_BOOT_AUTO)) {
     s_boot_mode = boot_mode;
   }
   nvs_close(h);
-  split_channel_mask(s_channel_mask, &s_local_channel_mask, &s_node_channel_mask);
-  ESP_LOGI(TAG, "config loaded hop=%u mask=0x%04X boot=%u", (unsigned)s_hop_ms,
-           (unsigned)s_channel_mask, (unsigned)s_boot_mode);
+
+  if (have_local_channel_mask && have_node_channel_mask && have_node_channel_mask_5ghz &&
+      node_channel_plan_enabled(node_channel_mask, node_channel_mask_5ghz)) {
+    apply_channel_plan(local_channel_mask, node_channel_mask, node_channel_mask_5ghz);
+  } else {
+    split_channel_mask(s_channel_mask, &s_local_channel_mask, &s_node_channel_mask);
+    apply_channel_plan(s_local_channel_mask, s_node_channel_mask, s_node_channel_mask_5ghz);
+  }
+  ESP_LOGI(TAG,
+           "config loaded hop=%u local_mask=0x%04X node_mask24=0x%04X node_mask5=0x%011llX boot=%u",
+           (unsigned)s_hop_ms, (unsigned)s_local_channel_mask, (unsigned)s_node_channel_mask,
+           (unsigned long long)s_node_channel_mask_5ghz, (unsigned)s_boot_mode);
 }
 
 static void send_snapshot(void) {
@@ -5256,6 +5772,25 @@ static uint8_t apply_command(const wg_command_t *cmd) {
       }
       s_channel_mask = cmd->channel_mask;
       split_channel_mask(s_channel_mask, &s_local_channel_mask, &s_node_channel_mask);
+      apply_channel_plan(s_local_channel_mask, s_node_channel_mask, s_node_channel_mask_5ghz);
+      if (s_scanning) {
+        s_current_channel = pick_first_channel(s_local_channel_mask);
+        esp_wifi_set_channel(s_current_channel, WIFI_SECOND_CHAN_NONE);
+      }
+      save_runtime_config();
+      notify_status_frame();
+      node_send_config();
+      return WG_ACK_OK;
+    case WG_CMD_SET_CHANNEL_PLAN:
+      if (!wg_channel_mask_is_valid(cmd->local_channel_mask) ||
+          !node_channel_mask_24_is_valid(cmd->node_channel_mask) ||
+          !node_channel_mask_5ghz_is_valid(cmd->node_channel_mask_5ghz)) {
+        return WG_ERR_BAD_ARG;
+      }
+      if (!node_channel_plan_enabled(cmd->node_channel_mask, cmd->node_channel_mask_5ghz)) {
+        return WG_ERR_BAD_ARG;
+      }
+      apply_channel_plan(cmd->local_channel_mask, cmd->node_channel_mask, cmd->node_channel_mask_5ghz);
       if (s_scanning) {
         s_current_channel = pick_first_channel(s_local_channel_mask);
         esp_wifi_set_channel(s_current_channel, WIFI_SECOND_CHAN_NONE);
@@ -5289,7 +5824,11 @@ static uint8_t apply_command(const wg_command_t *cmd) {
         return WG_ERR_BAD_ARG;
       }
       if (cmd->replay_enable == 1 && s_scanning) {
-        return WG_ERR_BUSY;
+        esp_err_t stop_rc = stop_scan();
+        if (stop_rc != ESP_OK) {
+          ESP_LOGW(TAG, "set replay failed: stop scan rc=%s", esp_err_to_name(stop_rc));
+          return WG_ERR_INTERNAL;
+        }
       }
       storage_set_replay_enabled(cmd->replay_enable == 1);
       notify_status_frame();
@@ -5299,11 +5838,33 @@ static uint8_t apply_command(const wg_command_t *cmd) {
         return WG_ERR_BAD_ARG;
       }
       if (cmd->backlog_blob_enable == 1 && s_scanning) {
-        return WG_ERR_BUSY;
+        esp_err_t stop_rc = stop_scan();
+        if (stop_rc != ESP_OK) {
+          ESP_LOGW(TAG, "set backlog blob failed: stop scan rc=%s", esp_err_to_name(stop_rc));
+          return WG_ERR_INTERNAL;
+        }
       }
       storage_set_blob_enabled(cmd->backlog_blob_enable == 1);
       notify_status_frame();
       return WG_ACK_OK;
+    case WG_CMD_BACKLOG_BLOB_CHUNK_REPLY:
+      if (cmd->backlog_blob_session_id == 0) {
+        return WG_ERR_BAD_ARG;
+      }
+      if (cmd->backlog_blob_chunk_reply != WG_BACKLOG_BLOB_CHUNK_REPLY_ACK &&
+          cmd->backlog_blob_chunk_reply != WG_BACKLOG_BLOB_CHUNK_REPLY_NAK) {
+        return WG_ERR_BAD_ARG;
+      }
+      if (cmd->backlog_blob_chunk_reply == WG_BACKLOG_BLOB_CHUNK_REPLY_ACK &&
+          cmd->backlog_blob_chunk_len == 0) {
+        return WG_ERR_BAD_ARG;
+      }
+      return storage_apply_blob_chunk_reply(cmd->backlog_blob_session_id,
+                                            cmd->backlog_blob_chunk_offset,
+                                            cmd->backlog_blob_chunk_len,
+                                            cmd->backlog_blob_chunk_reply)
+                 ? WG_ACK_OK
+                 : WG_ERR_INTERNAL;
     case WG_CMD_DEBUG_SEED_STORAGE: {
       if (s_scanning) {
         return WG_ERR_BUSY;
@@ -5551,6 +6112,73 @@ static void refresh_link_security_state(uint16_t conn_handle) {
            desc.sec_state.encrypted, desc.sec_state.authenticated, desc.sec_state.bonded);
 }
 
+static const char *ble_phy_name(uint8_t phy) {
+  switch (phy) {
+    case BLE_GAP_LE_PHY_1M:
+      return "1M";
+    case BLE_GAP_LE_PHY_2M:
+      return "2M";
+    case BLE_GAP_LE_PHY_CODED:
+      return "CODED";
+    default:
+      return "unknown";
+  }
+}
+
+static uint16_t ble_notify_frame_payload_limit(void) {
+  uint16_t mtu = s_ble_att_mtu;
+  if (mtu < 23) {
+    mtu = 23;
+  }
+  if (mtu <= (WG_FRAME_HEADER_SIZE + 3)) {
+    return 0;
+  }
+  uint16_t limit = (uint16_t)(mtu - WG_FRAME_HEADER_SIZE - 3);
+  if (limit > WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX) {
+    limit = WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX;
+  }
+  // Cap payload so the entire BLE notification fits within 2 LL PDU fragments.
+  // Some Android BLE stacks silently fail to reassemble L2CAP PDUs spanning 3+
+  // LL fragments.  With DLE=251 and encryption (4-byte MIC), each fragment
+  // carries at most 247 bytes of L2CAP data.  Two fragments = 494 bytes L2CAP
+  // → 490 ATT PDU → 487 notification value → 475 WG frame payload.
+  const uint16_t dle = WG_BLE_DATA_LEN_OCTETS;
+  const uint16_t mic = s_ble_encrypted ? 4 : 0;
+  const uint16_t l2cap_per_frag = (dle > mic) ? (uint16_t)(dle - mic) : 1;
+  const uint16_t safe_l2cap = (uint16_t)(l2cap_per_frag * 2U);
+  const uint16_t safe_att = (safe_l2cap > 4) ? (uint16_t)(safe_l2cap - 4) : 0;
+  const uint16_t safe_notify = (safe_att > 3) ? (uint16_t)(safe_att - 3) : 0;
+  const uint16_t safe_payload = (safe_notify > WG_FRAME_HEADER_SIZE)
+                                    ? (uint16_t)(safe_notify - WG_FRAME_HEADER_SIZE)
+                                    : 0;
+  if (limit > safe_payload) {
+    limit = safe_payload;
+  }
+  return limit;
+}
+
+static void refresh_ble_link_metrics(uint16_t conn_handle, const char *reason_tag) {
+  struct ble_gap_conn_desc desc;
+  const int rc = ble_gap_conn_find(conn_handle, &desc);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "%s: ble_gap_conn_find failed rc=%d", reason_tag, rc);
+    return;
+  }
+  s_ble_conn_itvl_1p25ms = desc.conn_itvl;
+  s_ble_conn_latency = desc.conn_latency;
+  s_ble_conn_supervision_10ms = desc.supervision_timeout;
+  s_ble_att_mtu = ble_att_mtu(conn_handle);
+  ESP_LOGI(TAG,
+           "%s: conn itvl=%u(%.2fms) latency=%u timeout=%u(%ums) mtu=%u phy=%s/%s dle tx=%u/%uus "
+           "rx=%u/%uus",
+           reason_tag, (unsigned)s_ble_conn_itvl_1p25ms, (double)s_ble_conn_itvl_1p25ms * 1.25,
+           (unsigned)s_ble_conn_latency, (unsigned)s_ble_conn_supervision_10ms,
+           (unsigned)(s_ble_conn_supervision_10ms * 10U), (unsigned)s_ble_att_mtu,
+           ble_phy_name(s_ble_tx_phy), ble_phy_name(s_ble_rx_phy), (unsigned)s_ble_max_tx_octets,
+           (unsigned)s_ble_max_tx_time_us, (unsigned)s_ble_max_rx_octets,
+           (unsigned)s_ble_max_rx_time_us);
+}
+
 static void request_fast_ble_conn_params(uint16_t conn_handle) {
   struct ble_gap_upd_params params;
   memset(&params, 0, sizeof(params));
@@ -5561,6 +6189,24 @@ static void request_fast_ble_conn_params(uint16_t conn_handle) {
   const int rc = ble_gap_update_params(conn_handle, &params);
   if (rc != 0 && rc != BLE_HS_EALREADY) {
     ESP_LOGW(TAG, "ble_gap_update_params failed rc=%d", rc);
+  }
+}
+
+static void request_fast_ble_phy_data_len(uint16_t conn_handle) {
+  int rc = ble_gap_set_prefered_le_phy(conn_handle, BLE_GAP_LE_PHY_1M_MASK,
+                                       BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_CODED_ANY);
+  if (rc != 0 && rc != BLE_HS_EALREADY) {
+    ESP_LOGW(TAG, "ble_gap_set_prefered_le_phy failed rc=%d", rc);
+  } else {
+    ESP_LOGI(TAG, "ble_gap_set_prefered_le_phy requested 1M");
+  }
+
+  rc = ble_gap_set_data_len(conn_handle, WG_BLE_DATA_LEN_OCTETS, WG_BLE_DATA_LEN_TIME_US);
+  if (rc != 0 && rc != BLE_HS_EALREADY) {
+    ESP_LOGW(TAG, "ble_gap_set_data_len failed rc=%d", rc);
+  } else {
+    ESP_LOGI(TAG, "ble_gap_set_data_len requested tx_octets=%u tx_time=%u",
+             (unsigned)WG_BLE_DATA_LEN_OCTETS, (unsigned)WG_BLE_DATA_LEN_TIME_US);
   }
 }
 
@@ -5614,9 +6260,17 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       if (event->connect.status == 0) {
         s_conn_handle = event->connect.conn_handle;
         s_security_retry_attempted = false;
+        s_ble_tx_phy = 0;
+        s_ble_rx_phy = 0;
+        s_ble_max_tx_octets = 0;
+        s_ble_max_tx_time_us = 0;
+        s_ble_max_rx_octets = 0;
+        s_ble_max_rx_time_us = 0;
         log_ble_store_counts("connect");
         refresh_link_security_state(s_conn_handle);
         request_fast_ble_conn_params(s_conn_handle);
+        request_fast_ble_phy_data_len(s_conn_handle);
+        refresh_ble_link_metrics(s_conn_handle, "connect");
         led_sync_link_state();
         if (!s_ble_encrypted) {
           ESP_LOGI(TAG, "connect: deferring security initiation until subscribe/write");
@@ -5632,6 +6286,16 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
       s_ble_encrypted = false;
       s_security_retry_attempted = false;
+      s_ble_conn_itvl_1p25ms = 0;
+      s_ble_conn_latency = 0;
+      s_ble_conn_supervision_10ms = 0;
+      s_ble_att_mtu = 0;
+      s_ble_tx_phy = 0;
+      s_ble_rx_phy = 0;
+      s_ble_max_tx_octets = 0;
+      s_ble_max_tx_time_us = 0;
+      s_ble_max_rx_octets = 0;
+      s_ble_max_rx_time_us = 0;
       s_status_notify_enabled = false;
       s_gps_notify_enabled = false;
       s_sighting_notify_enabled = false;
@@ -5640,10 +6304,17 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       led_sync_link_state();
       ble_advertise();
       return 0;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+      ESP_LOGI(TAG, "BLE conn update status=%d", event->conn_update.status);
+      if (event->conn_update.status == 0) {
+        refresh_ble_link_metrics(event->conn_update.conn_handle, "conn_update");
+      }
+      return 0;
     case BLE_GAP_EVENT_ENC_CHANGE:
       ESP_LOGI(TAG, "BLE encryption change status=%d", event->enc_change.status);
       if (event->enc_change.status == 0) {
         refresh_link_security_state(event->enc_change.conn_handle);
+        refresh_ble_link_metrics(event->enc_change.conn_handle, "enc_change");
         s_security_retry_attempted = false;
       } else {
         s_ble_encrypted = false;
@@ -5663,6 +6334,38 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
       }
       led_sync_link_state();
       notify_status_frame();
+      return 0;
+    case BLE_GAP_EVENT_MTU:
+      s_ble_att_mtu = event->mtu.value;
+      ESP_LOGI(TAG, "BLE MTU updated channel=%u mtu=%u", (unsigned)event->mtu.channel_id,
+               (unsigned)event->mtu.value);
+      refresh_ble_link_metrics(event->mtu.conn_handle, "mtu");
+      return 0;
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+      if (event->phy_updated.status == 0) {
+        s_ble_tx_phy = event->phy_updated.tx_phy;
+        s_ble_rx_phy = event->phy_updated.rx_phy;
+        ESP_LOGI(TAG, "BLE PHY update tx=%s rx=%s", ble_phy_name(s_ble_tx_phy),
+                 ble_phy_name(s_ble_rx_phy));
+        refresh_ble_link_metrics(event->phy_updated.conn_handle, "phy_update");
+      } else {
+        ESP_LOGW(TAG, "BLE PHY update failed status=%d", event->phy_updated.status);
+      }
+      return 0;
+    case BLE_GAP_EVENT_DATA_LEN_CHG:
+      s_ble_max_tx_octets = event->data_len_chg.max_tx_octets;
+      s_ble_max_tx_time_us = event->data_len_chg.max_tx_time;
+      s_ble_max_rx_octets = event->data_len_chg.max_rx_octets;
+      s_ble_max_rx_time_us = event->data_len_chg.max_rx_time;
+      ESP_LOGI(TAG, "BLE data len tx=%u/%uus rx=%u/%uus",
+               (unsigned)s_ble_max_tx_octets, (unsigned)s_ble_max_tx_time_us,
+               (unsigned)s_ble_max_rx_octets, (unsigned)s_ble_max_rx_time_us);
+      refresh_ble_link_metrics(event->data_len_chg.conn_handle, "data_len");
+      return 0;
+    case BLE_GAP_EVENT_NOTIFY_TX:
+      if (event->notify_tx.attr_handle == s_sighting_handle && event->notify_tx.status == 0) {
+        wake_replay_task();
+      }
       return 0;
     case BLE_GAP_EVENT_PASSKEY_ACTION: {
       struct ble_sm_io pkey = {0};
@@ -5697,6 +6400,9 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
         s_gps_notify_enabled = s_status_notify_enabled;
       } else if (event->subscribe.attr_handle == s_sighting_handle) {
         s_sighting_notify_enabled = event->subscribe.cur_notify;
+        if (event->subscribe.cur_notify) {
+          wake_replay_task();
+        }
       }
       if (wg_ble_should_request_security_on_subscribe(event->subscribe.cur_notify,
                                                       s_ble_encrypted)) {
@@ -5753,6 +6459,11 @@ static void ble_host_task(void *param) {
 
 static void init_ble(void) {
   ESP_ERROR_CHECK(nimble_port_init());
+  int mtu_rc = ble_att_set_preferred_mtu(WG_BLE_ATT_PREFERRED_MTU);
+  if (mtu_rc != 0) {
+    ESP_LOGW(TAG, "ble_att_set_preferred_mtu(%u) failed rc=%d",
+             (unsigned)WG_BLE_ATT_PREFERRED_MTU, mtu_rc);
+  }
 
   ble_hs_cfg.reset_cb = ble_on_reset;
   ble_hs_cfg.sync_cb = ble_on_sync;
@@ -5879,6 +6590,7 @@ void app_main(void) {
   if (s_prev_log_vprintf == NULL) {
     s_prev_log_vprintf = esp_log_set_vprintf(log_mux_vprintf);
   }
+  esp_log_level_set("NimBLE", ESP_LOG_WARN);
   load_runtime_config();
   init_wifi();
   init_storage();
