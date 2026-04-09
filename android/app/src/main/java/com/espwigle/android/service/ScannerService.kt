@@ -15,11 +15,11 @@ import com.espwigle.android.gps.GpsTracker
 import com.espwigle.android.logging.WigleCsvLogger
 import com.espwigle.android.model.EspGpsPayload
 import com.espwigle.android.model.GpsFix
-import com.espwigle.android.model.BacklogBlobChunkPayload
 import com.espwigle.android.model.BacklogBlobDonePayload
 import com.espwigle.android.model.BacklogBlobMetaPayload
 import com.espwigle.android.model.SightingPayload
 import com.espwigle.android.model.StatusPayload
+import com.espwigle.android.model.WifiBand
 import com.espwigle.android.model.WgFrame
 import com.espwigle.android.model.WgProtocol
 import com.espwigle.android.model.WigleWifiRow
@@ -62,6 +62,7 @@ data class ServiceState(
   val currentChannel: Int = 1,
   val hopMs: Int = 250,
   val channelMask: Int = 0x1FFF,
+  val localChannelMask: Int = 0x1FFF,
   val uniqueBssids: Int = 0,
   val packetsPerSec: Int = 0,
   val droppedNotifies: Int = 0,
@@ -79,6 +80,8 @@ data class ServiceState(
   val nodeForwardedSightings: Int = 0,
   val nodeChannel: Int = 0,
   val nodeChannelMask: Int = 0,
+  val nodeChannelMask24: Int = 0,
+  val nodeChannelMask5Ghz: Long = 0L,
   val sessionOpen: Boolean = false,
   val sessionId: Long = 0L,
   val queuedRecords: Long = 0L,
@@ -141,6 +144,8 @@ class ScannerService : Service(), EspBleClient.Listener {
     private const val BLOB_BLOCK_VERSION = 1
     private const val BLOB_BLOCK_HEADER_SIZE = 28
     private const val BLOB_RECORD_HEADER_SIZE = 2
+    private const val BLOB_PROGRESS_UI_INTERVAL_MS = 120L
+    private const val BLOB_PROGRESS_UI_STEP_BYTES = 16L * 1024L
     private const val DEBUG_SEED_TARGET_BYTES = 768 * 1024
     private const val DEBUG_SEED_MIN_BYTES = 512 * 1024
     private const val DEBUG_SEED_MAX_BYTES = 1024 * 1024
@@ -189,6 +194,7 @@ class ScannerService : Service(), EspBleClient.Listener {
   private data class BacklogImportResult(
     val records: Int,
     val highestSeq: Long,
+    val gapDetected: Boolean,
     val badBlocks: Int,
   )
 
@@ -207,6 +213,7 @@ class ScannerService : Service(), EspBleClient.Listener {
   private val lastCsvWriteByBssid = hashMapOf<String, Long>()
   private val sightingsMutex = Mutex()
   private val ackLock = Any()
+  private val backlogRecoveryLock = Any()
   private val sessionAcks = hashMapOf<Long, SessionAckTracker>()
 
   private val logTime = SimpleDateFormat("HH:mm:ss", Locale.US)
@@ -229,8 +236,12 @@ class ScannerService : Service(), EspBleClient.Listener {
   @Volatile private var gpsNavMode: Int = 0
   @Volatile private var phoneGpsPushActive: Boolean = false
   @Volatile private var downloadBacklogAutoStop: Boolean = false
+  @Volatile private var downloadBacklogStartMs: Long = 0L
   @Volatile private var visibleTimeoutSec: Int = 25
+  @Volatile private var backlogBlobRecoveryInFlight: Boolean = false
   @Volatile private var backlogBlobRx: BacklogBlobReceiver? = null
+  @Volatile private var blobProgressUiLastMs: Long = 0L
+  @Volatile private var blobProgressUiLastBytes: Long = 0L
 
   override fun onCreate() {
     super.onCreate()
@@ -355,6 +366,10 @@ class ScannerService : Service(), EspBleClient.Listener {
     }
     val shouldAutoStopCsv = downloadBacklogAutoStop
     downloadBacklogAutoStop = false
+    downloadBacklogStartMs = 0L
+    synchronized(backlogRecoveryLock) {
+      backlogBlobRecoveryInFlight = false
+    }
     bleClient.sendGpsClear()
     resetBacklogBlobReceiver(discardFile = true)
     bleClient.disconnect()
@@ -493,8 +508,11 @@ class ScannerService : Service(), EspBleClient.Listener {
   fun downloadBacklogToCsv(): Boolean {
     if (!controlLinkReady("Download backlog")) return false
     if (_state.value.scanning) {
-      appendLog("Backlog download blocked: stop scan first")
-      return false
+      appendLog("Backlog download: scanner active, sending stop first")
+      if (!bleClient.sendStop()) {
+        appendLog("Backlog download failed: stop command failed")
+        return false
+      }
     }
     if (_state.value.downloadBacklogActive) {
       val ok = bleClient.setBacklogBlobEnabled(false)
@@ -502,8 +520,17 @@ class ScannerService : Service(), EspBleClient.Listener {
         appendLog("Backlog stop command failed")
         return false
       }
+      downloadBacklogStartMs = 0L
       resetBacklogBlobReceiver(discardFile = true)
-      _state.update { it.copy(downloadBacklogActive = false) }
+      _state.update {
+        it.copy(
+          downloadBacklogActive = false,
+          blobActive = false,
+          blobSessionId = 0L,
+          blobBytesSent = 0L,
+          blobBytesTotal = 0L,
+        )
+      }
       appendLog("Backlog download stopped")
       val shouldAutoStopCsv = downloadBacklogAutoStop
       downloadBacklogAutoStop = false
@@ -521,7 +548,16 @@ class ScannerService : Service(), EspBleClient.Listener {
     }
     val okBlob = bleClient.setBacklogBlobEnabled(true)
     if (!okBlob) {
-      _state.update { it.copy(downloadBacklogActive = false) }
+      downloadBacklogStartMs = 0L
+      _state.update {
+        it.copy(
+          downloadBacklogActive = false,
+          blobActive = false,
+          blobSessionId = 0L,
+          blobBytesSent = 0L,
+          blobBytesTotal = 0L,
+        )
+      }
       appendLog("Backlog download request failed")
       if (downloadBacklogAutoStop && csvLogger.isActive) {
         stopLogging()
@@ -529,7 +565,16 @@ class ScannerService : Service(), EspBleClient.Listener {
       downloadBacklogAutoStop = false
       return false
     }
-    _state.update { it.copy(downloadBacklogActive = true) }
+    downloadBacklogStartMs = System.currentTimeMillis()
+    _state.update {
+      it.copy(
+        downloadBacklogActive = true,
+        blobActive = false,
+        blobSessionId = 0L,
+        blobBytesSent = 0L,
+        blobBytesTotal = 0L,
+      )
+    }
     appendLog("Backlog download started")
     bleClient.requestStatus()
     return true
@@ -627,15 +672,27 @@ class ScannerService : Service(), EspBleClient.Listener {
     return ok
   }
 
-  fun setChannelMask(mask: Int): Boolean {
-    if (!controlLinkReady("Set channel mask")) return false
-    val clamped = mask and 0x1FFF
-    if (clamped == 0) {
-      appendLog("Channel set rejected: choose at least one channel")
+  fun setChannelPlan(localMask: Int, nodeMask24: Int, nodeMask5Ghz: Long): Boolean {
+    if (!controlLinkReady("Set channel plan")) return false
+    val local = localMask and 0x1FFF
+    val node24 = nodeMask24 and 0x1FFF
+    val node5 = WifiBand.sanitizeNode5GhzMask(nodeMask5Ghz)
+    if (local == 0) {
+      appendLog("Channel plan rejected: master needs at least one 2.4 GHz channel")
       return false
     }
-    val ok = bleClient.setChannelMask(clamped)
-    if (ok) appendLog("Applied channel mask 0x${clamped.toString(16).uppercase(Locale.US)}")
+    if (node24 == 0 && node5 == 0L) {
+      appendLog("Channel plan rejected: slave needs at least one channel")
+      return false
+    }
+    val ok = bleClient.setChannelPlan(local, node24, node5)
+    if (ok) {
+      appendLog(
+        "Applied channel plan M24=0x${local.toString(16).uppercase(Locale.US)} " +
+          "S24=0x${node24.toString(16).uppercase(Locale.US)} " +
+          "S5=0x${node5.toULong().toString(16).uppercase(Locale.US)}",
+      )
+    }
     return ok
   }
 
@@ -691,6 +748,7 @@ class ScannerService : Service(), EspBleClient.Listener {
 
   fun stopLogging() {
     downloadBacklogAutoStop = false
+    downloadBacklogStartMs = 0L
     csvLogger.stopSession()
     _state.update { it.copy(loggingEnabled = false, downloadBacklogActive = false) }
     appendLog("CSV logging stopped")
@@ -710,6 +768,10 @@ class ScannerService : Service(), EspBleClient.Listener {
       resetBacklogBlobReceiver(discardFile = true)
       val shouldAutoStopCsv = downloadBacklogAutoStop
       downloadBacklogAutoStop = false
+      downloadBacklogStartMs = 0L
+      synchronized(backlogRecoveryLock) {
+        backlogBlobRecoveryInFlight = false
+      }
       if (shouldAutoStopCsv && csvLogger.isActive) {
         stopLogging()
       }
@@ -733,6 +795,8 @@ class ScannerService : Service(), EspBleClient.Listener {
         nodeForwardedSightings = if (!connected) 0 else current.nodeForwardedSightings,
         nodeChannel = if (!connected) 0 else current.nodeChannel,
         nodeChannelMask = if (!connected) 0 else current.nodeChannelMask,
+        nodeChannelMask24 = if (!connected) 0 else current.nodeChannelMask24,
+        nodeChannelMask5Ghz = if (!connected) 0L else current.nodeChannelMask5Ghz,
         sessionOpen = if (!connected) false else current.sessionOpen,
         sessionId = if (!connected) 0L else current.sessionId,
         queuedRecords = if (!connected) 0L else current.queuedRecords,
@@ -798,7 +862,8 @@ class ScannerService : Service(), EspBleClient.Listener {
         bleEncrypted = status.bleEncrypted,
         currentChannel = status.currentChannel,
         hopMs = status.hopMs,
-        channelMask = status.channelMask,
+        channelMask = status.localChannelMask,
+        localChannelMask = status.localChannelMask,
         uniqueBssids = status.uniqueBssids,
         packetsPerSec = status.packetsPerSec,
         droppedNotifies = status.droppedNotifies,
@@ -812,7 +877,9 @@ class ScannerService : Service(), EspBleClient.Listener {
         nodePacketsPerSec = status.nodePacketsPerSec,
         nodeForwardedSightings = status.nodeForwardedSightings,
         nodeChannel = status.nodeChannel,
-        nodeChannelMask = status.nodeChannelMask,
+        nodeChannelMask = status.nodeChannelMask24,
+        nodeChannelMask24 = status.nodeChannelMask24,
+        nodeChannelMask5Ghz = status.nodeChannelMask5Ghz,
         sessionOpen = status.sessionOpen,
         sessionId = status.sessionId,
         queuedRecords = status.queuedRecords,
@@ -834,7 +901,11 @@ class ScannerService : Service(), EspBleClient.Listener {
       )
     }
 
-    if (_state.value.downloadBacklogActive && status.scanning) {
+    val nowMs = System.currentTimeMillis()
+    val withinStartGrace =
+      downloadBacklogStartMs > 0L && (nowMs - downloadBacklogStartMs) < 2500L
+    if (_state.value.downloadBacklogActive && status.scanning && !withinStartGrace) {
+      downloadBacklogStartMs = 0L
       _state.update { it.copy(downloadBacklogActive = false) }
       appendLog("Backlog download stopped: scanner is active")
       val shouldAutoStopCsv = downloadBacklogAutoStop
@@ -843,14 +914,14 @@ class ScannerService : Service(), EspBleClient.Listener {
         stopLogging()
       }
     } else if (_state.value.downloadBacklogActive &&
-      (
-        (status.queuedRecords == 0L && !status.replayActive) ||
-          (status.blobBytesTotal > 0L && !status.blobActive && status.blobBytesSent >= status.blobBytesTotal)
-      )) {
+      status.queuedRecords == 0L &&
+      !status.replayActive &&
+      !status.blobActive) {
       _state.update { it.copy(downloadBacklogActive = false) }
       if (controlLinkReadySilent()) {
         bleClient.setBacklogBlobEnabled(false)
       }
+      downloadBacklogStartMs = 0L
       resetBacklogBlobReceiver(discardFile = true)
       appendLog("Backlog download complete")
       val shouldAutoStopCsv = downloadBacklogAutoStop
@@ -992,6 +1063,8 @@ class ScannerService : Service(), EspBleClient.Listener {
       } catch (_: Exception) {}
     }
     backlogBlobRx = null
+    blobProgressUiLastMs = 0L
+    blobProgressUiLastBytes = 0L
   }
 
   private fun handleBacklogBlobMetaFrame(payload: ByteArray) {
@@ -1001,7 +1074,7 @@ class ScannerService : Service(), EspBleClient.Listener {
       appendLog("Backlog meta decode error: ${e.message}")
       return
     }
-    if (meta.sessionId <= 0L || meta.totalBytes <= 0L) {
+    if (meta.sessionId == 0L || meta.totalBytes <= 0L) {
       appendLog("Backlog meta rejected: bad session or size")
       return
     }
@@ -1022,50 +1095,151 @@ class ScannerService : Service(), EspBleClient.Listener {
           file = file,
           out = out,
         )
+      blobProgressUiLastMs = 0L
+      blobProgressUiLastBytes = 0L
     }
 
     appendLog(
       "Backlog blob session 0x${java.lang.Long.toUnsignedString(meta.sessionId, 16)} size=${meta.totalBytes}B acked=${meta.ackedSeq} written=${meta.writtenSeq}",
     )
+    _state.update {
+      it.copy(
+        blobActive = true,
+        blobSessionId = meta.sessionId,
+        blobBytesSent = 0L,
+        blobBytesTotal = meta.totalBytes,
+      )
+    }
   }
 
   private fun handleBacklogBlobChunkFrame(payload: ByteArray) {
-    val chunk: BacklogBlobChunkPayload = try {
-      WgProtocol.decodeBacklogBlobChunkPayload(payload)
-    } catch (e: Exception) {
-      appendLog("Backlog chunk decode error: ${e.message}")
+    if (payload.size < 14) {
+      appendLog("Backlog chunk decode error: payload too short")
       return
     }
+    val sessionId = readU64Le(payload, 0)
+    val offset = readU32Le(payload, 8)
+    val chunkLen = readU16Le(payload, 12)
+    if (chunkLen <= 0 || payload.size != 14 + chunkLen) {
+      appendLog("Backlog chunk decode error: payload length mismatch")
+      return
+    }
+
+    var uiUpdateSessionId = 0L
+    var uiUpdateBytes = 0L
+    var uiUpdateTotal = 0L
+    var shouldUpdateUi = false
+    var replyOffset = offset
+    var replyLen = chunkLen
+    var replyAccept = false
 
     synchronized(this) {
       val rx = backlogBlobRx
       if (rx == null) {
         appendLog("Backlog chunk ignored: no active session")
-        return
+        replyOffset = 0L
+        replyLen = 0
+      } else if (rx.sessionId != sessionId) {
+        appendLog(
+          "Backlog chunk session mismatch; expected=0x${java.lang.Long.toUnsignedString(rx.sessionId, 16)} got=0x${java.lang.Long.toUnsignedString(sessionId, 16)}",
+        )
+        replyOffset = rx.receivedBytes
+        replyLen = 0
+      } else if (offset < rx.receivedBytes) {
+        // Duplicate chunk (typically ACK loss); ACK again.
+        replyAccept = true
+      } else if (offset > rx.receivedBytes) {
+        appendLog("Backlog chunk gap; expected=${rx.receivedBytes} got=${offset}")
+        replyOffset = rx.receivedBytes
+        replyLen = 0
+      } else {
+        if (rx.receivedBytes == 0L && offset == 0L) {
+          appendLog("Backlog blob first chunk received")
+        }
+        try {
+          rx.out.write(payload, 14, chunkLen)
+        } catch (e: Exception) {
+          appendLog("Backlog chunk write failed: ${e.message}")
+          sendBacklogBlobChunkReply(sessionId, rx.receivedBytes, 0, accepted = false)
+          resetBacklogBlobReceiver(discardFile = true)
+          recoverBacklogBlobStream("chunk write failed")
+          return
+        }
+        rx.receivedBytes += chunkLen.toLong()
+        replyAccept = true
+        if (rx.receivedBytes % (64L * 1024L) < chunkLen.toLong() || rx.receivedBytes == rx.totalBytes) {
+          appendLog("Backlog blob progress ${rx.receivedBytes}/${rx.totalBytes}B")
+        }
+        val nowMs = System.currentTimeMillis()
+        val bytesDelta = rx.receivedBytes - blobProgressUiLastBytes
+        val dueToTime = (nowMs - blobProgressUiLastMs) >= BLOB_PROGRESS_UI_INTERVAL_MS
+        val dueToBytes = bytesDelta >= BLOB_PROGRESS_UI_STEP_BYTES
+        val done = rx.receivedBytes == rx.totalBytes
+        if (dueToTime || dueToBytes || done) {
+          blobProgressUiLastMs = nowMs
+          blobProgressUiLastBytes = rx.receivedBytes
+          shouldUpdateUi = true
+          uiUpdateSessionId = rx.sessionId
+          uiUpdateBytes = rx.receivedBytes
+          uiUpdateTotal = rx.totalBytes
+        }
       }
-      if (rx.sessionId != chunk.sessionId) {
-        appendLog("Backlog chunk session mismatch; restarting receiver")
-        resetBacklogBlobReceiver(discardFile = true)
-        return
-      }
-      if (chunk.offset != rx.receivedBytes) {
-        appendLog("Backlog chunk offset mismatch; expected=${rx.receivedBytes} got=${chunk.offset}")
-        resetBacklogBlobReceiver(discardFile = true)
-        return
-      }
-      try {
-        rx.out.write(chunk.data)
-      } catch (e: Exception) {
-        appendLog("Backlog chunk write failed: ${e.message}")
-        resetBacklogBlobReceiver(discardFile = true)
-        return
-      }
-      rx.receivedBytes += chunk.data.size.toLong()
-      if (rx.receivedBytes % (64L * 1024L) < chunk.data.size.toLong() || rx.receivedBytes == rx.totalBytes) {
-        appendLog("Backlog blob progress ${rx.receivedBytes}/${rx.totalBytes}B")
+    }
+
+    sendBacklogBlobChunkReply(
+      sessionId = sessionId,
+      chunkOffset = replyOffset,
+      chunkLen = replyLen,
+      accepted = replyAccept,
+    )
+
+    if (shouldUpdateUi) {
+      _state.update {
+        it.copy(
+          blobActive = true,
+          blobSessionId = uiUpdateSessionId,
+          blobBytesSent = uiUpdateBytes,
+          blobBytesTotal = uiUpdateTotal,
+        )
       }
     }
   }
+
+  private fun sendBacklogBlobChunkReply(
+    sessionId: Long,
+    chunkOffset: Long,
+    chunkLen: Int,
+    accepted: Boolean,
+  ) {
+    if (!bleClient.isConnected()) {
+      return
+    }
+    var ok = false
+    repeat(3) {
+      ok = bleClient.sendBacklogBlobChunkReply(
+        sessionId = sessionId,
+        chunkOffset = chunkOffset,
+        chunkLen = chunkLen.coerceIn(0, 0xFFFF),
+        accepted = accepted,
+      )
+      if (ok) return
+    }
+    appendLog(
+      "Backlog chunk ${if (accepted) "ACK" else "NAK"} send failed off=$chunkOffset len=$chunkLen",
+    )
+  }
+
+  private fun readU16Le(bytes: ByteArray, offset: Int): Int =
+    (bytes[offset].toInt() and 0xFF) or ((bytes[offset + 1].toInt() and 0xFF) shl 8)
+
+  private fun readU32Le(bytes: ByteArray, offset: Int): Long =
+    ((bytes[offset].toLong() and 0xFFL) or
+      ((bytes[offset + 1].toLong() and 0xFFL) shl 8) or
+      ((bytes[offset + 2].toLong() and 0xFFL) shl 16) or
+      ((bytes[offset + 3].toLong() and 0xFFL) shl 24))
+
+  private fun readU64Le(bytes: ByteArray, offset: Int): Long =
+    (readU32Le(bytes, offset) or (readU32Le(bytes, offset + 4) shl 32))
 
   private fun handleBacklogBlobDoneFrame(payload: ByteArray) {
     val done: BacklogBlobDonePayload = try {
@@ -1075,35 +1249,54 @@ class ScannerService : Service(), EspBleClient.Listener {
       return
     }
 
-    val completed: BacklogBlobReceiver = synchronized(this) {
+    var nakOffset = 0L
+    var shouldNak = false
+    val completed: BacklogBlobReceiver? = synchronized(this) {
       val rx = backlogBlobRx
       if (rx == null) {
         appendLog("Backlog done ignored: no active session")
-        return
-      }
-      if (rx.sessionId != done.sessionId) {
+        shouldNak = true
+        nakOffset = 0L
+        null
+      } else if (rx.sessionId != done.sessionId) {
         appendLog("Backlog done session mismatch")
-        resetBacklogBlobReceiver(discardFile = true)
-        return
-      }
-      if (rx.receivedBytes != rx.totalBytes || done.totalBytes != rx.totalBytes) {
+        shouldNak = true
+        nakOffset = rx.receivedBytes
+        null
+      } else if (rx.receivedBytes != rx.totalBytes || done.totalBytes != rx.totalBytes) {
         appendLog("Backlog done size mismatch")
-        resetBacklogBlobReceiver(discardFile = true)
-        return
+        shouldNak = true
+        nakOffset = rx.receivedBytes
+        null
+      } else {
+        try {
+          rx.out.flush()
+        } catch (_: Exception) {}
+        try {
+          rx.out.close()
+        } catch (_: Exception) {}
+        backlogBlobRx = null
+        rx
       }
-      try {
-        rx.out.flush()
-      } catch (_: Exception) {}
-      try {
-        rx.out.close()
-      } catch (_: Exception) {}
-      backlogBlobRx = null
-      rx
+    }
+    if (completed == null) {
+      if (shouldNak) {
+        sendBacklogBlobChunkReply(done.sessionId, nakOffset, 0, accepted = false)
+      }
+      return
     }
 
     appendLog(
       "Backlog blob received session 0x${java.lang.Long.toUnsignedString(done.sessionId, 16)} (${done.totalBytes}B), importing...",
     )
+    _state.update {
+      it.copy(
+        blobActive = false,
+        blobSessionId = done.sessionId,
+        blobBytesSent = done.totalBytes,
+        blobBytesTotal = done.totalBytes,
+      )
+    }
     importBacklogBlobSessionAsync(
       file = completed.file,
       sessionId = done.sessionId,
@@ -1111,17 +1304,29 @@ class ScannerService : Service(), EspBleClient.Listener {
     )
   }
 
-  private fun importBacklogBlobSessionAsync(file: File, sessionId: Long, writtenSeq: Long) {
+  private fun importBacklogBlobSessionAsync(
+    file: File,
+    sessionId: Long,
+    writtenSeq: Long,
+  ) {
     scope.launch {
       val result = parseBacklogBlobFile(file, sessionId)
-      val ackSeq = maxOf(writtenSeq, result.highestSeq)
+      val targetSeq = if (writtenSeq > 0L) writtenSeq else result.highestSeq
+      val importComplete =
+        targetSeq > 0L &&
+          result.badBlocks == 0 &&
+          !result.gapDetected &&
+          result.highestSeq >= targetSeq
       appendLog(
-        "Backlog import done sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)} records=${result.records} bad_blocks=${result.badBlocks}",
+        "Backlog import done sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)} records=${result.records} highest_seq=${result.highestSeq} bad_blocks=${result.badBlocks} gap=${result.gapDetected}",
       )
-      if (ackSeq > 0L && controlLinkReadySilent()) {
-        if (!bleClient.sendReplayAck(sessionId, ackSeq)) {
-          appendLog("Backlog ack send failed sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)}")
-        }
+      if (importComplete) {
+        queueBlobSessionAck(sessionId, targetSeq, force = true)
+      } else {
+        appendLog(
+          "Backlog import incomplete sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)}; withholding ACK and retrying",
+        )
+        recoverBacklogBlobStream("import integrity check failed")
       }
       try {
         file.delete()
@@ -1132,14 +1337,68 @@ class ScannerService : Service(), EspBleClient.Listener {
     }
   }
 
+  private fun queueBlobSessionAck(sessionId: Long, ackSeq: Long, force: Boolean) {
+    if (sessionId == 0L || ackSeq <= 0L) {
+      return
+    }
+    synchronized(ackLock) {
+      val tracker = sessionAcks.getOrPut(sessionId) { SessionAckTracker() }
+      if (ackSeq > tracker.highestContiguous) {
+        tracker.highestContiguous = ackSeq
+      }
+      maybeSendReplayAckLocked(sessionId, tracker, force)
+    }
+  }
+
+  private fun recoverBacklogBlobStream(reason: String) {
+    if (!_state.value.downloadBacklogActive) {
+      return
+    }
+    if (!controlLinkReadySilent()) {
+      appendLog("Backlog recovery skipped: control link unavailable")
+      return
+    }
+    synchronized(backlogRecoveryLock) {
+      if (backlogBlobRecoveryInFlight) {
+        return
+      }
+      backlogBlobRecoveryInFlight = true
+    }
+    appendLog("Backlog blob desync ($reason); restarting stream")
+    scope.launch {
+      try {
+        val disableOk = bleClient.setBacklogBlobEnabled(false)
+        if (!disableOk) {
+          appendLog("Backlog recovery failed: disable command failed")
+          return@launch
+        }
+        delay(120)
+        val enableOk = bleClient.setBacklogBlobEnabled(true)
+        if (!enableOk) {
+          appendLog("Backlog recovery failed: enable command failed")
+          return@launch
+        }
+        delay(80)
+        bleClient.requestStatus()
+      } finally {
+        synchronized(backlogRecoveryLock) {
+          backlogBlobRecoveryInFlight = false
+        }
+      }
+    }
+  }
+
   private fun parseBacklogBlobFile(file: File, expectedSessionId: Long): BacklogImportResult {
     if (!file.exists()) {
-      return BacklogImportResult(records = 0, highestSeq = 0L, badBlocks = 1)
+      return BacklogImportResult(records = 0, highestSeq = 0L, gapDetected = false, badBlocks = 1)
     }
 
     var records = 0
     var highestSeq = 0L
+    var gapDetected = false
     var badBlocks = 0
+    var expectedNextSeq = 0L
+    var hasExpectedNextSeq = false
     val block = ByteArray(BLOB_BLOCK_SIZE)
 
     BufferedInputStream(FileInputStream(file), 64 * 1024).use { input ->
@@ -1202,15 +1461,28 @@ class ScannerService : Service(), EspBleClient.Listener {
           val sighting = try {
             WgProtocol.decodeSightingPayload(recordBytes)
           } catch (_: Exception) {
-            continue
+            blockValid = false
+            break
           }
           appendCsvFromBacklogSighting(sighting, System.currentTimeMillis())
           records += 1
 
           val seq = if (sighting.recordSeq > 0L) sighting.recordSeq else firstSeq + index
+          if (!hasExpectedNextSeq) {
+            expectedNextSeq = seq
+            hasExpectedNextSeq = true
+          }
+          if (seq == expectedNextSeq) {
+            expectedNextSeq += 1L
+          } else if (seq > expectedNextSeq) {
+            gapDetected = true
+          }
           if (seq > highestSeq) {
             highestSeq = seq
           }
+        }
+        if (payloadPos != payloadEnd) {
+          blockValid = false
         }
         if (!blockValid) {
           badBlocks += 1
@@ -1218,7 +1490,12 @@ class ScannerService : Service(), EspBleClient.Listener {
       }
     }
 
-    return BacklogImportResult(records = records, highestSeq = highestSeq, badBlocks = badBlocks)
+    return BacklogImportResult(
+      records = records,
+      highestSeq = highestSeq,
+      gapDetected = gapDetected,
+      badBlocks = badBlocks,
+    )
   }
 
   private fun readFullBlock(input: BufferedInputStream, target: ByteArray): Int {
@@ -1501,7 +1778,7 @@ class ScannerService : Service(), EspBleClient.Listener {
   }
 
   private fun trackReplayRecord(sessionId: Long, recordSeq: Long): Boolean {
-    if (sessionId <= 0L || recordSeq <= 0L) return true
+    if (sessionId == 0L || recordSeq <= 0L) return true
     synchronized(ackLock) {
       val tracker = sessionAcks.getOrPut(sessionId) { SessionAckTracker() }
       val highest = tracker.highestContiguous

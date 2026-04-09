@@ -68,6 +68,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.espwigle.android.model.WifiBand
 import com.espwigle.android.ui.AppUiState
 import com.espwigle.android.ui.MainViewModel
 import com.espwigle.android.ui.SightingUi
@@ -104,8 +105,10 @@ class MainActivity : ComponentActivity() {
           onHopInput = viewModel::setHopInput,
           onApplyHop = viewModel::applyHopMs,
           onSetAutoHopEnabled = viewModel::setAutoHopEnabled,
-          onChannelToggle = viewModel::toggleChannel,
-          onApplyChannels = viewModel::applyChannelMask,
+          onMasterChannelToggle = viewModel::toggleMaster24Channel,
+          onNode24ChannelToggle = viewModel::toggleNode24Channel,
+          onNode5ChannelToggle = viewModel::toggleNode5Channel,
+          onApplyChannels = viewModel::applyChannelPlan,
           onSetBootMode = viewModel::setBootMode,
           onSetGpsNavMode = viewModel::setGpsNavMode,
           onVisibleTimeout = viewModel::setVisibleTimeoutSec,
@@ -251,7 +254,9 @@ private fun EspWigleScreen(
   onHopInput: (Int) -> Unit,
   onApplyHop: () -> Unit,
   onSetAutoHopEnabled: (Boolean) -> Unit,
-  onChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
+  onMasterChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
+  onNode24ChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
+  onNode5ChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
   onApplyChannels: () -> Unit,
   onSetBootMode: (Int) -> Unit,
   onSetGpsNavMode: (Int) -> Unit,
@@ -394,7 +399,9 @@ private fun EspWigleScreen(
               onHopInput = onHopInput,
               onApplyHop = onApplyHop,
               onSetAutoHopEnabled = onSetAutoHopEnabled,
-              onChannelToggle = onChannelToggle,
+              onMasterChannelToggle = onMasterChannelToggle,
+              onNode24ChannelToggle = onNode24ChannelToggle,
+              onNode5ChannelToggle = onNode5ChannelToggle,
               onApplyChannels = onApplyChannels,
               onSetBootMode = onSetBootMode,
               onSetGpsNavMode = onSetGpsNavMode,
@@ -488,7 +495,7 @@ private fun StatusRibbon(state: AppUiState) {
         label = if (state.connected) "BLE ✓" else "BLE ✗",
         color = if (state.connected) Color(0xFF4CAF50) else Color(0xFFEF5350),
       )
-      RibbonChip(label = "Ch ${state.currentChannel}")
+      RibbonChip(label = "Ch ${WifiBand.conciseChannelLabel(state.currentChannel)}")
       RibbonChip(label = "${state.uniqueBssids} APs")
       if (state.autoHopEnabled) {
         RibbonChip(
@@ -508,6 +515,9 @@ private fun StatusRibbon(state: AppUiState) {
         label = if (state.nodeLinkUp) "Node ✓" else "Node ✗",
         color = if (state.nodeLinkUp) Color(0xFF4CAF50) else Color(0xFFEF5350),
       )
+      if (state.nodeLinkUp && state.nodeChannel > 0) {
+        RibbonChip(label = "NodeCh ${WifiBand.conciseChannelLabel(state.nodeChannel)}")
+      }
       RibbonChip(
         label = when {
           state.phoneGpsAgeS < 0 -> "📱GPS ✗"
@@ -721,7 +731,7 @@ private fun GeneralStatusDetails(state: AppUiState) {
     KvRow("BLE", if (state.connected) "Connected" else "Disconnected")
     KvRow("Link", if (state.bleEncrypted) "Encrypted" else "Unencrypted")
     KvRow("Scanner", if (state.scanning) "Running" else "Stopped")
-    KvRow("Current Channel", state.currentChannel.toString())
+    KvRow("Current Channel", channelWithFrequencyLabel(state.currentChannel))
     KvRow("Hop Mode", if (state.autoHopEnabled) "Auto (speed)" else "Manual")
     if (state.autoHopEnabled) {
       KvRow("Hop Base", "${state.autoHopBaseMs} ms")
@@ -729,7 +739,7 @@ private fun GeneralStatusDetails(state: AppUiState) {
     } else {
       KvRow("Hop", "${state.hopMs} ms")
     }
-    KvRow("Channel Mask", "0x${state.channelMask.toString(16).uppercase()}")
+    KvRow("Master 2.4 Mask", "0x${state.localChannelMask.toString(16).uppercase()}")
     KvRow("Unique BSSID", state.uniqueBssids.toString())
     KvRow("Packets/s", state.packetsPerSec.toString())
     KvRow("Notify Drops", state.droppedNotifies.toString())
@@ -809,12 +819,13 @@ private fun NodeStatusDetails(state: AppUiState) {
   Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
     KvRow("Node Link", if (state.nodeLinkUp) "Up (${state.nodeLastSeenS}s)" else "Down")
     KvRow("Node Last Seen", "${state.nodeLastSeenS}s")
-    KvRow("Node Ch", if (state.nodeChannel > 0) state.nodeChannel.toString() else "-")
-    KvRow("Node Mask", "0x${state.nodeChannelMask.toString(16).uppercase()}")
+    KvRow("Node Ch", if (state.nodeChannel > 0) channelWithFrequencyLabel(state.nodeChannel) else "-")
+    KvRow("Node 2.4 Mask", "0x${state.nodeChannelMask24.toString(16).uppercase()}")
+    KvRow("Node 5G Mask", "0x${state.nodeChannelMask5Ghz.toULong().toString(16).uppercase()}")
     KvRow("Node pkt/s", state.nodePacketsPerSec.toString())
     KvRow("Node sightings", state.nodeForwardedSightings.toString())
     KvRow("Node count", state.nodeCount.toString())
-    KvRow("Node Enabled", if (state.nodeChannelMask != 0) "Yes" else "No")
+    KvRow("Node Enabled", if (state.nodeChannelMask24 != 0 || state.nodeChannelMask5Ghz != 0L) "Yes" else "No")
   }
 }
 
@@ -828,7 +839,9 @@ private fun ConfigSection(
   onHopInput: (Int) -> Unit,
   onApplyHop: () -> Unit,
   onSetAutoHopEnabled: (Boolean) -> Unit,
-  onChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
+  onMasterChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
+  onNode24ChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
+  onNode5ChannelToggle: (channel: Int, enabled: Boolean) -> Unit,
   onApplyChannels: () -> Unit,
   onSetBootMode: (Int) -> Unit,
   onSetGpsNavMode: (Int) -> Unit,
@@ -891,16 +904,56 @@ private fun ConfigSection(
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
     // -- Channel chips --
-    Text("Channels", style = MaterialTheme.typography.labelMedium)
+    Text("Master Channels (C6 / 2.4 GHz)", style = MaterialTheme.typography.labelMedium)
     FlowRow(
       horizontalArrangement = Arrangement.spacedBy(4.dp),
       verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-      for (ch in 1..13) {
-        val selected = (state.channelMaskInput and (1 shl (ch - 1))) != 0
+      for (ch in WifiBand.CHANNELS_24_GHZ) {
+        val selected = (state.localChannelMaskInput and (1 shl (ch - 1))) != 0
         FilterChip(
           selected = selected,
-          onClick = { onChannelToggle(ch, !selected) },
+          onClick = { onMasterChannelToggle(ch, !selected) },
+          label = { Text(ch.toString(), style = MaterialTheme.typography.labelSmall) },
+          modifier = Modifier.height(30.dp),
+          shape = RoundedCornerShape(6.dp),
+          colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f),
+            selectedLabelColor = MaterialTheme.colorScheme.primary,
+          ),
+        )
+      }
+    }
+    Text("Slave Channels (RTL / 2.4 GHz)", style = MaterialTheme.typography.labelMedium)
+    FlowRow(
+      horizontalArrangement = Arrangement.spacedBy(4.dp),
+      verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+      for (ch in WifiBand.CHANNELS_24_GHZ) {
+        val selected = (state.nodeChannelMask24Input and (1 shl (ch - 1))) != 0
+        FilterChip(
+          selected = selected,
+          onClick = { onNode24ChannelToggle(ch, !selected) },
+          label = { Text(ch.toString(), style = MaterialTheme.typography.labelSmall) },
+          modifier = Modifier.height(30.dp),
+          shape = RoundedCornerShape(6.dp),
+          colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f),
+            selectedLabelColor = MaterialTheme.colorScheme.primary,
+          ),
+        )
+      }
+    }
+    Text("Slave Channels (RTL / 5 GHz)", style = MaterialTheme.typography.labelMedium)
+    FlowRow(
+      horizontalArrangement = Arrangement.spacedBy(4.dp),
+      verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+      for (ch in WifiBand.NODE_CHANNELS_5_GHZ) {
+        val selected = WifiBand.node5GhzChannelEnabled(state.nodeChannelMask5GhzInput, ch)
+        FilterChip(
+          selected = selected,
+          onClick = { onNode5ChannelToggle(ch, !selected) },
           label = { Text(ch.toString(), style = MaterialTheme.typography.labelSmall) },
           modifier = Modifier.height(30.dp),
           shape = RoundedCornerShape(6.dp),
@@ -916,7 +969,7 @@ private fun ConfigSection(
       modifier = Modifier.fillMaxWidth().height(34.dp),
       shape = RoundedCornerShape(6.dp),
     ) {
-      Text("Apply Channels", style = MaterialTheme.typography.labelMedium)
+      Text("Apply Channel Plan", style = MaterialTheme.typography.labelMedium)
     }
 
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -1054,7 +1107,7 @@ private fun SightingRowCompact(sighting: SightingUi, nowMs: Long) {
       weight = 0.26f,
     )
     CompactCell(text = sighting.auth, weight = 0.22f)
-    CompactCell(text = sighting.channel.toString(), weight = 0.08f)
+    CompactCell(text = WifiBand.conciseChannelLabel(sighting.channel), weight = 0.08f)
     CompactCell(text = sighting.rssi.toString(), weight = 0.08f, color = rssiColor(sighting.rssi))
     CompactCell(text = "${ageS}s", weight = 0.08f, color = ageColor(ageS))
   }
@@ -1092,4 +1145,9 @@ private fun KvRow(label: String, value: String) {
       style = MaterialTheme.typography.bodySmall,
     )
   }
+}
+
+private fun channelWithFrequencyLabel(channel: Int): String {
+  val freq = WifiBand.frequencyMhzFromChannel(channel) ?: return channel.toString()
+  return "${WifiBand.conciseChannelLabel(channel)} (${freq} MHz)"
 }

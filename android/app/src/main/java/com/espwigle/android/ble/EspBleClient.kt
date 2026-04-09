@@ -46,7 +46,7 @@ class EspBleClient(
     private const val TARGET_DEVICE_NAME = "ESPWIGLE-C6"
     private const val TARGET_DEVICE_ADDRESS = "A0:85:E3:DB:04:92"
     private const val SCAN_TIMEOUT_MS = 12_000L
-    private const val TARGET_MTU = 247
+    private const val TARGET_MTU = 517
   }
 
   private val appContext = context.applicationContext
@@ -125,6 +125,12 @@ class EspBleClient(
     return sendCommand(WgProtocol.Command.SET_CHANNEL_MASK, payload)
   }
 
+  fun setChannelPlan(localMask: Int, nodeMask24: Int, nodeMask5Ghz: Long): Boolean =
+    sendCommand(
+      WgProtocol.Command.SET_CHANNEL_PLAN,
+      WgProtocol.encodeChannelPlanPayload(localMask, nodeMask24, nodeMask5Ghz),
+    )
+
   fun setBootMode(mode: Int): Boolean =
     sendCommand(WgProtocol.Command.SET_BOOT_MODE, byteArrayOf((mode and 0xFF).toByte()))
 
@@ -147,6 +153,17 @@ class EspBleClient(
     sendCommand(
       WgProtocol.Command.SET_BACKLOG_BLOB,
       WgProtocol.encodeBacklogBlobTogglePayload(enabled),
+    )
+
+  fun sendBacklogBlobChunkReply(
+    sessionId: Long,
+    chunkOffset: Long,
+    chunkLen: Int,
+    accepted: Boolean,
+  ): Boolean =
+    sendCommand(
+      WgProtocol.Command.BACKLOG_BLOB_CHUNK_REPLY,
+      WgProtocol.encodeBacklogBlobChunkReplyPayload(sessionId, chunkOffset, chunkLen, accepted),
     )
 
   fun seedDebugStorage(targetBytes: Int): Boolean =
@@ -181,6 +198,14 @@ class EspBleClient(
     )
 
   private fun sendCommand(commandId: Int, payload: ByteArray = byteArrayOf()): Boolean {
+    return sendCommand(commandId, payload, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+  }
+
+  private fun sendCommand(
+    commandId: Int,
+    payload: ByteArray,
+    writeType: Int,
+  ): Boolean {
     if (!ready) {
       listener.onInfo("Command blocked: BLE link not ready")
       return false
@@ -196,7 +221,7 @@ class EspBleClient(
         payload = payload,
       )
 
-    return writeCharacteristicNoResponse(targetGatt, targetControl, frame)
+    return writeCharacteristic(targetGatt, targetControl, frame, writeType)
   }
 
   @SuppressLint("MissingPermission")
@@ -288,12 +313,27 @@ class EspBleClient(
     characteristic: BluetoothGattCharacteristic,
     bytes: ByteArray,
   ): Boolean {
-    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+    return writeCharacteristic(
+      targetGatt = targetGatt,
+      characteristic = characteristic,
+      bytes = bytes,
+      writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+    )
+  }
+
+  @SuppressLint("MissingPermission")
+  private fun writeCharacteristic(
+    targetGatt: BluetoothGatt,
+    characteristic: BluetoothGattCharacteristic,
+    bytes: ByteArray,
+    writeType: Int,
+  ): Boolean {
+    characteristic.writeType = writeType
     return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       targetGatt.writeCharacteristic(
         characteristic,
         bytes,
-        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+        writeType,
       ) == BluetoothStatusCodes.SUCCESS
     } else {
       characteristic.value = bytes
@@ -345,6 +385,14 @@ class EspBleClient(
             if (!gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)) {
               listener.onInfo("BLE connection priority request failed")
             }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+              gatt.setPreferredPhy(
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+              )
+              listener.onInfo("Requested LE 2M PHY")
+            }
             gatt.requestMtu(TARGET_MTU)
           }
           gatt.discoverServices()
@@ -358,6 +406,10 @@ class EspBleClient(
         if (status == BluetoothGatt.GATT_SUCCESS) {
           listener.onInfo("MTU=$mtu")
         }
+      }
+
+      override fun onPhyUpdate(gatt: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+        listener.onInfo("PHY update tx=${phyName(txPhy)} rx=${phyName(rxPhy)} status=$status")
       }
 
       override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -424,7 +476,15 @@ class EspBleClient(
       val frame = WgProtocol.decodeFrame(value)
       listener.onFrame(frame)
     } catch (e: Exception) {
-      listener.onInfo("Frame decode error: ${e.message}")
+      listener.onInfo("Frame decode error (${value.size} bytes): ${e.message}")
     }
   }
+
+  private fun phyName(phy: Int): String =
+    when (phy) {
+      BluetoothDevice.PHY_LE_1M -> "1M"
+      BluetoothDevice.PHY_LE_2M -> "2M"
+      BluetoothDevice.PHY_LE_CODED -> "CODED"
+      else -> "unknown($phy)"
+    }
 }

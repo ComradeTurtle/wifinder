@@ -27,7 +27,7 @@ object WigleCsvFormatter {
 
   fun formatRow(row: WigleWifiRow): String {
     val firstSeen = timestampFormat.format(Date(row.firstSeenEpochMs))
-    val freq = row.frequency ?: channelToFrequency(row.channel)
+    val freq = row.frequency ?: (WifiBand.frequencyMhzFromChannel(row.channel) ?: 0)
     return listOf(
       csvEscape(row.mac),
       csvEscape(row.ssid),
@@ -103,16 +103,6 @@ object WigleCsvFormatter {
     val uniqueCaps = capabilities.distinct()
     if (uniqueCaps.isEmpty()) return "[ESS]"
     return uniqueCaps.joinToString(separator = "", transform = { "[$it]" }) + "[ESS]"
-  }
-
-  /** Maps 2.4 GHz and 5 GHz WiFi channel numbers to centre frequency in MHz. */
-  private fun channelToFrequency(channel: Int): Int = when (channel) {
-    in 1..13 -> 2407 + channel * 5     // 2.4 GHz band
-    14 -> 2484                          // Japan-only
-    in 32..68 -> 5000 + channel * 5    // 5 GHz lower
-    in 96..144 -> 5000 + channel * 5   // 5 GHz mid
-    in 149..177 -> 5000 + channel * 5  // 5 GHz upper
-    else -> 0
   }
 
   private fun csvEscape(input: String): String {

@@ -8,7 +8,7 @@ import org.junit.Test
 class WgProtocolTest {
   @Test
   fun `decode status payload parses gps fields and extended storage stats`() {
-    val payload = ByteArray(115)
+    val payload = ByteArray(127)
     payload[0] = 1
     payload[1] = 1
     payload[2] = 11
@@ -85,6 +85,14 @@ class WgProtocolTest {
       payload[99 + i] = ((usedStorage ushr (8 * i)) and 0xFF).toByte()
       payload[107 + i] = ((freeStorage ushr (8 * i)) and 0xFF).toByte()
     }
+    payload[115] = 0xAA.toByte()
+    payload[116] = 0x0A
+    payload[117] = 0x0F
+    payload[118] = 0x00
+    val nodeMask5 = 0x0000000012345678L
+    for (i in 0 until 8) {
+      payload[119 + i] = ((nodeMask5 ushr (8 * i)) and 0xFF).toByte()
+    }
 
     val status = WgProtocol.decodeStatusPayload(payload)
 
@@ -93,6 +101,7 @@ class WgProtocolTest {
     assertEquals(11, status.currentChannel)
     assertEquals(250, status.hopMs)
     assertEquals(0x1FFF, status.channelMask)
+    assertEquals(0x0AAA, status.localChannelMask)
     assertEquals(100000, status.uniqueBssids)
     assertEquals(86, status.packetsPerSec)
     assertEquals(1, status.droppedNotifies)
@@ -106,6 +115,8 @@ class WgProtocolTest {
     assertEquals(16, status.nodeForwardedSightings)
     assertEquals(6, status.nodeChannel)
     assertEquals(0x1555, status.nodeChannelMask)
+    assertEquals(0x000F, status.nodeChannelMask24)
+    assertEquals(nodeMask5, status.nodeChannelMask5Ghz)
     assertTrue(status.sessionOpen)
     assertEquals(sessionId, status.sessionId)
     assertEquals(42L, status.queuedRecords)
@@ -134,6 +145,9 @@ class WgProtocolTest {
     val status = WgProtocol.decodeStatusPayload(payload)
 
     assertEquals(0x1234, status.uniqueBssids)
+    assertEquals(status.channelMask, status.localChannelMask)
+    assertEquals(status.nodeChannelMask, status.nodeChannelMask24)
+    assertEquals(0L, status.nodeChannelMask5Ghz)
     assertEquals(0, status.gpsNavAppliedHz)
     assertEquals(0L, status.spiffsFreeBytes)
     assertEquals(false, status.blobActive)
@@ -256,6 +270,25 @@ class WgProtocolTest {
   }
 
   @Test
+  fun `encode backlog blob chunk reply payload packs fields`() {
+    val payload = WgProtocol.encodeBacklogBlobChunkReplyPayload(
+      sessionId = 0x0123456789ABCDEFL,
+      chunkOffset = 0x10203040L,
+      chunkLen = 500,
+      accepted = true,
+    )
+
+    assertEquals(15, payload.size)
+    assertEquals(0xEF, payload[0].toInt() and 0xFF)
+    assertEquals(0xCD, payload[1].toInt() and 0xFF)
+    assertEquals(0x40, payload[8].toInt() and 0xFF)
+    assertEquals(0x30, payload[9].toInt() and 0xFF)
+    assertEquals(0xF4, payload[12].toInt() and 0xFF)
+    assertEquals(0x01, payload[13].toInt() and 0xFF)
+    assertEquals(1, payload[14].toInt() and 0xFF)
+  }
+
+  @Test
   fun `decode gps payload parses source and coordinates`() {
     val payload = byteArrayOf(
       1,
@@ -358,6 +391,19 @@ class WgProtocolTest {
     assertEquals(1, enabled[0].toInt() and 0xFF)
     assertEquals(1, disabled.size)
     assertEquals(0, disabled[0].toInt() and 0xFF)
+  }
+
+  @Test
+  fun `encode channel plan payload packs masks little endian`() {
+    val payload = WgProtocol.encodeChannelPlanPayload(0x1555, 0x0AA0, 0x0000000011223344L)
+
+    assertEquals(12, payload.size)
+    assertEquals(0x55, payload[0].toInt() and 0xFF)
+    assertEquals(0x15, payload[1].toInt() and 0xFF)
+    assertEquals(0xA0, payload[2].toInt() and 0xFF)
+    assertEquals(0x0A, payload[3].toInt() and 0xFF)
+    assertEquals(0x44, payload[4].toInt() and 0xFF)
+    assertEquals(0x11, payload[7].toInt() and 0xFF)
   }
 
   @Test

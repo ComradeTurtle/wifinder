@@ -43,6 +43,8 @@ object WgProtocol {
     const val SET_GPS_NAV_RATE = 0x0C
     const val SET_BACKLOG_BLOB = 0x0D
     const val DEBUG_SEED_STORAGE = 0x0E
+    const val SET_CHANNEL_PLAN = 0x0F
+    const val BACKLOG_BLOB_CHUNK_REPLY = 0x10
   }
 
   const val GPS_FLAG_VALID = 1 shl 0
@@ -140,6 +142,11 @@ object WgProtocol {
     val nodeForwardedSightings = if (payload.size >= 26) bb.getShort(24).toInt() and 0xFFFF else 0
     val nodeChannel = if (payload.size >= 27) payload[26].toInt() and 0xFF else 0
     val nodeChannelMask = if (payload.size >= 29) bb.getShort(27).toInt() and 0xFFFF else 0
+    val localChannelMask =
+      if (payload.size >= 117) bb.getShort(115).toInt() and 0xFFFF else channelMask
+    val nodeChannelMask24 =
+      if (payload.size >= 119) bb.getShort(117).toInt() and 0xFFFF else nodeChannelMask
+    val nodeChannelMask5Ghz = if (payload.size >= 127) bb.getLong(119) else 0L
     val sessionOpen = payload.size >= 30 && (payload[29].toInt() and 0xFF) == 1
     val sessionId = if (payload.size >= 38) bb.getLong(30) else 0L
     val queuedRecords = if (payload.size >= 42) bb.getInt(38).toLong() and 0xFFFF_FFFFL else 0L
@@ -166,6 +173,7 @@ object WgProtocol {
       currentChannel = currentChannel,
       hopMs = hopMs,
       channelMask = channelMask,
+      localChannelMask = localChannelMask,
       uniqueBssids = uniqueBssids,
       packetsPerSec = packetsPerSec,
       droppedNotifies = droppedNotifies,
@@ -179,6 +187,8 @@ object WgProtocol {
       nodeForwardedSightings = nodeForwardedSightings,
       nodeChannel = nodeChannel,
       nodeChannelMask = nodeChannelMask,
+      nodeChannelMask24 = nodeChannelMask24,
+      nodeChannelMask5Ghz = nodeChannelMask5Ghz,
       sessionOpen = sessionOpen,
       sessionId = sessionId,
       queuedRecords = queuedRecords,
@@ -342,10 +352,34 @@ object WgProtocol {
   fun encodeBacklogBlobTogglePayload(enabled: Boolean): ByteArray =
     byteArrayOf(if (enabled) 1 else 0)
 
+  fun encodeBacklogBlobChunkReplyPayload(
+    sessionId: Long,
+    chunkOffset: Long,
+    chunkLen: Int,
+    accepted: Boolean,
+  ): ByteArray {
+    val out = ByteArray(15)
+    val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+    bb.putLong(sessionId)
+    bb.putInt((chunkOffset and 0xFFFF_FFFFL).toInt())
+    bb.putShort((chunkLen and 0xFFFF).toShort())
+    bb.put(if (accepted) 1 else 0)
+    return out
+  }
+
   fun encodeDebugSeedStoragePayload(targetBytes: Int): ByteArray {
     val out = ByteArray(4)
     val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
     bb.putInt(targetBytes.coerceAtLeast(0))
+    return out
+  }
+
+  fun encodeChannelPlanPayload(localChannelMask: Int, nodeChannelMask24: Int, nodeChannelMask5Ghz: Long): ByteArray {
+    val out = ByteArray(12)
+    val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+    bb.putShort((localChannelMask and 0xFFFF).toShort())
+    bb.putShort((nodeChannelMask24 and 0xFFFF).toShort())
+    bb.putLong(nodeChannelMask5Ghz)
     return out
   }
 
@@ -446,6 +480,7 @@ data class StatusPayload(
   val currentChannel: Int,
   val hopMs: Int,
   val channelMask: Int,
+  val localChannelMask: Int,
   val uniqueBssids: Int,
   val packetsPerSec: Int,
   val droppedNotifies: Int,
@@ -459,6 +494,8 @@ data class StatusPayload(
   val nodeForwardedSightings: Int,
   val nodeChannel: Int,
   val nodeChannelMask: Int,
+  val nodeChannelMask24: Int,
+  val nodeChannelMask5Ghz: Long,
   val sessionOpen: Boolean,
   val sessionId: Long,
   val queuedRecords: Long,

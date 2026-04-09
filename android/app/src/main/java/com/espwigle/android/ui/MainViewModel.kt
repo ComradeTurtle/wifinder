@@ -8,6 +8,7 @@ import android.content.SharedPreferences
 import android.content.ServiceConnection
 import android.os.Build
 import android.os.IBinder
+import com.espwigle.android.model.WifiBand
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.espwigle.android.service.ScannerService.Companion.normalizeGpsNavMode
@@ -32,6 +33,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private const val PREF_AUTO_HOP_ENABLED = "auto_hop_enabled"
     private const val PREF_AUTO_HOP_BASE_MS = "auto_hop_base_ms"
     private const val PREF_CHANNEL_MASK_INPUT = "channel_mask_input"
+    private const val PREF_LOCAL_CHANNEL_MASK_INPUT = "local_channel_mask_input"
+    private const val PREF_NODE_CHANNEL_MASK24_INPUT = "node_channel_mask24_input"
+    private const val PREF_NODE_CHANNEL_MASK5_INPUT = "node_channel_mask5_input"
     private const val PREF_GPS_NAV_MODE = "gps_nav_mode"
   }
 
@@ -53,8 +57,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       .coerceIn(MIN_HOP_MS, MAX_HOP_MS)
     val autoHopEnabled = prefs.getBoolean(PREF_AUTO_HOP_ENABLED, false)
     val gpsNavMode = normalizeGpsNavMode(prefs.getInt(PREF_GPS_NAV_MODE, 0))
-    val channelMask = prefs.getInt(PREF_CHANNEL_MASK_INPUT, 0x1FFF) and 0x1FFF
-    val normalizedMask = if (channelMask == 0) 0x1FFF else channelMask
+    val legacyMask = prefs.getInt(PREF_CHANNEL_MASK_INPUT, 0x1FFF) and 0x1FFF
+    val localMask = prefs.getInt(PREF_LOCAL_CHANNEL_MASK_INPUT, legacyMask) and 0x1FFF
+    val nodeMask24 = prefs.getInt(PREF_NODE_CHANNEL_MASK24_INPUT, 0x0000) and 0x1FFF
+    val rawNodeMask5 =
+      if (prefs.contains(PREF_NODE_CHANNEL_MASK5_INPUT)) {
+        prefs.getLong(PREF_NODE_CHANNEL_MASK5_INPUT, 0L)
+      } else {
+        WifiBand.NODE_CHANNELS_5_GHZ_ALL_MASK
+      }
+    val nodeMask5 = WifiBand.sanitizeNode5GhzMask(rawNodeMask5)
+    val normalizedLocalMask = if (localMask == 0) 0x1FFF else localMask
     return AppUiState(
       visibleTimeoutSec = visibleTimeout,
       hopInputMs = hopInput,
@@ -62,8 +75,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       autoHopAppliedMs = hopInput,
       autoHopEnabled = autoHopEnabled,
       gpsNavMode = gpsNavMode,
-      channelMaskInput = normalizedMask,
-      channelMask = normalizedMask,
+      localChannelMaskInput = normalizedLocalMask,
+      nodeChannelMask24Input = nodeMask24,
+      nodeChannelMask5GhzInput = nodeMask5,
+      channelMask = normalizedLocalMask,
+      localChannelMask = normalizedLocalMask,
+      nodeChannelMask24 = nodeMask24,
+      nodeChannelMask5Ghz = nodeMask5,
+      nodeChannelMask = nodeMask24,
     )
   }
 
@@ -73,6 +92,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
   private fun persistBoolean(key: String, value: Boolean) {
     prefs.edit().putBoolean(key, value).apply()
+  }
+
+  private fun persistLong(key: String, value: Long) {
+    prefs.edit().putLong(key, value).apply()
   }
 
   private val connection = object : ServiceConnection {
@@ -188,19 +211,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     persistInt(PREF_AUTO_HOP_BASE_MS, base)
   }
 
-  fun toggleChannel(channel: Int, enabled: Boolean) {
+  fun toggleMaster24Channel(channel: Int, enabled: Boolean) {
     if (channel !in 1..13) return
     val bit = 1 shl (channel - 1)
-    val current = stateFlow.value.channelMaskInput
+    val current = stateFlow.value.localChannelMaskInput
     val next = if (enabled) current or bit else current and bit.inv()
-    stateFlow.update { it.copy(channelMaskInput = next and 0x1FFF, channelMaskInputDirty = true) }
+    stateFlow.update { it.copy(localChannelMaskInput = next and 0x1FFF, channelPlanInputDirty = true) }
+    persistInt(PREF_LOCAL_CHANNEL_MASK_INPUT, next and 0x1FFF)
     persistInt(PREF_CHANNEL_MASK_INPUT, next and 0x1FFF)
   }
 
-  fun applyChannelMask() {
-    val mask = stateFlow.value.channelMaskInput and 0x1FFF
-    if (service?.setChannelMask(mask) == true) {
-      stateFlow.update { it.copy(channelMaskInputDirty = false) }
+  fun toggleNode24Channel(channel: Int, enabled: Boolean) {
+    if (channel !in 1..13) return
+    val bit = 1 shl (channel - 1)
+    val current = stateFlow.value.nodeChannelMask24Input
+    val next = if (enabled) current or bit else current and bit.inv()
+    stateFlow.update { it.copy(nodeChannelMask24Input = next and 0x1FFF, channelPlanInputDirty = true) }
+    persistInt(PREF_NODE_CHANNEL_MASK24_INPUT, next and 0x1FFF)
+  }
+
+  fun toggleNode5Channel(channel: Int, enabled: Boolean) {
+    val current = stateFlow.value.nodeChannelMask5GhzInput
+    val next = WifiBand.setNode5GhzChannel(current, channel, enabled)
+    stateFlow.update { it.copy(nodeChannelMask5GhzInput = next, channelPlanInputDirty = true) }
+    persistLong(PREF_NODE_CHANNEL_MASK5_INPUT, next)
+  }
+
+  fun applyChannelPlan() {
+    val localMask = stateFlow.value.localChannelMaskInput and 0x1FFF
+    val nodeMask24 = stateFlow.value.nodeChannelMask24Input and 0x1FFF
+    val nodeMask5 = WifiBand.sanitizeNode5GhzMask(stateFlow.value.nodeChannelMask5GhzInput)
+    if (service?.setChannelPlan(localMask, nodeMask24, nodeMask5) == true) {
+      stateFlow.update { it.copy(channelPlanInputDirty = false) }
     }
   }
 
@@ -237,7 +279,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         currentChannel = svc.currentChannel,
         hopMs = svc.hopMs,
         channelMask = svc.channelMask,
-        channelMaskInput = if (!ui.channelMaskInputDirty) svc.channelMask else ui.channelMaskInput,
+        localChannelMask = svc.localChannelMask,
+        localChannelMaskInput = if (!ui.channelPlanInputDirty) svc.localChannelMask else ui.localChannelMaskInput,
+        nodeChannelMask24Input =
+          if (!ui.channelPlanInputDirty) svc.nodeChannelMask24 else ui.nodeChannelMask24Input,
+        nodeChannelMask5GhzInput =
+          if (!ui.channelPlanInputDirty) svc.nodeChannelMask5Ghz else ui.nodeChannelMask5GhzInput,
         uniqueBssids = svc.uniqueBssids,
         packetsPerSec = svc.packetsPerSec,
         droppedNotifies = svc.droppedNotifies,
@@ -255,6 +302,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         nodeForwardedSightings = svc.nodeForwardedSightings,
         nodeChannel = svc.nodeChannel,
         nodeChannelMask = svc.nodeChannelMask,
+        nodeChannelMask24 = svc.nodeChannelMask24,
+        nodeChannelMask5Ghz = svc.nodeChannelMask5Ghz,
         sessionOpen = svc.sessionOpen,
         sessionId = svc.sessionId,
         queuedRecords = svc.queuedRecords,
