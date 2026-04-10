@@ -22,8 +22,13 @@ gcc -std=c11 -Wall -Wextra -Werror -I./main \
   tests/test_ble_security_policy.c main/ble_security_policy.c \
   -o /tmp/test_ble_security_policy
 
+gcc -std=c11 -Wall -Wextra -Werror -I./main \
+  tests/test_scan_policy.c main/scan_policy.c \
+  -o /tmp/test_scan_policy
+
 /tmp/test_sniffer_logic
 /tmp/test_channel_plan
 /tmp/test_wg_protocol
 /tmp/test_wg_payload
 /tmp/test_ble_security_policy
+/tmp/test_scan_policy

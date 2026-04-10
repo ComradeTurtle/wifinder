@@ -6,6 +6,7 @@ idf_component_register(
     "wg_protocol.c"
     "wg_payload.c"
     "ble_security_policy.c"
+    "scan_policy.c"
   INCLUDE_DIRS
     "."
   REQUIRES

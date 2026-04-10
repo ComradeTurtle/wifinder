@@ -56,6 +56,7 @@
 
 #include "channel_plan.h"
 #include "ble_security_policy.h"
+#include "scan_policy.h"
 #include "sniffer_logic.h"
 #include "wg_payload.h"
 #include "wg_protocol.h"
@@ -353,6 +354,7 @@ static bool s_unique_hll_dirty = false;
 static uint32_t s_unique_bssid_estimate = 0;
 
 static bool s_scanning = false;
+static bool s_auto_scan_paused = false;
 static uint16_t s_hop_ms = WG_DEFAULT_HOP_MS;
 static uint16_t s_channel_mask = WG_DEFAULT_CHANNEL_MASK;
 static uint8_t s_current_channel = 1;
@@ -360,6 +362,7 @@ static uint8_t s_boot_mode = WG_BOOT_MANUAL;
 
 static esp_timer_handle_t s_hop_timer = NULL;
 static bool s_hop_timer_started = false;
+static SemaphoreHandle_t s_scan_mutex = NULL;
 static TaskHandle_t s_status_task = NULL;
 static TaskHandle_t s_replay_task = NULL;
 
@@ -702,6 +705,8 @@ static uint16_t rd_u16_le(const uint8_t *in);
 static void wr_u16_le(uint8_t *out, uint16_t value);
 static void wr_u32_le(uint8_t *out, uint32_t value);
 static void wr_u64_le(uint8_t *out, uint64_t value);
+static void scan_state_lock(void);
+static void scan_state_unlock(void);
 
 static const struct ble_gatt_svc_def gatt_services[] = {
     {
@@ -746,6 +751,18 @@ static const struct ble_gatt_svc_def gatt_services[] = {
 };
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+
+static void scan_state_lock(void) {
+  if (s_scan_mutex != NULL) {
+    (void)xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+  }
+}
+
+static void scan_state_unlock(void) {
+  if (s_scan_mutex != NULL) {
+    (void)xSemaphoreGive(s_scan_mutex);
+  }
+}
 
 static uint8_t pick_first_channel(uint16_t mask) {
   uint8_t next = 1;
@@ -3959,7 +3976,8 @@ static void apply_effective_gps_fix(const gps_fix_t *src, wg_gps_source_t source
     led_sync_scan_gps_state();
     notify_status_frame();
     notify_gps_frame();
-    if (!prev_valid && s_latest_gps.valid && s_boot_mode == WG_BOOT_AUTO && !s_scanning) {
+    if (wg_scan_policy_should_auto_start(s_boot_mode, s_auto_scan_paused, s_scanning, prev_valid,
+                                         s_latest_gps.valid)) {
       esp_err_t rc = start_scan();
       if (rc == ESP_OK) {
         ESP_LOGI(TAG, "Boot auto: scan started after GPS fix became valid");
@@ -6042,12 +6060,16 @@ static void replay_task(void *arg) {
 }
 
 static esp_err_t start_scan(void) {
+  scan_state_lock();
+  esp_err_t rc = ESP_OK;
   if (!s_latest_gps.valid) {
     ESP_LOGW(TAG, "Scan start blocked: no valid GPS fix");
-    return ESP_ERR_INVALID_STATE;
+    rc = ESP_ERR_INVALID_STATE;
+    goto out;
   }
   if (s_scanning) {
-    return ESP_OK;
+    rc = ESP_OK;
+    goto out;
   }
 
   storage_set_replay_enabled(false);
@@ -6055,17 +6077,18 @@ static esp_err_t start_scan(void) {
   seed_ap_cache_from_active_scan();
   if (s_storage_ready && !storage_open_session()) {
     ESP_LOGW(TAG, "Scan start blocked: storage session open failed");
-    return ESP_FAIL;
+    rc = ESP_FAIL;
+    goto out;
   }
 
   s_current_channel = pick_first_channel(s_local_channel_mask);
-  esp_err_t rc = esp_wifi_set_channel(s_current_channel, WIFI_SECOND_CHAN_NONE);
+  rc = esp_wifi_set_channel(s_current_channel, WIFI_SECOND_CHAN_NONE);
   if (rc != ESP_OK) {
     ESP_LOGW(TAG, "Scan start failed: set channel rc=%s", esp_err_to_name(rc));
     if (s_storage_ready) {
       storage_close_session(WG_SESSION_STATE_ABORTED);
     }
-    return rc;
+    goto out;
   }
   rc = esp_wifi_set_promiscuous(true);
   if (rc != ESP_OK) {
@@ -6073,7 +6096,7 @@ static esp_err_t start_scan(void) {
     if (s_storage_ready) {
       storage_close_session(WG_SESSION_STATE_ABORTED);
     }
-    return rc;
+    goto out;
   }
 
   if (!s_hop_timer_started) {
@@ -6084,7 +6107,7 @@ static esp_err_t start_scan(void) {
       if (s_storage_ready) {
         storage_close_session(WG_SESSION_STATE_ABORTED);
       }
-      return rc;
+      goto out;
     }
     s_hop_timer_started = true;
   }
@@ -6092,12 +6115,16 @@ static esp_err_t start_scan(void) {
   led_sync_scan_gps_state();
   notify_status_frame();
   node_send_config();
-  return ESP_OK;
+out:
+  scan_state_unlock();
+  return rc;
 }
 
 static esp_err_t stop_scan(void) {
+  scan_state_lock();
+  esp_err_t rc = ESP_OK;
   if (!s_scanning) {
-    return ESP_OK;
+    goto out;
   }
   bool timer_stopped = false;
   if (s_hop_timer_started) {
@@ -6110,7 +6137,7 @@ static esp_err_t stop_scan(void) {
     }
   }
 
-  esp_err_t rc = esp_wifi_set_promiscuous(false);
+  rc = esp_wifi_set_promiscuous(false);
   if (rc != ESP_OK) {
     ESP_LOGW(TAG, "Scan stop failed: disable promiscuous rc=%s", esp_err_to_name(rc));
     if (timer_stopped && !s_hop_timer_started) {
@@ -6121,7 +6148,7 @@ static esp_err_t stop_scan(void) {
         ESP_LOGW(TAG, "Scan stop rollback warning: timer restart rc=%s", esp_err_to_name(restart_rc));
       }
     }
-    return rc;
+    goto out;
   }
 
   s_scanning = false;
@@ -6131,7 +6158,9 @@ static esp_err_t stop_scan(void) {
   led_sync_scan_gps_state();
   notify_status_frame();
   node_send_config();
-  return ESP_OK;
+out:
+  scan_state_unlock();
+  return rc;
 }
 
 static void save_runtime_config(void) {
@@ -6235,8 +6264,10 @@ static uint8_t apply_command(const wg_command_t *cmd) {
       if (!s_latest_gps.valid) {
         return WG_ERR_BAD_ARG;
       }
+      wg_scan_policy_on_explicit_start(&s_auto_scan_paused);
       return start_scan() == ESP_OK ? WG_ACK_OK : WG_ERR_INTERNAL;
     case WG_CMD_STOP:
+      wg_scan_policy_on_manual_stop(s_boot_mode, &s_auto_scan_paused);
       return stop_scan() == ESP_OK ? WG_ACK_OK : WG_ERR_INTERNAL;
     case WG_CMD_SET_HOP_MS:
       if (cmd->hop_ms < WG_MIN_HOP_MS || cmd->hop_ms > WG_MAX_HOP_MS) {
@@ -6289,6 +6320,7 @@ static uint8_t apply_command(const wg_command_t *cmd) {
         return WG_ERR_BAD_ARG;
       }
       s_boot_mode = cmd->boot_mode;
+      wg_scan_policy_on_boot_mode_set(s_boot_mode, &s_auto_scan_paused);
       save_runtime_config();
       notify_status_frame();
       return WG_ACK_OK;
@@ -7066,6 +7098,10 @@ static void init_timers(void) {
       .callback = channel_hopper_cb,
       .name = "hop_timer",
   };
+  if (s_scan_mutex == NULL) {
+    s_scan_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_scan_mutex != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+  }
   ESP_ERROR_CHECK(esp_timer_create(&hop_args, &s_hop_timer));
   BaseType_t rc = xTaskCreate(status_task, "wg_status", 6144, NULL, 4, &s_status_task);
   ESP_ERROR_CHECK(rc == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
