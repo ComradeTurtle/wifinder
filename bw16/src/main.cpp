@@ -28,10 +28,12 @@ constexpr uint32_t WG_NODE_STATUS_INTERVAL_MS = 1000;
 constexpr uint32_t WG_NODE_LINK_TIMEOUT_MS = 6000;
 constexpr uint32_t WG_SIGHTING_NOTIFY_INTERVAL_MS = 3000;
 constexpr uint32_t WG_SCAN_RETRY_BACKOFF_MS = 250;
-constexpr int WG_SCAN_BUF_LEN = 4096;
+constexpr int WG_SCAN_BUF_LEN = 8192;
 
-constexpr uint16_t WG_AP_CAPACITY = 220;
-constexpr uint8_t WG_QUEUE_CAPACITY = 100;
+constexpr uint16_t WG_AP_CAPACITY = 320;
+constexpr uint16_t WG_QUEUE_CAPACITY = 192;
+constexpr uint16_t WG_QUEUE_SCAN_BACKPRESSURE_HIGH = (WG_QUEUE_CAPACITY * 3U) / 4U;
+constexpr uint16_t WG_QUEUE_SCAN_BACKPRESSURE_LOW = WG_QUEUE_CAPACITY / 2U;
 
 constexpr uint32_t WG_UART_BAUD = 115200;
 
@@ -110,21 +112,23 @@ struct sighting_event_t {
 
 ap_entry_t s_seen[WG_AP_CAPACITY] = {};
 sighting_event_t s_event_queue[WG_QUEUE_CAPACITY] = {};
-volatile uint8_t s_event_head = 0;
-volatile uint8_t s_event_tail = 0;
+volatile uint16_t s_event_head = 0;
+volatile uint16_t s_event_tail = 0;
 volatile uint32_t s_event_drop_count = 0;
 
 uint16_t s_hop_ms = WG_DEFAULT_HOP_MS;
 uint16_t s_channel_mask = WG_DEFAULT_CHANNEL_MASK;
 uint64_t s_channel_mask_5ghz = WG_NODE_5GHZ_MASK_ALL;
 uint8_t s_current_channel = 1;
+bool s_scan_paused_for_backpressure = false;
+bool s_scan_task_running = false;
 
-bool s_scan_enabled = false;
-bool s_scanning = false;
-bool s_report_enabled = false;
-bool s_link_established = false;
+volatile bool s_scan_enabled = false;
+volatile bool s_scanning = false;
+volatile bool s_report_enabled = false;
+volatile bool s_link_established = false;
 
-uint32_t s_next_scan_earliest_ms = 0;
+volatile uint32_t s_next_scan_earliest_ms = 0;
 uint32_t s_last_status_ms = 0;
 uint32_t s_last_rx_ms = 0;
 
@@ -407,24 +411,60 @@ bool should_emit_event(ap_entry_t *entry, bool is_new, bool is_updated, uint32_t
   return false;
 }
 
-bool enqueue_event(const sighting_event_t &evt) {
-  uint8_t next = (uint8_t)((s_event_head + 1U) % WG_QUEUE_CAPACITY);
-  if (next == s_event_tail) {
-    s_event_drop_count++;
-    return false;
+uint16_t event_queue_count(void) {
+  uint16_t head = 0;
+  uint16_t tail = 0;
+  noInterrupts();
+  head = s_event_head;
+  tail = s_event_tail;
+  interrupts();
+  if (head >= tail) {
+    return (uint16_t)(head - tail);
   }
-  memcpy(&s_event_queue[s_event_head], &evt, sizeof(evt));
-  s_event_head = next;
-  return true;
+  return (uint16_t)(WG_QUEUE_CAPACITY - (tail - head));
 }
 
-bool dequeue_event(sighting_event_t *out) {
-  if (s_event_head == s_event_tail) {
-    return false;
+bool enqueue_event(const sighting_event_t &evt) {
+  bool ok = false;
+  noInterrupts();
+  uint16_t next = (uint16_t)(s_event_head + 1U);
+  if (next >= WG_QUEUE_CAPACITY) {
+    next = 0;
   }
-  memcpy(out, &s_event_queue[s_event_tail], sizeof(*out));
-  s_event_tail = (uint8_t)((s_event_tail + 1U) % WG_QUEUE_CAPACITY);
-  return true;
+  if (next == s_event_tail) {
+    s_event_drop_count++;
+  } else {
+    memcpy(&s_event_queue[s_event_head], &evt, sizeof(evt));
+    s_event_head = next;
+    ok = true;
+  }
+  interrupts();
+  return ok;
+}
+
+bool peek_event(sighting_event_t *out) {
+  bool ok = false;
+  noInterrupts();
+  if (s_event_head != s_event_tail) {
+    memcpy(out, &s_event_queue[s_event_tail], sizeof(*out));
+    ok = true;
+  }
+  interrupts();
+  return ok;
+}
+
+bool pop_event(void) {
+  bool ok = false;
+  noInterrupts();
+  if (s_event_head != s_event_tail) {
+    s_event_tail = (uint16_t)(s_event_tail + 1U);
+    if (s_event_tail >= WG_QUEUE_CAPACITY) {
+      s_event_tail = 0;
+    }
+    ok = true;
+  }
+  interrupts();
+  return ok;
 }
 
 void rate_counter_tick(uint32_t now_ms) {
@@ -523,6 +563,7 @@ bool send_sighting(const sighting_event_t &evt) {
 void stop_scanning() {
   s_scanning = false;
   s_next_scan_earliest_ms = 0;
+  s_scan_paused_for_backpressure = false;
 }
 
 void start_scanning() {
@@ -534,8 +575,11 @@ void start_scanning() {
   } else {
     s_current_channel = 0;
   }
+  // BW16 runs full-band scans, so the instantaneous channel is not meaningful in status.
+  s_current_channel = 0;
   s_next_scan_earliest_ms = 0;
   s_scanning = true;
+  s_scan_paused_for_backpressure = false;
 }
 
 void apply_scan_enable() {
@@ -681,11 +725,15 @@ void drain_event_queue() {
     return;
   }
   sighting_event_t evt = {};
-  while (dequeue_event(&evt)) {
+  while (peek_event(&evt)) {
     if (!s_report_enabled) {
+      (void)pop_event();
       continue;
     }
-    send_sighting(evt);
+    if (!send_sighting(evt)) {
+      break;
+    }
+    (void)pop_event();
   }
 }
 
@@ -824,7 +872,6 @@ void process_scan_record(const rtw_scan_result_t *record, uint32_t ts_ms) {
   }
   (void)enqueue_event(evt);
   s_rate_packet_acc++;
-  s_current_channel = channel;
 }
 
 uint32_t s_scan_ts_ms = 0;
@@ -897,6 +944,7 @@ void run_scan_once(uint32_t now_ms) {
   memset(scan_buf_mem, 0, sizeof(scan_buf_mem));
 
   s_scan_ts_ms = now_ms;
+  s_current_channel = 0;
   if (wifi_scan(RTW_SCAN_TYPE_PASSIVE, RTW_BSS_TYPE_ANY, &scan_buf) < 0) {
     s_next_scan_earliest_ms = now_ms + WG_SCAN_RETRY_BACKOFF_MS;
     return;
@@ -921,10 +969,28 @@ void maybe_run_scan(uint32_t now_ms) {
   if (!s_scanning) {
     return;
   }
+  const uint16_t queued = event_queue_count();
+  if (s_scan_paused_for_backpressure) {
+    if (queued > WG_QUEUE_SCAN_BACKPRESSURE_LOW) {
+      return;
+    }
+    s_scan_paused_for_backpressure = false;
+  } else if (queued >= WG_QUEUE_SCAN_BACKPRESSURE_HIGH) {
+    s_scan_paused_for_backpressure = true;
+    return;
+  }
   if ((int32_t)(now_ms - s_next_scan_earliest_ms) < 0) {
     return;
   }
   run_scan_once(now_ms);
+}
+
+void scan_task(const void *arg) {
+  (void)arg;
+  while (true) {
+    maybe_run_scan(millis());
+    delay(1);
+  }
 }
 
 }  // namespace
@@ -937,6 +1003,9 @@ void setup() {
 
   s_current_channel = pick_first_channel(s_channel_mask);
   s_last_status_ms = millis();
+  if (os_thread_create_arduino(scan_task, nullptr, OS_PRIORITY_ABOVENORMAL, 2048) != 0) {
+    s_scan_task_running = true;
+  }
 }
 
 void loop() {
@@ -944,7 +1013,9 @@ void loop() {
 
   drain_host_uart_rx();
   rate_counter_tick(now_ms);
-  maybe_run_scan(now_ms);
+  if (!s_scan_task_running) {
+    maybe_run_scan(now_ms);
+  }
   drain_event_queue();
 
   if (s_link_established) {
