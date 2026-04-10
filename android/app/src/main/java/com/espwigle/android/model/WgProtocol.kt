@@ -167,6 +167,7 @@ object WgProtocol {
     val blobSessionId = if (payload.size >= 83) bb.getLong(75) else 0L
     val blobBytesSent = if (payload.size >= 87) bb.getInt(83).toLong() and 0xFFFF_FFFFL else 0L
     val blobBytesTotal = if (payload.size >= 91) bb.getInt(87).toLong() and 0xFFFF_FFFFL else 0L
+    val dieTempCenti = if (payload.size >= 129) bb.getShort(127).toInt() else Int.MIN_VALUE
     return StatusPayload(
       scanning = scanning,
       bleEncrypted = bleEncrypted,
@@ -206,6 +207,7 @@ object WgProtocol {
       blobSessionId = blobSessionId,
       blobBytesSent = blobBytesSent,
       blobBytesTotal = blobBytesTotal,
+      dieTempCenti = dieTempCenti,
     )
   }
 
@@ -513,6 +515,7 @@ data class StatusPayload(
   val blobSessionId: Long,
   val blobBytesSent: Long,
   val blobBytesTotal: Long,
+  val dieTempCenti: Int,
 )
 
 data class SightingPayload(

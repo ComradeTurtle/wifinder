@@ -11,9 +11,12 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import com.espwigle.android.ble.EspBleClient
+import com.espwigle.android.logging.GpxTrackLogger
 import com.espwigle.android.gps.GpsTracker
 import com.espwigle.android.logging.WigleCsvLogger
 import com.espwigle.android.model.EspGpsPayload
+import com.espwigle.android.model.GpxTrackSample
+import com.espwigle.android.model.GpxTrackSampling
 import com.espwigle.android.model.GpsFix
 import com.espwigle.android.model.BacklogBlobDonePayload
 import com.espwigle.android.model.BacklogBlobMetaPayload
@@ -103,12 +106,17 @@ data class ServiceState(
   val spiffsTotalBytes: Long = 0L,
   val spiffsUsedBytes: Long = 0L,
   val spiffsFreeBytes: Long = 0L,
+  val dieTempCenti: Int = Int.MIN_VALUE,
   val blobActive: Boolean = false,
   val blobSessionId: Long = 0L,
   val blobBytesSent: Long = 0L,
   val blobBytesTotal: Long = 0L,
   val phoneGpsPushActive: Boolean = false,
   val downloadBacklogActive: Boolean = false,
+  val gpxEnabled: Boolean = true,
+  val gpxLogging: Boolean = false,
+  val gpxPath: String = "",
+  val gpxPointCount: Long = 0L,
   val loggingEnabled: Boolean = false,
   val csvPath: String = "",
   val sightings: List<SightingUi> = emptyList(),
@@ -139,6 +147,9 @@ class ScannerService : Service(), EspBleClient.Listener {
     private const val PREF_AUTO_HOP_ENABLED = "auto_hop_enabled"
     private const val PREF_AUTO_HOP_BASE_MS = "auto_hop_base_ms"
     private const val PREF_GPS_NAV_MODE = "gps_nav_mode"
+    private const val PREF_GPX_ENABLED = "gpx_enabled"
+    private const val GPX_MIN_ELAPSED_MS = 1000L
+    private const val GPX_MIN_DISTANCE_METERS = 5.0
     private const val BLOB_BLOCK_SIZE = 1024
     private const val BLOB_BLOCK_MAGIC = 0x314B4257L
     private const val BLOB_BLOCK_VERSION = 1
@@ -219,6 +230,7 @@ class ScannerService : Service(), EspBleClient.Listener {
   private val logTime = SimpleDateFormat("HH:mm:ss", Locale.US)
 
   private lateinit var bleClient: EspBleClient
+  private lateinit var gpxLogger: GpxTrackLogger
   private lateinit var csvLogger: WigleCsvLogger
   private lateinit var gpsTracker: GpsTracker
   private lateinit var prefs: SharedPreferences
@@ -234,6 +246,9 @@ class ScannerService : Service(), EspBleClient.Listener {
   @Volatile private var pendingManualHopApply: Boolean = false
   @Volatile private var pendingGpsNavModeApply: Boolean = false
   @Volatile private var gpsNavMode: Int = 0
+  @Volatile private var gpxEnabled: Boolean = true
+  @Volatile private var liveGpxSessionId: Long = 0L
+  @Volatile private var lastLiveGpxSample: GpxTrackSample? = null
   @Volatile private var phoneGpsPushActive: Boolean = false
   @Volatile private var downloadBacklogAutoStop: Boolean = false
   @Volatile private var downloadBacklogStartMs: Long = 0L
@@ -248,6 +263,7 @@ class ScannerService : Service(), EspBleClient.Listener {
     NotificationHelper.createChannel(this)
     prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
     bleClient = EspBleClient(applicationContext, this)
+    gpxLogger = GpxTrackLogger(applicationContext)
     csvLogger = WigleCsvLogger(applicationContext)
     gpsTracker = GpsTracker(
       context = applicationContext,
@@ -316,6 +332,7 @@ class ScannerService : Service(), EspBleClient.Listener {
     super.onDestroy()
     scope.cancel()
     try { bleClient.sendGpsClear() } catch (_: Exception) {}
+    stopLiveGpxSession(reason = null)
     resetBacklogBlobReceiver(discardFile = true)
     bleClient.disconnect()
     gpsTracker.stop()
@@ -327,6 +344,7 @@ class ScannerService : Service(), EspBleClient.Listener {
     val autoHopBase = prefs.getInt(PREF_AUTO_HOP_BASE_MS, 250).coerceIn(MIN_HOP_MS, MAX_HOP_MS)
     val autoHopEnabled = prefs.getBoolean(PREF_AUTO_HOP_ENABLED, false)
     gpsNavMode = normalizeGpsNavMode(prefs.getInt(PREF_GPS_NAV_MODE, 0))
+    gpxEnabled = prefs.getBoolean(PREF_GPX_ENABLED, true)
     _state.update {
       it.copy(
         visibleTimeoutSec = visibleTimeoutSec,
@@ -334,6 +352,7 @@ class ScannerService : Service(), EspBleClient.Listener {
         autoHopBaseMs = autoHopBase,
         autoHopAppliedMs = autoHopBase,
         gpsNavMode = gpsNavMode,
+        gpxEnabled = gpxEnabled,
       )
     }
   }
@@ -353,6 +372,10 @@ class ScannerService : Service(), EspBleClient.Listener {
     prefs.edit().putInt(PREF_GPS_NAV_MODE, normalizeGpsNavMode(mode)).apply()
   }
 
+  private fun persistGpxEnabledSetting(enabled: Boolean) {
+    prefs.edit().putBoolean(PREF_GPX_ENABLED, enabled).apply()
+  }
+
   // ── Public API (called by ViewModel via binder) ─────────────
 
   fun doConnect() {
@@ -361,6 +384,7 @@ class ScannerService : Service(), EspBleClient.Listener {
 
   fun doDisconnect() {
     phoneGpsPushActive = false
+    stopLiveGpxSession(reason = null)
     if (controlLinkReadySilent()) {
       bleClient.setBacklogBlobEnabled(false)
     }
@@ -727,6 +751,20 @@ class ScannerService : Service(), EspBleClient.Listener {
     return ok
   }
 
+  fun setGpxEnabled(enabled: Boolean) {
+    gpxEnabled = enabled
+    persistGpxEnabledSetting(enabled)
+    if (!enabled) {
+      stopLiveGpxSession(reason = null)
+    } else {
+      val snapshot = _state.value
+      if (snapshot.connected && snapshot.sessionOpen && snapshot.scanning && snapshot.sessionId != 0L) {
+        startLiveGpxSession(snapshot.sessionId)
+      }
+    }
+    _state.update { it.copy(gpxEnabled = enabled, gpxLogging = gpxLogger.isActive) }
+  }
+
   fun setVisibleTimeout(sec: Int) {
     visibleTimeoutSec = sec.coerceIn(5, 300)
     _state.update { it.copy(visibleTimeoutSec = visibleTimeoutSec) }
@@ -760,6 +798,7 @@ class ScannerService : Service(), EspBleClient.Listener {
     if (!connected) {
       lastEspGps = null
       lastEspFixMs = -1L
+      stopLiveGpxSession(reason = null)
       phoneGpsPushActive = false
       gpsTracker.stop()
       synchronized(ackLock) {
@@ -810,12 +849,17 @@ class ScannerService : Service(), EspBleClient.Listener {
         spiffsTotalBytes = if (!connected) 0L else current.spiffsTotalBytes,
         spiffsUsedBytes = if (!connected) 0L else current.spiffsUsedBytes,
         spiffsFreeBytes = if (!connected) 0L else current.spiffsFreeBytes,
+        dieTempCenti = if (!connected) Int.MIN_VALUE else current.dieTempCenti,
         blobActive = if (!connected) false else current.blobActive,
         blobSessionId = if (!connected) 0L else current.blobSessionId,
         blobBytesSent = if (!connected) 0L else current.blobBytesSent,
         blobBytesTotal = if (!connected) 0L else current.blobBytesTotal,
         phoneGpsPushActive = if (!connected) false else current.phoneGpsPushActive,
         downloadBacklogActive = if (!connected) false else current.downloadBacklogActive,
+        gpxEnabled = current.gpxEnabled,
+        gpxLogging = if (!connected) false else current.gpxLogging,
+        gpxPath = current.gpxPath,
+        gpxPointCount = current.gpxPointCount,
       )
     }
     appendLog(if (connected) "Connected" else "Disconnected")
@@ -894,12 +938,15 @@ class ScannerService : Service(), EspBleClient.Listener {
         spiffsTotalBytes = status.spiffsTotalBytes,
         spiffsUsedBytes = status.spiffsUsedBytes,
         spiffsFreeBytes = status.spiffsFreeBytes,
+        dieTempCenti = status.dieTempCenti,
         blobActive = status.blobActive,
         blobSessionId = status.blobSessionId,
         blobBytesSent = status.blobBytesSent,
         blobBytesTotal = status.blobBytesTotal,
       )
     }
+
+    syncLiveGpxSession(status)
 
     val nowMs = System.currentTimeMillis()
     val withinStartGrace =
@@ -985,6 +1032,18 @@ class ScannerService : Service(), EspBleClient.Listener {
         gpsHdopCenti = gps.hdopCenti,
         gpsPdopCenti = gps.pdopCenti,
       )
+    }
+
+    if (gpxEnabled) {
+      val sample = gpxSampleFromEspGps(gps, now)
+      if (sample != null) {
+        maybeAppendLiveGpxPoint(
+          sample = sample,
+          altitudeMeters = gps.altMm / 1000.0,
+          hdop = if (gps.hdopCenti > 0) gps.hdopCenti / 100.0 else null,
+          satCount = gps.satCount.takeIf { it > 0 },
+        )
+      }
     }
 
     if (_state.value.autoHopEnabled) {
@@ -1399,94 +1458,162 @@ class ScannerService : Service(), EspBleClient.Listener {
     var badBlocks = 0
     var expectedNextSeq = 0L
     var hasExpectedNextSeq = false
+    var backlogLastGpxSample: GpxTrackSample? = null
     val block = ByteArray(BLOB_BLOCK_SIZE)
+    var backlogGpxLogger: GpxTrackLogger? = null
 
-    BufferedInputStream(FileInputStream(file), 64 * 1024).use { input ->
-      while (true) {
-        val read = readFullBlock(input, block)
-        if (read < 0) break
-        if (read != BLOB_BLOCK_SIZE) {
-          badBlocks += 1
-          break
+    if (gpxEnabled) {
+      try {
+        backlogGpxLogger = GpxTrackLogger(applicationContext)
+        val session = backlogGpxLogger.startSession(expectedSessionId, "backlog")
+        _state.update {
+          it.copy(
+            gpxEnabled = gpxEnabled,
+            gpxLogging = true,
+            gpxPath = session.displayPath,
+            gpxPointCount = 0L,
+          )
         }
+        appendLog("Backlog GPX started: ${session.displayPath}")
+      } catch (e: Exception) {
+        backlogGpxLogger = null
+        appendLog("Backlog GPX start failed: ${e.message}")
+      }
+    }
 
-        val bb = ByteBuffer.wrap(block).order(ByteOrder.LITTLE_ENDIAN)
-        val magic = bb.int.toLong() and 0xFFFF_FFFFL
-        val version = bb.short.toInt() and 0xFFFF
-        val headerSize = bb.short.toInt() and 0xFFFF
-        val sessionId = bb.long
-        val firstSeq = bb.int.toLong() and 0xFFFF_FFFFL
-        val recordCount = bb.short.toInt() and 0xFFFF
-        val payloadLen = bb.short.toInt() and 0xFFFF
-        val expectedCrc = bb.int.toLong() and 0xFFFF_FFFFL
-
-        if (magic != BLOB_BLOCK_MAGIC ||
-            version != BLOB_BLOCK_VERSION ||
-            headerSize != BLOB_BLOCK_HEADER_SIZE ||
-            sessionId != expectedSessionId ||
-            recordCount == 0 ||
-            payloadLen == 0 ||
-            payloadLen > BLOB_BLOCK_SIZE - headerSize) {
-          badBlocks += 1
-          continue
-        }
-
-        val crc = CRC32()
-        crc.update(block, headerSize, payloadLen)
-        val actualCrc = crc.value and 0xFFFF_FFFFL
-        if (actualCrc != expectedCrc) {
-          badBlocks += 1
-          continue
-        }
-
-        var payloadPos = headerSize
-        val payloadEnd = headerSize + payloadLen
-        var blockValid = true
-        for (index in 0 until recordCount) {
-          if (payloadPos + BLOB_RECORD_HEADER_SIZE > payloadEnd) {
-            blockValid = false
+    try {
+      BufferedInputStream(FileInputStream(file), 64 * 1024).use { input ->
+        while (true) {
+          val read = readFullBlock(input, block)
+          if (read < 0) break
+          if (read != BLOB_BLOCK_SIZE) {
+            badBlocks += 1
             break
           }
-          val recordLen =
-            (block[payloadPos].toInt() and 0xFF) or
-              ((block[payloadPos + 1].toInt() and 0xFF) shl 8)
-          payloadPos += BLOB_RECORD_HEADER_SIZE
-          if (recordLen <= 0 || payloadPos + recordLen > payloadEnd) {
-            blockValid = false
-            break
-          }
-          val recordBytes = block.copyOfRange(payloadPos, payloadPos + recordLen)
-          payloadPos += recordLen
 
-          val sighting = try {
-            WgProtocol.decodeSightingPayload(recordBytes)
-          } catch (_: Exception) {
-            blockValid = false
-            break
-          }
-          appendCsvFromBacklogSighting(sighting, System.currentTimeMillis())
-          records += 1
+          val bb = ByteBuffer.wrap(block).order(ByteOrder.LITTLE_ENDIAN)
+          val magic = bb.int.toLong() and 0xFFFF_FFFFL
+          val version = bb.short.toInt() and 0xFFFF
+          val headerSize = bb.short.toInt() and 0xFFFF
+          val sessionId = bb.long
+          val firstSeq = bb.int.toLong() and 0xFFFF_FFFFL
+          val recordCount = bb.short.toInt() and 0xFFFF
+          val payloadLen = bb.short.toInt() and 0xFFFF
+          val expectedCrc = bb.int.toLong() and 0xFFFF_FFFFL
 
-          val seq = if (sighting.recordSeq > 0L) sighting.recordSeq else firstSeq + index
-          if (!hasExpectedNextSeq) {
-            expectedNextSeq = seq
-            hasExpectedNextSeq = true
+          if (magic != BLOB_BLOCK_MAGIC ||
+              version != BLOB_BLOCK_VERSION ||
+              headerSize != BLOB_BLOCK_HEADER_SIZE ||
+              sessionId != expectedSessionId ||
+              recordCount == 0 ||
+              payloadLen == 0 ||
+              payloadLen > BLOB_BLOCK_SIZE - headerSize) {
+            badBlocks += 1
+            continue
           }
-          if (seq == expectedNextSeq) {
-            expectedNextSeq += 1L
-          } else if (seq > expectedNextSeq) {
-            gapDetected = true
+
+          val crc = CRC32()
+          crc.update(block, headerSize, payloadLen)
+          val actualCrc = crc.value and 0xFFFF_FFFFL
+          if (actualCrc != expectedCrc) {
+            badBlocks += 1
+            continue
           }
-          if (seq > highestSeq) {
-            highestSeq = seq
+
+          var payloadPos = headerSize
+          val payloadEnd = headerSize + payloadLen
+          var blockValid = true
+          for (index in 0 until recordCount) {
+            if (payloadPos + BLOB_RECORD_HEADER_SIZE > payloadEnd) {
+              blockValid = false
+              break
+            }
+            val recordLen =
+              (block[payloadPos].toInt() and 0xFF) or
+                ((block[payloadPos + 1].toInt() and 0xFF) shl 8)
+            payloadPos += BLOB_RECORD_HEADER_SIZE
+            if (recordLen <= 0 || payloadPos + recordLen > payloadEnd) {
+              blockValid = false
+              break
+            }
+            val recordBytes = block.copyOfRange(payloadPos, payloadPos + recordLen)
+            payloadPos += recordLen
+
+            val sighting = try {
+              WgProtocol.decodeSightingPayload(recordBytes)
+            } catch (_: Exception) {
+              blockValid = false
+              break
+            }
+            appendCsvFromBacklogSighting(sighting, System.currentTimeMillis())
+
+            if (backlogGpxLogger != null && sighting.gpsValid &&
+                validLatLon(sighting.gpsLatE7, sighting.gpsLonE7)) {
+              val sample = GpxTrackSample(
+                lat = sighting.gpsLatE7 / 10_000_000.0,
+                lon = sighting.gpsLonE7 / 10_000_000.0,
+                unixTimeMs = if (sighting.gpsUnixTimeS > 0L) sighting.gpsUnixTimeS * 1000L else System.currentTimeMillis(),
+              )
+              if (GpxTrackSampling.shouldEmit(
+                  previous = backlogLastGpxSample,
+                  candidate = sample,
+                  minElapsedMs = GPX_MIN_ELAPSED_MS,
+                  minDistanceMeters = GPX_MIN_DISTANCE_METERS,
+                )) {
+                backlogGpxLogger.appendTrackPoint(
+                  sample = sample,
+                  altitudeMeters = sighting.gpsAltMm / 1000.0,
+                  hdop = null,
+                  satCount = null,
+                )
+                backlogLastGpxSample = sample
+              }
+            }
+
+            records += 1
+
+            val seq = if (sighting.recordSeq > 0L) sighting.recordSeq else firstSeq + index
+            if (!hasExpectedNextSeq) {
+              expectedNextSeq = seq
+              hasExpectedNextSeq = true
+            }
+            if (seq == expectedNextSeq) {
+              expectedNextSeq += 1L
+            } else if (seq > expectedNextSeq) {
+              gapDetected = true
+            }
+            if (seq > highestSeq) {
+              highestSeq = seq
+            }
+          }
+          if (payloadPos != payloadEnd) {
+            blockValid = false
+          }
+          if (!blockValid) {
+            badBlocks += 1
           }
         }
-        if (payloadPos != payloadEnd) {
-          blockValid = false
+      }
+    } finally {
+      if (backlogGpxLogger != null) {
+        try {
+          val pointCount = backlogGpxLogger.currentPointCount()
+          val path = backlogGpxLogger.currentPath()
+          backlogGpxLogger.stopSession(finalize = true)
+          _state.update {
+            it.copy(
+              gpxEnabled = gpxEnabled,
+              gpxLogging = gpxLogger.isActive,
+              gpxPath = path ?: it.gpxPath,
+              gpxPointCount = pointCount,
+            )
+          }
+          appendLog("Backlog GPX complete (${pointCount} points)")
+        } catch (e: Exception) {
+          appendLog("Backlog GPX finalize failed: ${e.message}")
         }
-        if (!blockValid) {
-          badBlocks += 1
-        }
+      } else {
+        _state.update { it.copy(gpxLogging = gpxLogger.isActive) }
       }
     }
 
@@ -1522,8 +1649,9 @@ class ScannerService : Service(), EspBleClient.Listener {
   }
 
   private fun onPhoneLocation(location: Location) {
+    val nowMs = System.currentTimeMillis()
     lastPhoneLocation = location
-    lastPhoneFixMs = System.currentTimeMillis()
+    lastPhoneFixMs = nowMs
     lastPhoneSpeedMmps = if (location.hasSpeed()) (location.speed * 1000f).roundToInt() else 0
     val speedKmh = speedMmpsToKmh(lastPhoneSpeedMmps)
     _state.update { current ->
@@ -1532,6 +1660,22 @@ class ScannerService : Service(), EspBleClient.Listener {
         phoneGpsAccuracyM = location.accuracy,
         phoneSpeedKmh = speedKmh,
       )
+    }
+
+    if (gpxEnabled && liveGpxSessionId != 0L && gpxLogger.isActive) {
+      val espAgeMs = if (lastEspFixMs <= 0L) Long.MAX_VALUE else nowMs - lastEspFixMs
+      val hasFreshEsp = lastEspGps?.valid == true && espAgeMs <= MAX_ESP_GPS_AGE_MS_FOR_LOGGING
+      if (!hasFreshEsp) {
+        val sample = gpxSampleFromPhoneLocation(location, nowMs)
+        if (sample != null) {
+          maybeAppendLiveGpxPoint(
+            sample = sample,
+            altitudeMeters = if (location.hasAltitude()) location.altitude else null,
+            hdop = null,
+            satCount = null,
+          )
+        }
+      }
     }
 
     if (!bleClient.isConnected()) return
@@ -1775,6 +1919,131 @@ class ScannerService : Service(), EspBleClient.Listener {
     } catch (e: Exception) {
       appendLog("CSV write failed: ${e.message}")
     }
+  }
+
+  private fun startLiveGpxSession(sessionId: Long) {
+    if (!gpxEnabled || sessionId == 0L) {
+      return
+    }
+    if (liveGpxSessionId == sessionId && gpxLogger.isActive) {
+      return
+    }
+    stopLiveGpxSession(reason = null)
+    try {
+      val session = gpxLogger.startSession(sessionId = sessionId, sourceTag = "live")
+      liveGpxSessionId = sessionId
+      lastLiveGpxSample = null
+      _state.update {
+        it.copy(
+          gpxEnabled = gpxEnabled,
+          gpxLogging = true,
+          gpxPath = session.displayPath,
+          gpxPointCount = 0L,
+        )
+      }
+      appendLog("GPX logging started: ${session.displayPath}")
+    } catch (e: Exception) {
+      liveGpxSessionId = 0L
+      lastLiveGpxSample = null
+      _state.update { it.copy(gpxLogging = false) }
+      appendLog("GPX start failed: ${e.message}")
+    }
+  }
+
+  private fun stopLiveGpxSession(reason: String?) {
+    val wasActive = gpxLogger.isActive
+    if (wasActive) {
+      try {
+        gpxLogger.stopSession(finalize = true)
+      } catch (_: Exception) {}
+    }
+    if (wasActive && reason != null) {
+      appendLog("GPX logging stopped ($reason)")
+    }
+    liveGpxSessionId = 0L
+    lastLiveGpxSample = null
+    _state.update {
+      it.copy(
+        gpxLogging = false,
+      )
+    }
+  }
+
+  private fun syncLiveGpxSession(status: StatusPayload) {
+    if (!gpxEnabled) {
+      stopLiveGpxSession(reason = null)
+      return
+    }
+    if (status.scanning && status.sessionOpen && status.sessionId != 0L) {
+      startLiveGpxSession(status.sessionId)
+      return
+    }
+    if (liveGpxSessionId != 0L || gpxLogger.isActive) {
+      stopLiveGpxSession(reason = "session closed")
+    }
+  }
+
+  private fun maybeAppendLiveGpxPoint(
+    sample: GpxTrackSample,
+    altitudeMeters: Double? = null,
+    hdop: Double? = null,
+    satCount: Int? = null,
+  ) {
+    if (!gpxEnabled || liveGpxSessionId == 0L || !gpxLogger.isActive) {
+      return
+    }
+    if (!GpxTrackSampling.shouldEmit(
+        previous = lastLiveGpxSample,
+        candidate = sample,
+        minElapsedMs = GPX_MIN_ELAPSED_MS,
+        minDistanceMeters = GPX_MIN_DISTANCE_METERS,
+      )) {
+      return
+    }
+    try {
+      gpxLogger.appendTrackPoint(
+        sample = sample,
+        altitudeMeters = altitudeMeters,
+        hdop = hdop,
+        satCount = satCount,
+      )
+      lastLiveGpxSample = sample
+      _state.update {
+        it.copy(
+          gpxLogging = true,
+          gpxPath = gpxLogger.currentPath() ?: it.gpxPath,
+          gpxPointCount = gpxLogger.currentPointCount(),
+        )
+      }
+    } catch (e: Exception) {
+      appendLog("GPX write failed: ${e.message}")
+    }
+  }
+
+  private fun validLatLon(latE7: Int, lonE7: Int): Boolean {
+    return latE7 in -900_000_000..900_000_000 && lonE7 in -1_800_000_000..1_800_000_000
+  }
+
+  private fun gpxSampleFromEspGps(gps: EspGpsPayload, nowMs: Long): GpxTrackSample? {
+    if (!gps.valid) return null
+    if (!validLatLon(gps.latE7, gps.lonE7)) return null
+    val sampleTs = if (gps.unixTimeS > 0L) gps.unixTimeS * 1000L else nowMs
+    return GpxTrackSample(
+      lat = gps.latE7 / 10_000_000.0,
+      lon = gps.lonE7 / 10_000_000.0,
+      unixTimeMs = sampleTs,
+    )
+  }
+
+  private fun gpxSampleFromPhoneLocation(location: Location, nowMs: Long): GpxTrackSample? {
+    val latE7 = (location.latitude * 10_000_000.0).roundToInt()
+    val lonE7 = (location.longitude * 10_000_000.0).roundToInt()
+    if (!validLatLon(latE7, lonE7)) return null
+    return GpxTrackSample(
+      lat = location.latitude,
+      lon = location.longitude,
+      unixTimeMs = nowMs,
+    )
   }
 
   private fun trackReplayRecord(sessionId: Long, recordSeq: Long): Boolean {

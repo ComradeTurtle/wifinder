@@ -98,6 +98,7 @@ static void test_status_payload_encoding(void) {
       .blob_session_id = 0x8877665544332211ULL,
       .blob_bytes_sent = 123456,
       .blob_bytes_total = 456789,
+      .die_temp_centi = 4578,
   };
 
   uint8_t out[WG_STATUS_PAYLOAD_SIZE] = {0};
@@ -142,6 +143,7 @@ static void test_status_payload_encoding(void) {
   assert_u64(rd_u64(&out[75]), 0x8877665544332211ULL, "blob session id should be encoded");
   assert_u32(rd_u32(&out[83]), 123456, "blob bytes sent should be encoded");
   assert_u32(rd_u32(&out[87]), 456789, "blob bytes total should be encoded");
+  assert_u16(rd_u16(&out[127]), (uint16_t)4578, "die temp should be encoded");
 }
 
 static void test_sighting_payload_encoding(void) {

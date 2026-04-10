@@ -65,6 +65,7 @@ size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, 
   wr_u16(&out[115], status->local_channel_mask);
   wr_u16(&out[117], status->node_channel_mask_24);
   wr_u64(&out[119], status->node_channel_mask_5ghz);
+  wr_u16(&out[127], (uint16_t)status->die_temp_centi);
   out[74] = status->blob_active ? 1 : 0;
   wr_u64(&out[75], status->blob_session_id);
   wr_u32(&out[83], status->blob_bytes_sent);

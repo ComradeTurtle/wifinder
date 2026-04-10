@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -21,6 +22,7 @@
 #include "driver/rmt_tx.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
+#include "driver/temperature_sensor.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_err.h"
@@ -149,6 +151,10 @@ _Static_assert(WG_NODE_5GHZ_MASK_BIT_COUNT < 64, "WG_NODE_5GHZ_MASK_BIT_COUNT mu
 #define WG_STORAGE_PERSIST_MAX_INTERVAL_MS 120000
 #define WG_STORAGE_PERSIST_RSSI_DELTA_DB 6
 #define WG_STORAGE_MOVING_SPEED_MMPS 2000
+#define WG_STORAGE_GPX_POINT_MIN_INTERVAL_MS 1000
+#define WG_STORAGE_GPX_POINT_MIN_DISTANCE_M 5.0
+#define WG_STORAGE_GPX_FLUSH_INTERVAL_MS 2000
+#define WG_STORAGE_PATH_BUF_SIZE 128
 #define WG_SD_SPI_CS_GPIO GPIO_NUM_20
 #define WG_SD_SPI_SCK_GPIO GPIO_NUM_21
 #define WG_SD_SPI_MOSI_GPIO GPIO_NUM_22
@@ -378,6 +384,11 @@ static volatile int s_gps_uart_baud_active = WG_GPS_UART_BAUD;
 static volatile uint8_t s_gps_nav_rate_hz = 1;
 static volatile uint8_t s_gps_nav_mode = WG_GPS_NAV_MODE_AUTO;
 static volatile int64_t s_gps_last_rate_change_ms = 0;
+#if SOC_TEMP_SENSOR_SUPPORTED
+static temperature_sensor_handle_t s_die_temp_handle = NULL;
+static bool s_die_temp_valid = false;
+static int16_t s_die_temp_centi = INT16_MIN;
+#endif
 
 static node_link_status_t s_node_status = {0};
 static uint16_t s_node_seq = 1;
@@ -524,6 +535,16 @@ static uint8_t s_blob_pending_msg_type = WG_MSG_BACKLOG_BLOB_META;
 static uint8_t s_blob_pending_payload[WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX] = {0};
 static uint16_t s_blob_pending_len = 0;
 static uint16_t s_blob_pending_chunk_len = 0;
+static FILE *s_gpx_fp = NULL;
+static uint64_t s_gpx_session_id = 0;
+static char s_gpx_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+static char s_gpx_tmp_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+static bool s_gpx_has_last_point = false;
+static int32_t s_gpx_last_lat_e7 = 0;
+static int32_t s_gpx_last_lon_e7 = 0;
+static int64_t s_gpx_last_point_ms = 0;
+static int64_t s_gpx_last_flush_ms = 0;
+static uint32_t s_gpx_points_written = 0;
 
 #if CONFIG_WG_RGB_LED_ENABLE
 typedef struct {
@@ -627,10 +648,13 @@ static bool should_notify_entry(ap_entry_t *entry, bool is_new, bool is_updated,
 static bool storage_has_output_link(void);
 static const char *storage_base_path(void);
 static bool storage_get_fs_info(uint64_t *total_bytes_out, uint64_t *used_bytes_out);
+static bool storage_commit_file(FILE *fp, const char *kind, uint64_t session_id);
 static bool storage_open_session(void);
 static bool storage_open_session_locked(void);
 static void storage_close_session(wg_session_state_t final_state);
 static void storage_close_session_locked(wg_session_state_t final_state);
+static bool storage_append_gpx_point_locked(const gps_fix_t *gps, bool force_commit);
+static void storage_gpx_tick(void);
 static bool storage_flush_pending(bool force);
 static void storage_refresh_backlog(bool reclaim);
 static bool storage_apply_replay_ack(uint64_t session_id, uint32_t highest_seq);
@@ -652,6 +676,8 @@ static void refresh_ble_link_metrics(uint16_t conn_handle, const char *reason_ta
 static const char *ble_phy_name(uint8_t phy);
 static void clear_peer_bond_for_conn(uint16_t conn_handle, const char *reason_tag);
 static void request_link_security(uint16_t conn_handle, const char *reason_tag);
+static void init_die_temp_sensor(void);
+static void update_die_temp_sample(void);
 static uint16_t rd_u16_le(const uint8_t *in);
 static void wr_u16_le(uint8_t *out, uint16_t value);
 static void wr_u32_le(uint8_t *out, uint32_t value);
@@ -1387,6 +1413,163 @@ static void storage_manifest_paths(uint64_t session_id, char *slot_a_path, size_
   }
 }
 
+static void storage_gpx_paths(uint64_t session_id, char *gpx_path, size_t gpx_size,
+                              char *gpx_tmp_path, size_t gpx_tmp_size) {
+  const char *base_path = storage_base_path();
+  if (gpx_path != NULL && gpx_size > 0) {
+    snprintf(gpx_path, gpx_size, "%s/" WG_STORAGE_FILE_PREFIX "%016llX.gpx", base_path,
+             (unsigned long long)session_id);
+  }
+  if (gpx_tmp_path != NULL && gpx_tmp_size > 0) {
+    snprintf(gpx_tmp_path, gpx_tmp_size, "%s/" WG_STORAGE_FILE_PREFIX "%016llX.gpx.tmp", base_path,
+             (unsigned long long)session_id);
+  }
+}
+
+static double gpx_distance_meters_e7(int32_t lat1_e7, int32_t lon1_e7, int32_t lat2_e7, int32_t lon2_e7) {
+  static const double k_earth_radius_m = 6371000.0;
+  const double lat1 = ((double)lat1_e7 / 10000000.0) * (M_PI / 180.0);
+  const double lat2 = ((double)lat2_e7 / 10000000.0) * (M_PI / 180.0);
+  const double dlat = ((double)(lat2_e7 - lat1_e7) / 10000000.0) * (M_PI / 180.0);
+  const double dlon = ((double)(lon2_e7 - lon1_e7) / 10000000.0) * (M_PI / 180.0);
+  const double sin_dlat = sin(dlat / 2.0);
+  const double sin_dlon = sin(dlon / 2.0);
+  const double h = sin_dlat * sin_dlat + cos(lat1) * cos(lat2) * sin_dlon * sin_dlon;
+  const double c = 2.0 * atan2(sqrt(h), sqrt(fmax(0.0, 1.0 - h)));
+  return k_earth_radius_m * c;
+}
+
+static bool gpx_format_time_utc(uint32_t unix_time_s, char *out, size_t out_size) {
+  if (out == NULL || out_size == 0) {
+    return false;
+  }
+  if (unix_time_s == 0) {
+    unix_time_s = (uint32_t)(now_ms() / 1000LL);
+  }
+  time_t epoch = (time_t)unix_time_s;
+  struct tm tm_utc = {0};
+  if (gmtime_r(&epoch, &tm_utc) == NULL) {
+    return false;
+  }
+  return strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) > 0;
+}
+
+static void storage_reset_gpx_state_locked(bool close_file, bool remove_tmp) {
+  if (close_file && s_gpx_fp != NULL) {
+    fclose(s_gpx_fp);
+  }
+  s_gpx_fp = NULL;
+  if (remove_tmp && s_gpx_tmp_path[0] != '\0') {
+    (void)unlink(s_gpx_tmp_path);
+  }
+  s_gpx_session_id = 0;
+  s_gpx_path[0] = '\0';
+  s_gpx_tmp_path[0] = '\0';
+  s_gpx_has_last_point = false;
+  s_gpx_last_lat_e7 = 0;
+  s_gpx_last_lon_e7 = 0;
+  s_gpx_last_point_ms = 0;
+  s_gpx_last_flush_ms = 0;
+  s_gpx_points_written = 0;
+}
+
+static bool storage_open_gpx_session_locked(uint64_t session_id) {
+  if (session_id == 0) {
+    return false;
+  }
+  storage_reset_gpx_state_locked(true, false);
+  storage_gpx_paths(session_id, s_gpx_path, sizeof(s_gpx_path), s_gpx_tmp_path, sizeof(s_gpx_tmp_path));
+  (void)unlink(s_gpx_tmp_path);
+
+  FILE *fp = fopen(s_gpx_tmp_path, "wb");
+  if (fp == NULL) {
+    ESP_LOGW(TAG, "gpx open failed sid=%016llX path=%s errno=%d", (unsigned long long)session_id,
+             s_gpx_tmp_path, errno);
+    storage_reset_gpx_state_locked(false, false);
+    return false;
+  }
+
+  int n = fprintf(fp,
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                  "<gpx version=\"1.1\" creator=\"espwigle\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n"
+                  "<trk><name>session-%016llX</name><trkseg>\n",
+                  (unsigned long long)session_id);
+  if (n <= 0 || !storage_commit_file(fp, "gpx header", session_id)) {
+    ESP_LOGW(TAG, "gpx header failed sid=%016llX errno=%d", (unsigned long long)session_id, errno);
+    fclose(fp);
+    (void)unlink(s_gpx_tmp_path);
+    storage_reset_gpx_state_locked(false, false);
+    return false;
+  }
+
+  s_gpx_fp = fp;
+  s_gpx_session_id = session_id;
+  s_gpx_last_flush_ms = now_ms();
+  return true;
+}
+
+static void storage_close_gpx_session_locked(bool finalize) {
+  FILE *fp = s_gpx_fp;
+  if (fp == NULL) {
+    storage_reset_gpx_state_locked(false, false);
+    return;
+  }
+
+  bool ok = true;
+  if (finalize) {
+    if (fprintf(fp, "</trkseg></trk></gpx>\n") <= 0) {
+      ok = false;
+    }
+  }
+  if (ok && !storage_commit_file(fp, finalize ? "gpx finalize" : "gpx close", s_gpx_session_id)) {
+    ok = false;
+  }
+  fclose(fp);
+  s_gpx_fp = NULL;
+
+  if (finalize && ok) {
+    (void)unlink(s_gpx_path);
+    if (rename(s_gpx_tmp_path, s_gpx_path) != 0) {
+      ESP_LOGW(TAG, "gpx rename failed sid=%016llX from=%s to=%s errno=%d",
+               (unsigned long long)s_gpx_session_id, s_gpx_tmp_path, s_gpx_path, errno);
+      ok = false;
+    }
+  }
+  if (!ok) {
+    ESP_LOGW(TAG, "gpx close incomplete sid=%016llX", (unsigned long long)s_gpx_session_id);
+  }
+  storage_reset_gpx_state_locked(false, !ok || !finalize);
+}
+
+static bool storage_finalize_stale_gpx_session(uint64_t session_id) {
+  if (session_id == 0) {
+    return false;
+  }
+  char gpx_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+  char gpx_tmp_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+  storage_gpx_paths(session_id, gpx_path, sizeof(gpx_path), gpx_tmp_path, sizeof(gpx_tmp_path));
+  struct stat st = {0};
+  if (stat(gpx_tmp_path, &st) != 0 || st.st_size <= 0) {
+    return false;
+  }
+  FILE *fp = fopen(gpx_tmp_path, "ab");
+  if (fp == NULL) {
+    return false;
+  }
+  bool ok = (fprintf(fp, "</trkseg></trk></gpx>\n") > 0) &&
+            storage_commit_file(fp, "gpx stale finalize", session_id);
+  fclose(fp);
+  if (!ok) {
+    return false;
+  }
+  (void)unlink(gpx_path);
+  if (rename(gpx_tmp_path, gpx_path) != 0) {
+    ESP_LOGW(TAG, "gpx stale rename failed sid=%016llX errno=%d", (unsigned long long)session_id, errno);
+    return false;
+  }
+  return true;
+}
+
 static bool storage_parse_meta_filename(const char *name, uint64_t *session_id_out) {
   if (name == NULL || session_id_out == NULL) {
     return false;
@@ -1682,8 +1865,11 @@ static uint32_t storage_reclaim_acked_sessions_locked(void) {
     char meta_path[96] = {0};
     char meta_path_b[100] = {0};
     char data_path[96] = {0};
+    char gpx_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+    char gpx_tmp_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
     storage_manifest_paths(sid, meta_path, sizeof(meta_path), meta_path_b, sizeof(meta_path_b));
     storage_session_paths(sid, NULL, 0, data_path, sizeof(data_path));
+    storage_gpx_paths(sid, gpx_path, sizeof(gpx_path), gpx_tmp_path, sizeof(gpx_tmp_path));
     if (!storage_read_manifest(sid, &manifest)) {
       continue;
     }
@@ -1704,6 +1890,8 @@ static uint32_t storage_reclaim_acked_sessions_locked(void) {
       reclaimed++;
     }
     (void)unlink(data_path);
+    (void)unlink(gpx_path);
+    (void)unlink(gpx_tmp_path);
   }
   closedir(dir);
   if (reclaimed > 0) {
@@ -1850,6 +2038,89 @@ static bool storage_enqueue_record_locked(const uint8_t *payload, uint16_t paylo
     }
   }
   return true;
+}
+
+static bool storage_append_gpx_point_locked(const gps_fix_t *gps, bool force_commit) {
+  if (gps == NULL || !gps->valid || !s_session_open || s_session_id == 0) {
+    return false;
+  }
+  if (s_gpx_fp == NULL || s_gpx_session_id != s_session_id) {
+    if (!storage_open_gpx_session_locked(s_session_id)) {
+      return false;
+    }
+  }
+
+  int64_t ms = now_ms();
+  if (ms < 0) {
+    ms = 0;
+  }
+  if (!force_commit && s_gpx_has_last_point) {
+    int64_t elapsed_ms = ms - s_gpx_last_point_ms;
+    double distance_m =
+        gpx_distance_meters_e7(s_gpx_last_lat_e7, s_gpx_last_lon_e7, gps->lat_e7, gps->lon_e7);
+    if (elapsed_ms >= 0 && elapsed_ms < WG_STORAGE_GPX_POINT_MIN_INTERVAL_MS &&
+        distance_m < WG_STORAGE_GPX_POINT_MIN_DISTANCE_M) {
+      return true;
+    }
+  }
+
+  char iso_time[32] = {0};
+  if (!gpx_format_time_utc(gps->unix_time_s, iso_time, sizeof(iso_time))) {
+    return false;
+  }
+
+  double lat = (double)gps->lat_e7 / 10000000.0;
+  double lon = (double)gps->lon_e7 / 10000000.0;
+  int n = fprintf(s_gpx_fp, "<trkpt lat=\"%.7f\" lon=\"%.7f\"><time>%s</time>", lat, lon, iso_time);
+  if (n <= 0) {
+    return false;
+  }
+  if ((gps->flags & WG_GPS_FLAG_HAS_ALT) != 0) {
+    if (fprintf(s_gpx_fp, "<ele>%.1f</ele>", (double)gps->alt_mm / 1000.0) <= 0) {
+      return false;
+    }
+  }
+  if (fprintf(s_gpx_fp, "</trkpt>\n") <= 0) {
+    return false;
+  }
+
+  s_gpx_has_last_point = true;
+  s_gpx_last_lat_e7 = gps->lat_e7;
+  s_gpx_last_lon_e7 = gps->lon_e7;
+  s_gpx_last_point_ms = ms;
+  if (s_gpx_points_written < UINT32_MAX) {
+    s_gpx_points_written++;
+  }
+
+  bool should_commit = force_commit;
+  if (!should_commit) {
+    int64_t flush_age_ms = ms - s_gpx_last_flush_ms;
+    should_commit = (s_gpx_last_flush_ms <= 0 || flush_age_ms >= WG_STORAGE_GPX_FLUSH_INTERVAL_MS ||
+                     (s_gpx_points_written % 16U) == 0U);
+  }
+  if (should_commit) {
+    if (!storage_commit_file(s_gpx_fp, "gpx append", s_gpx_session_id)) {
+      return false;
+    }
+    s_gpx_last_flush_ms = ms;
+  }
+  return true;
+}
+
+static void storage_gpx_tick(void) {
+  if (!s_storage_ready) {
+    return;
+  }
+  if (!storage_lock(pdMS_TO_TICKS(50))) {
+    return;
+  }
+  if (s_scanning && s_session_open && s_gpx_session_id == s_session_id && s_latest_gps.valid) {
+    if (!storage_append_gpx_point_locked(&s_latest_gps, false)) {
+      ESP_LOGW(TAG, "gpx tick append failed sid=%016llX errno=%d", (unsigned long long)s_session_id,
+               errno);
+    }
+  }
+  storage_unlock();
 }
 
 static uint32_t debug_seed_prng_next(uint32_t *state) {
@@ -2021,6 +2292,7 @@ static bool storage_open_session_locked(void) {
     return false;
   }
   storage_reset_pending_block_locked();
+  storage_reset_gpx_state_locked(true, false);
   s_session_open = true;
   storage_refresh_backlog_locked(false);
   ESP_LOGI(TAG, "session open sid=%016llX", (unsigned long long)s_session_id);
@@ -2031,7 +2303,11 @@ static void storage_close_session_locked(wg_session_state_t final_state) {
   if (!s_storage_ready || !s_session_open) {
     return;
   }
+  if (s_latest_gps.valid && s_gpx_fp != NULL && s_gpx_session_id == s_session_id) {
+    (void)storage_append_gpx_point_locked(&s_latest_gps, true);
+  }
   (void)storage_flush_pending_locked(true);
+  storage_close_gpx_session_locked(true);
   if (final_state < WG_SESSION_STATE_OPEN || final_state > WG_SESSION_STATE_ABORTED) {
     final_state = WG_SESSION_STATE_ABORTED;
   }
@@ -2843,10 +3119,12 @@ static bool storage_clear_sessions(void) {
     bool is_meta = (name_len > 5 && strcmp(ent->d_name + name_len - 5, ".meta") == 0) ||
                    (name_len > 7 && strcmp(ent->d_name + name_len - 7, ".meta.b") == 0);
     bool is_data = name_len > 4 && strcmp(ent->d_name + name_len - 4, ".dat") == 0;
-    if (!is_meta && !is_data) {
+    bool is_gpx = name_len > 4 && strcmp(ent->d_name + name_len - 4, ".gpx") == 0;
+    bool is_gpx_tmp = name_len > 8 && strcmp(ent->d_name + name_len - 8, ".gpx.tmp") == 0;
+    if (!is_meta && !is_data && !is_gpx && !is_gpx_tmp) {
       continue;
     }
-    char path[PATH_MAX] = {0};
+    char path[WG_STORAGE_PATH_BUF_SIZE] = {0};
     int path_len = snprintf(path, sizeof(path), "%s/%s", storage_base_path(), ent->d_name);
     if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
       ok = false;
@@ -3172,6 +3450,7 @@ static void storage_abort_stale_open_sessions(void) {
     manifest.state = WG_SESSION_STATE_ABORTED;
     manifest.unclean_shutdown = 1;
     if (storage_write_manifest(&manifest)) {
+      (void)storage_finalize_stale_gpx_session(sid);
       aborted++;
     }
   }
@@ -3272,6 +3551,63 @@ static void init_storage(void) {
     ESP_LOGI(TAG, "storage ready backend=%s base=%s",
              storage_backend_name(s_storage_backend), storage_base_path());
   }
+}
+
+static void init_die_temp_sensor(void) {
+#if SOC_TEMP_SENSOR_SUPPORTED
+  temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+  temperature_sensor_handle_t handle = NULL;
+  esp_err_t rc = temperature_sensor_install(&cfg, &handle);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "die temp install failed rc=%s", esp_err_to_name(rc));
+    s_die_temp_handle = NULL;
+    s_die_temp_valid = false;
+    s_die_temp_centi = INT16_MIN;
+    return;
+  }
+  rc = temperature_sensor_enable(handle);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "die temp enable failed rc=%s", esp_err_to_name(rc));
+    (void)temperature_sensor_uninstall(handle);
+    s_die_temp_handle = NULL;
+    s_die_temp_valid = false;
+    s_die_temp_centi = INT16_MIN;
+    return;
+  }
+  s_die_temp_handle = handle;
+  s_die_temp_valid = false;
+  s_die_temp_centi = INT16_MIN;
+  ESP_LOGI(TAG, "die temp sensor ready");
+#endif
+}
+
+static void update_die_temp_sample(void) {
+#if SOC_TEMP_SENSOR_SUPPORTED
+  if (s_die_temp_handle == NULL) {
+    return;
+  }
+  float celsius = 0.0f;
+  esp_err_t rc = temperature_sensor_get_celsius(s_die_temp_handle, &celsius);
+  if (rc != ESP_OK || !isfinite(celsius)) {
+    s_die_temp_valid = false;
+    s_die_temp_centi = INT16_MIN;
+    return;
+  }
+  double bounded = (double)celsius;
+  if (bounded > 327.67) {
+    bounded = 327.67;
+  } else if (bounded < -327.67) {
+    bounded = -327.67;
+  }
+  long centi = lround(bounded * 100.0);
+  if (centi > INT16_MAX) {
+    centi = INT16_MAX;
+  } else if (centi < (long)INT16_MIN + 1L) {
+    centi = (long)INT16_MIN + 1L;
+  }
+  s_die_temp_centi = (int16_t)centi;
+  s_die_temp_valid = true;
+#endif
 }
 
 static void split_channel_mask(uint16_t global_mask, uint16_t *local_mask, uint16_t *node_mask) {
@@ -3441,7 +3777,7 @@ static void log_bridge_diagnostics(bool force) {
            "diag store ready=%d backend=%s open=%d sid=%016llX backlog_records=%lu backlog_bytes=%lu "
            "replay_req=%d replay=%d replay_sid=%016llX replay_cursor=%lu "
            "blob_req=%d blob=%d blob_sid=%016llX blob_bytes_ack=%lu blob_bytes_tx=%lu/%lu "
-           "queue_full=%d dropped_full=%lu",
+           "queue_full=%d dropped_full=%lu gpx_sid=%016llX gpx_points=%lu gpx_active=%d",
            s_storage_ready ? 1 : 0, storage_backend_name(s_storage_backend),
            s_session_open ? 1 : 0, (unsigned long long)s_session_id,
            (unsigned long)s_queue_backlog_records, (unsigned long)s_queue_backlog_bytes,
@@ -3453,7 +3789,8 @@ static void log_bridge_diagnostics(bool force) {
            (unsigned long)s_blob_bytes_acked, (unsigned long)s_blob_bytes_sent,
            (unsigned long)s_blob_file_bytes,
            s_queue_full ? 1 : 0,
-           (unsigned long)s_dropped_flash_full);
+           (unsigned long)s_dropped_flash_full, (unsigned long long)s_gpx_session_id,
+           (unsigned long)s_gpx_points_written, s_gpx_fp != NULL ? 1 : 0);
 
   if (!s_node_seen_hello && s_node_uart_rx_bytes == 0 && s_node_tx_frames >= 20 &&
       !s_node_no_rx_warned) {
@@ -3549,6 +3886,11 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .blob_session_id = s_blob_session_id,
       .blob_bytes_sent = s_blob_bytes_acked,
       .blob_bytes_total = s_blob_file_bytes,
+#if SOC_TEMP_SENSOR_SUPPORTED
+      .die_temp_centi = s_die_temp_valid ? s_die_temp_centi : INT16_MIN,
+#else
+      .die_temp_centi = INT16_MIN,
+#endif
   };
 }
 
@@ -5517,6 +5859,8 @@ static void channel_hopper_cb(void *arg) {
 static void status_tick_once(void) {
   rate_counter_tick(now_ms());
   unique_bssid_refresh_estimate();
+  update_die_temp_sample();
+  storage_gpx_tick();
   (void)storage_flush_pending(false);
   storage_refresh_backlog(false);
   if (s_node_status.link_up && (now_ms() - s_node_status.last_rx_ms) > WG_NODE_STALE_MS) {
@@ -6594,6 +6938,8 @@ void app_main(void) {
   load_runtime_config();
   init_wifi();
   init_storage();
+  init_die_temp_sensor();
+  update_die_temp_sample();
   init_timers();
   init_uart_bridges();
   init_host_serial_bridge();

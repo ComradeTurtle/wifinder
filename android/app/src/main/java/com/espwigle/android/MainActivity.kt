@@ -66,10 +66,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.platform.LocalView
+import android.view.WindowManager
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.espwigle.android.model.WifiBand
 import com.espwigle.android.ui.AppUiState
+import com.espwigle.android.ui.DashboardScreen
 import com.espwigle.android.ui.MainViewModel
 import com.espwigle.android.ui.SightingUi
 import com.espwigle.android.ui.theme.EspWigleTheme
@@ -91,6 +98,25 @@ class MainActivity : ComponentActivity() {
     setContent {
       EspWigleTheme(darkTheme = true) {
         val state by viewModel.state.collectAsStateWithLifecycle()
+        if (state.dashboardMode) {
+          val view = LocalView.current
+          DisposableEffect(Unit) {
+            val window = (view.context as? ComponentActivity)?.window
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            val controller = window?.let { WindowCompat.getInsetsController(it, view) }
+            controller?.systemBarsBehavior =
+              WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller?.hide(WindowInsetsCompat.Type.systemBars())
+            onDispose {
+              window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              controller?.show(WindowInsetsCompat.Type.systemBars())
+            }
+          }
+          DashboardScreen(
+            state = state,
+            onExit = viewModel::toggleDashboardMode,
+          )
+        } else {
         EspWigleScreen(
           state = state,
           onRequestPermissions = ::requestMissingPermissions,
@@ -111,6 +137,7 @@ class MainActivity : ComponentActivity() {
           onApplyChannels = viewModel::applyChannelPlan,
           onSetBootMode = viewModel::setBootMode,
           onSetGpsNavMode = viewModel::setGpsNavMode,
+          onSetGpxEnabled = viewModel::setGpxEnabled,
           onVisibleTimeout = viewModel::setVisibleTimeoutSec,
           onStartLogging = viewModel::startLogging,
           onStopLogging = viewModel::stopLogging,
@@ -118,7 +145,9 @@ class MainActivity : ComponentActivity() {
           onSeedDebugBacklog = viewModel::seedDebugBacklog,
           onPushPhoneGpsNow = viewModel::pushPhoneGpsNow,
           onToggleSection = viewModel::toggleSection,
+          onToggleDashboard = viewModel::toggleDashboardMode,
         )
+        }
       }
     }
   }
@@ -260,6 +289,7 @@ private fun EspWigleScreen(
   onApplyChannels: () -> Unit,
   onSetBootMode: (Int) -> Unit,
   onSetGpsNavMode: (Int) -> Unit,
+  onSetGpxEnabled: (Boolean) -> Unit,
   onVisibleTimeout: (Int) -> Unit,
   onStartLogging: () -> Unit,
   onStopLogging: () -> Unit,
@@ -267,6 +297,7 @@ private fun EspWigleScreen(
   onSeedDebugBacklog: () -> Unit,
   onPushPhoneGpsNow: () -> Unit,
   onToggleSection: (String) -> Unit,
+  onToggleDashboard: () -> Unit,
 ) {
   val now = System.currentTimeMillis()
 
@@ -301,6 +332,13 @@ private fun EspWigleScreen(
           containerColor = MaterialTheme.colorScheme.surface,
         ),
         actions = {
+          IconButton(onClick = onToggleDashboard) {
+            Text(
+              "▦",
+              fontSize = 20.sp,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+          }
           if (!state.permissionsGranted) {
             TextButton(onClick = onRequestPermissions) {
               Text("Grant", color = MaterialTheme.colorScheme.error)
@@ -405,6 +443,7 @@ private fun EspWigleScreen(
               onApplyChannels = onApplyChannels,
               onSetBootMode = onSetBootMode,
               onSetGpsNavMode = onSetGpsNavMode,
+              onSetGpxEnabled = onSetGpxEnabled,
               onVisibleTimeout = onVisibleTimeout,
             )
           }
@@ -532,6 +571,9 @@ private fun StatusRibbon(state: AppUiState) {
       )
       if (state.loggingEnabled) {
         RibbonChip(label = "CSV ●", color = Color(0xFFEF5350))
+      }
+      if (state.gpxEnabled && state.gpxLogging) {
+        RibbonChip(label = "GPX ●", color = Color(0xFF4CAF50))
       }
     }
   }
@@ -758,14 +800,37 @@ private fun GeneralStatusDetails(state: AppUiState) {
       "${formatBytesShort(state.spiffsUsedBytes)} used / ${formatBytesShort(state.spiffsTotalBytes)} total (${formatBytesShort(state.spiffsFreeBytes)} free)",
     )
     KvRow(
+      "Die Temp",
+      if (state.dieTempCenti != Int.MIN_VALUE) "${"%.2f".format(state.dieTempCenti / 100.0)} °C" else "-",
+    )
+    KvRow(
       "Queue Pressure",
       if (state.queueFull) "YES (drops=${state.droppedFlashFull})" else "No (drops=${state.droppedFlashFull})",
     )
     KvRow("Visible Rows", state.sightings.size.toString())
     KvRow("CSV", if (state.loggingEnabled) "Recording" else "Stopped")
+    KvRow(
+      "GPX",
+      when {
+        !state.gpxEnabled -> "Disabled"
+        state.gpxLogging -> "Recording (${state.gpxPointCount} pts)"
+        state.gpxPath.isNotBlank() -> "Ready (${state.gpxPointCount} pts)"
+        else -> "Idle"
+      },
+    )
     if (state.csvPath.isNotBlank()) {
       Text(
         text = state.csvPath,
+        style = MaterialTheme.typography.bodySmall,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        fontFamily = FontFamily.Monospace,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+    }
+    if (state.gpxPath.isNotBlank()) {
+      Text(
+        text = state.gpxPath,
         style = MaterialTheme.typography.bodySmall,
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
@@ -845,6 +910,7 @@ private fun ConfigSection(
   onApplyChannels: () -> Unit,
   onSetBootMode: (Int) -> Unit,
   onSetGpsNavMode: (Int) -> Unit,
+  onSetGpxEnabled: (Boolean) -> Unit,
   onVisibleTimeout: (Int) -> Unit,
 ) {
   Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1018,6 +1084,24 @@ private fun ConfigSection(
         selected = state.gpsNavMode == 4,
         onClick = { onSetGpsNavMode(4) },
         label = { Text("4 Hz") },
+        shape = RoundedCornerShape(6.dp),
+      )
+    }
+
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+    Text("GPX Track Logging", style = MaterialTheme.typography.labelMedium)
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+      FilterChip(
+        selected = state.gpxEnabled,
+        onClick = { onSetGpxEnabled(true) },
+        label = { Text("Enabled") },
+        shape = RoundedCornerShape(6.dp),
+      )
+      FilterChip(
+        selected = !state.gpxEnabled,
+        onClick = { onSetGpxEnabled(false) },
+        label = { Text("Disabled") },
         shape = RoundedCornerShape(6.dp),
       )
     }

@@ -8,7 +8,7 @@ import org.junit.Test
 class WgProtocolTest {
   @Test
   fun `decode status payload parses gps fields and extended storage stats`() {
-    val payload = ByteArray(127)
+    val payload = ByteArray(129)
     payload[0] = 1
     payload[1] = 1
     payload[2] = 11
@@ -93,6 +93,9 @@ class WgProtocolTest {
     for (i in 0 until 8) {
       payload[119 + i] = ((nodeMask5 ushr (8 * i)) and 0xFF).toByte()
     }
+    val dieTempCenti = 4567
+    payload[127] = (dieTempCenti and 0xFF).toByte()
+    payload[128] = ((dieTempCenti ushr 8) and 0xFF).toByte()
 
     val status = WgProtocol.decodeStatusPayload(payload)
 
@@ -134,6 +137,7 @@ class WgProtocolTest {
     assertEquals(blobSessionId, status.blobSessionId)
     assertEquals(4096L, status.blobBytesSent)
     assertEquals(8192L, status.blobBytesTotal)
+    assertEquals(dieTempCenti, status.dieTempCenti)
   }
 
   @Test
@@ -151,6 +155,7 @@ class WgProtocolTest {
     assertEquals(0, status.gpsNavAppliedHz)
     assertEquals(0L, status.spiffsFreeBytes)
     assertEquals(false, status.blobActive)
+    assertEquals(Int.MIN_VALUE, status.dieTempCenti)
   }
 
   @Test

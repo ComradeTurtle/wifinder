@@ -37,6 +37,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private const val PREF_NODE_CHANNEL_MASK24_INPUT = "node_channel_mask24_input"
     private const val PREF_NODE_CHANNEL_MASK5_INPUT = "node_channel_mask5_input"
     private const val PREF_GPS_NAV_MODE = "gps_nav_mode"
+    private const val PREF_GPX_ENABLED = "gpx_enabled"
+    private const val PREF_DASHBOARD_MODE = "dashboard_mode"
   }
 
   private val prefs: SharedPreferences =
@@ -57,6 +59,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       .coerceIn(MIN_HOP_MS, MAX_HOP_MS)
     val autoHopEnabled = prefs.getBoolean(PREF_AUTO_HOP_ENABLED, false)
     val gpsNavMode = normalizeGpsNavMode(prefs.getInt(PREF_GPS_NAV_MODE, 0))
+    val gpxEnabled = prefs.getBoolean(PREF_GPX_ENABLED, true)
+    val dashboardMode = prefs.getBoolean(PREF_DASHBOARD_MODE, false)
     val legacyMask = prefs.getInt(PREF_CHANNEL_MASK_INPUT, 0x1FFF) and 0x1FFF
     val localMask = prefs.getInt(PREF_LOCAL_CHANNEL_MASK_INPUT, legacyMask) and 0x1FFF
     val nodeMask24 = prefs.getInt(PREF_NODE_CHANNEL_MASK24_INPUT, 0x0000) and 0x1FFF
@@ -69,12 +73,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val nodeMask5 = WifiBand.sanitizeNode5GhzMask(rawNodeMask5)
     val normalizedLocalMask = if (localMask == 0) 0x1FFF else localMask
     return AppUiState(
+      dashboardMode = dashboardMode,
       visibleTimeoutSec = visibleTimeout,
       hopInputMs = hopInput,
       autoHopBaseMs = hopInput,
       autoHopAppliedMs = hopInput,
       autoHopEnabled = autoHopEnabled,
       gpsNavMode = gpsNavMode,
+      gpxEnabled = gpxEnabled,
       localChannelMaskInput = normalizedLocalMask,
       nodeChannelMask24Input = nodeMask24,
       nodeChannelMask5GhzInput = nodeMask5,
@@ -130,6 +136,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
       if (section in next) next.remove(section) else next.add(section)
       current.copy(expandedSections = next)
     }
+  }
+
+  fun toggleDashboardMode() {
+    val next = !stateFlow.value.dashboardMode
+    stateFlow.update { it.copy(dashboardMode = next) }
+    persistBoolean(PREF_DASHBOARD_MODE, next)
   }
 
   // ── Service lifecycle ──────────────────────────────────────
@@ -255,6 +267,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     persistInt(PREF_GPS_NAV_MODE, normalized)
   }
 
+  fun setGpxEnabled(enabled: Boolean) {
+    service?.setGpxEnabled(enabled)
+    stateFlow.update { it.copy(gpxEnabled = enabled) }
+    persistBoolean(PREF_GPX_ENABLED, enabled)
+  }
+
   fun setVisibleTimeoutSec(value: Int) {
     val timeout = value.coerceIn(MIN_VISIBLE_TIMEOUT_SEC, MAX_VISIBLE_TIMEOUT_SEC)
     stateFlow.update { it.copy(visibleTimeoutSec = timeout) }
@@ -325,12 +343,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         spiffsTotalBytes = svc.spiffsTotalBytes,
         spiffsUsedBytes = svc.spiffsUsedBytes,
         spiffsFreeBytes = svc.spiffsFreeBytes,
+        dieTempCenti = svc.dieTempCenti,
         blobActive = svc.blobActive,
         blobSessionId = svc.blobSessionId,
         blobBytesSent = svc.blobBytesSent,
         blobBytesTotal = svc.blobBytesTotal,
         phoneGpsPushActive = svc.phoneGpsPushActive,
         downloadBacklogActive = svc.downloadBacklogActive,
+        gpxEnabled = svc.gpxEnabled,
+        gpxLogging = svc.gpxLogging,
+        gpxPath = svc.gpxPath,
+        gpxPointCount = svc.gpxPointCount,
         loggingEnabled = svc.loggingEnabled,
         csvPath = svc.csvPath,
         sightings = svc.sightings,
