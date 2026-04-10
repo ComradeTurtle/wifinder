@@ -844,14 +844,18 @@ private fun GeneralStatusDetails(state: AppUiState) {
 @Composable
 private fun GpsStatusDetails(state: AppUiState) {
   val hdopText = if (state.gpsHdopCenti > 0) "%.2f".format(state.gpsHdopCenti / 100.0) else "-"
+  val vdopText = if (state.gpsVdopCenti > 0) "%.2f".format(state.gpsVdopCenti / 100.0) else "-"
   val pdopText = if (state.gpsPdopCenti > 0) "%.2f".format(state.gpsPdopCenti / 100.0) else "-"
-  val satText = if (state.gpsSatCount > 0) state.gpsSatCount.toString() else "-"
+  val satInUse = if (state.gpsSatInUse > 0) state.gpsSatInUse else state.gpsSatCount
+  val satUseText = if (satInUse > 0) satInUse.toString() else "-"
+  val satViewText = if (state.gpsSatInView > 0) state.gpsSatInView.toString() else "-"
+  val satText = if (satInUse > 0 && state.gpsSatInView > 0) "$satInUse/${state.gpsSatInView}" else satUseText
 
   Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
     KvRow(
       "ESP GPS",
       if (state.gpsValid) {
-        "${state.gpsAgeS}s old, ±${state.gpsAccuracyDm / 10.0}m, sats=$satText, PDOP=$pdopText, src=${gpsSourceLabel(state.gpsSource)}"
+        "${state.gpsAgeS}s old, ±${state.gpsAccuracyDm / 10.0}m, sats(use/view)=$satText, DOP(H/V/P)=$hdopText/$vdopText/$pdopText, src=${gpsSourceLabel(state.gpsSource)}"
       } else {
         "No fix"
       },
@@ -860,8 +864,10 @@ private fun GpsStatusDetails(state: AppUiState) {
     KvRow("ESP Valid", if (state.gpsValid) "Yes" else "No")
     KvRow("ESP Age", "${state.gpsAgeS}s")
     KvRow("ESP Accuracy", "±${state.gpsAccuracyDm / 10.0}m")
-    KvRow("ESP Satellites", satText)
+    KvRow("ESP Sats In Use", satUseText)
+    KvRow("ESP Sats In View", satViewText)
     KvRow("ESP HDOP", hdopText)
+    KvRow("ESP VDOP", vdopText)
     KvRow("ESP PDOP", pdopText)
     KvRow("Nav Rate Mode", gpsNavModeWithAppliedLabel(state.gpsNavMode, state.gpsNavAppliedHz))
     KvRow(

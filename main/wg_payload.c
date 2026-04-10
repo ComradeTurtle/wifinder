@@ -134,5 +134,8 @@ size_t wg_build_gps_payload(const wg_gps_payload_t *gps, uint8_t *out, size_t ou
   out[28] = gps->sat_count;
   wr_u16(&out[29], gps->hdop_centi);
   wr_u16(&out[31], gps->pdop_centi);
+  wr_u16(&out[33], gps->vdop_centi);
+  out[35] = gps->sat_in_use;
+  out[36] = gps->sat_in_view;
   return WG_GPS_PAYLOAD_SIZE;
 }

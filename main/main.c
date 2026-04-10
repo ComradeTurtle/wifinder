@@ -106,6 +106,7 @@ _Static_assert(WG_NODE_5GHZ_MASK_BIT_COUNT < 64, "WG_NODE_5GHZ_MASK_BIT_COUNT mu
 #define WG_GPS_PHONE_MAX_AGE_MS 5000
 #define WG_GPS_UART_ACCURACY_FALLBACK_CM 5000
 #define WG_GPS_GSV_FRESH_MS 5000
+#define WG_GPS_GN_PREFERRED_STALE_MS 4000
 #define WG_GPS_RATE_EVAL_MS 2000
 #define WG_GPS_RATE_SWITCH_MIN_MS 12000
 #define WG_GPS_RATE_SPEED_2HZ_UP_MMPS 3000
@@ -116,6 +117,18 @@ _Static_assert(WG_NODE_5GHZ_MASK_BIT_COUNT < 64, "WG_NODE_5GHZ_MASK_BIT_COUNT mu
 #define WG_GPS_NAV_MODE_1HZ 1
 #define WG_GPS_NAV_MODE_2HZ 2
 #define WG_GPS_NAV_MODE_4HZ 4
+#define WG_GPS_NMEA_LOG_RAW 0
+#define WG_UBX_CFG_LAYER_RAM 0x01
+#define WG_UBX_CFG_KEY_NMEA_PROTVER 0x20930001U
+#define WG_UBX_CFG_KEY_PM_OPERATEMODE 0x20D00001U
+#define WG_UBX_CFG_KEY_SIGNAL_GPS_ENA 0x1031001FU
+#define WG_UBX_CFG_KEY_SIGNAL_SBAS_ENA 0x10310020U
+#define WG_UBX_CFG_KEY_SIGNAL_GAL_ENA 0x10310021U
+#define WG_UBX_CFG_KEY_SIGNAL_BDS_ENA 0x10310022U
+#define WG_UBX_CFG_KEY_SIGNAL_QZSS_ENA 0x10310024U
+#define WG_UBX_CFG_KEY_SIGNAL_GLO_ENA 0x10310025U
+#define WG_UBX_CFG_PM_OPERATEMODE_FULL 0
+#define WG_UBX_CFG_NMEA_PROTVER_41 0x41
 
 #define WG_STORAGE_SPIFFS_BASE_PATH "/spiffs"
 #define WG_STORAGE_SD_BASE_PATH "/sdcard"
@@ -250,9 +263,12 @@ typedef struct {
   uint32_t bearing_mdeg;
   uint32_t unix_time_s;
   uint16_t accuracy_cm;
+  uint8_t sat_in_use;
+  uint8_t sat_in_view;
   uint8_t sat_count;
   uint16_t hdop_centi;
   uint16_t pdop_centi;
+  uint16_t vdop_centi;
   int64_t received_ms;
 } gps_fix_t;
 
@@ -378,8 +394,12 @@ static volatile uint32_t s_gps_rmc_reject_status = 0;
 static volatile uint32_t s_gps_rmc_reject_latlon = 0;
 static volatile int s_gps_last_fix_quality = -1;
 static volatile int s_gps_last_sats = -1;
+static volatile int s_gps_last_sats_in_view = -1;
 static volatile char s_gps_last_rmc_status = '?';
+static volatile int64_t s_gps_last_gsa_ms = 0;
 static volatile int64_t s_gps_last_gsv_ms = 0;
+static volatile int64_t s_gps_last_gn_gsa_ms = 0;
+static volatile int64_t s_gps_last_gn_gsv_ms = 0;
 static volatile int s_gps_uart_baud_active = WG_GPS_UART_BAUD;
 static volatile uint8_t s_gps_nav_rate_hz = 1;
 static volatile uint8_t s_gps_nav_mode = WG_GPS_NAV_MODE_AUTO;
@@ -3718,9 +3738,9 @@ static void log_bridge_diagnostics(bool force) {
            "diag gps src=%s valid=%d baud=%d nav_hz=%u nav_mode=%s uart_rx_bytes=%lu rx_age_ms=%lld "
            "fix_age_ms=%lld rate_age_ms=%lld "
            "lines=%lu gga=%lu rmc=%lu gsa=%lu gsv=%lu other=%lu fix_updates=%lu "
-           "unique_est=%lu lat=%ld lon=%ld acc_cm=%u sats=%u hdop=%.2f pdop=%.2f "
+           "unique_est=%lu lat=%ld lon=%ld acc_cm=%u sats=%u/%u hdop=%.2f vdop=%.2f pdop=%.2f "
            "gga_rej_latlon=%lu gga_rej_fix=%lu rmc_rej_status=%lu rmc_rej_latlon=%lu "
-           "last_fixq=%d last_sats=%d last_rmc=%c",
+           "last_fixq=%d last_sats_use=%d last_sats_view=%d last_rmc=%c",
            gps_source_name(s_gps_source), s_latest_gps.valid ? 1 : 0, s_gps_uart_baud_active,
            (unsigned)s_gps_nav_rate_hz, gps_nav_mode_name(s_gps_nav_mode),
            (unsigned long)s_gps_uart_rx_bytes,
@@ -3731,11 +3751,12 @@ static void log_bridge_diagnostics(bool force) {
            (unsigned long)s_gps_nmea_other,
            (unsigned long)s_gps_fix_updates, (unsigned long)s_unique_bssid_estimate,
            (long)s_latest_gps.lat_e7,
-           (long)s_latest_gps.lon_e7, s_latest_gps.accuracy_cm, (unsigned)s_latest_gps.sat_count,
-           (double)s_latest_gps.hdop_centi / 100.0, (double)s_latest_gps.pdop_centi / 100.0,
+           (long)s_latest_gps.lon_e7, s_latest_gps.accuracy_cm, (unsigned)s_latest_gps.sat_in_use,
+           (unsigned)s_latest_gps.sat_in_view, (double)s_latest_gps.hdop_centi / 100.0,
+           (double)s_latest_gps.vdop_centi / 100.0, (double)s_latest_gps.pdop_centi / 100.0,
            (unsigned long)s_gps_gga_reject_latlon, (unsigned long)s_gps_gga_reject_fix,
            (unsigned long)s_gps_rmc_reject_status, (unsigned long)s_gps_rmc_reject_latlon,
-           s_gps_last_fix_quality, s_gps_last_sats, s_gps_last_rmc_status);
+           s_gps_last_fix_quality, s_gps_last_sats, s_gps_last_sats_in_view, s_gps_last_rmc_status);
 
   const int64_t node_rx_age_ms =
       (s_node_status.last_rx_ms > 0) ? (ms - s_node_status.last_rx_ms) : -1;
@@ -3914,18 +3935,23 @@ static void apply_effective_gps_fix(const gps_fix_t *src, wg_gps_source_t source
     changed = !s_latest_gps.valid || s_gps_source != source ||
               s_latest_gps.lat_e7 != src->lat_e7 || s_latest_gps.lon_e7 != src->lon_e7 ||
               s_latest_gps.accuracy_cm != src->accuracy_cm ||
+              s_latest_gps.sat_in_use != src->sat_in_use ||
+              s_latest_gps.sat_in_view != src->sat_in_view ||
               s_latest_gps.sat_count != src->sat_count ||
               s_latest_gps.hdop_centi != src->hdop_centi ||
-              s_latest_gps.pdop_centi != src->pdop_centi;
+              s_latest_gps.pdop_centi != src->pdop_centi ||
+              s_latest_gps.vdop_centi != src->vdop_centi;
     s_latest_gps = *src;
     s_gps_source = source;
   }
   if (changed) {
     if (s_latest_gps.valid) {
-      ESP_LOGI(TAG, "GPS selected src=%s lat=%ld lon=%ld acc_cm=%u sats=%u hdop=%.2f pdop=%.2f age_ms=%lld",
+      ESP_LOGI(TAG,
+               "GPS selected src=%s lat=%ld lon=%ld acc_cm=%u sats=%u/%u hdop=%.2f vdop=%.2f pdop=%.2f age_ms=%lld",
                gps_source_name(s_gps_source), (long)s_latest_gps.lat_e7, (long)s_latest_gps.lon_e7,
-               s_latest_gps.accuracy_cm, (unsigned)s_latest_gps.sat_count,
-               (double)s_latest_gps.hdop_centi / 100.0, (double)s_latest_gps.pdop_centi / 100.0,
+               s_latest_gps.accuracy_cm, (unsigned)s_latest_gps.sat_in_use,
+               (unsigned)s_latest_gps.sat_in_view, (double)s_latest_gps.hdop_centi / 100.0,
+               (double)s_latest_gps.vdop_centi / 100.0, (double)s_latest_gps.pdop_centi / 100.0,
                (long long)(now_ms() - s_latest_gps.received_ms));
     } else if (prev_valid || prev_source != WG_GPS_SRC_NONE) {
       ESP_LOGW(TAG, "GPS lost (prev_src=%s)", gps_source_name(prev_source));
@@ -4000,6 +4026,25 @@ static uint16_t parse_nmea_dop_centi(const char *token) {
   return clamp_u16_u32((uint32_t)llround(dop * 100.0));
 }
 
+static bool nmea_sentence_has_type(const char *line, const char *type3) {
+  if (line == NULL || type3 == NULL) {
+    return false;
+  }
+  size_t len = strnlen(line, 16);
+  if (len < 6) {
+    return false;
+  }
+  return line[0] == '$' && strncmp(&line[3], type3, 3) == 0;
+}
+
+static bool nmea_sentence_is_gn_talker(const char *line) {
+  if (line == NULL) {
+    return false;
+  }
+  size_t len = strnlen(line, 8);
+  return len >= 3 && line[0] == '$' && line[1] == 'G' && line[2] == 'N';
+}
+
 static bool gps_send_ubx(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t payload_len) {
   if (payload_len > 64) {
     return false;
@@ -4071,6 +4116,38 @@ static bool gps_send_cfg_msg_nmea(uint8_t nmea_msg_id, uint8_t uart1_rate) {
       0x00, 0x00,         // SPI rate, reserved
   };
   return gps_send_ubx(0x06, 0x01, payload, sizeof(payload));
+}
+
+static bool gps_send_cfg_valset_u1(uint32_t key, uint8_t value) {
+  uint8_t payload[9] = {0};
+  payload[0] = 0x00;                  // version
+  payload[1] = WG_UBX_CFG_LAYER_RAM;  // layers (RAM)
+  payload[2] = 0x00;                  // transaction
+  payload[3] = 0x00;                  // reserved
+  wr_u32_le(&payload[4], key);
+  payload[8] = value;
+  return gps_send_ubx(0x06, 0x8A, payload, sizeof(payload));
+}
+
+static bool gps_apply_m9_profile(void) {
+  bool ok = true;
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_PM_OPERATEMODE, WG_UBX_CFG_PM_OPERATEMODE_FULL) &&
+       ok;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_NMEA_PROTVER, WG_UBX_CFG_NMEA_PROTVER_41) && ok;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_SIGNAL_GPS_ENA, 1) && ok;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_SIGNAL_GLO_ENA, 1) && ok;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_SIGNAL_GAL_ENA, 1) && ok;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_SIGNAL_BDS_ENA, 1) && ok;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_SIGNAL_QZSS_ENA, 1) && ok;
+  vTaskDelay(pdMS_TO_TICKS(20));
+  ok = gps_send_cfg_valset_u1(WG_UBX_CFG_KEY_SIGNAL_SBAS_ENA, 1) && ok;
+  return ok;
 }
 
 static bool gps_apply_nav_profile(uint8_t nav_rate_hz, bool include_static_msgs) {
@@ -4244,22 +4321,31 @@ static void parse_nmea_gga(char *line) {
   s_uart_gps.lat_e7 = lat_e7;
   s_uart_gps.lon_e7 = lon_e7;
   s_uart_gps.alt_mm = (int32_t)llround(alt_m * 1000.0);
+  uint32_t sat_u32 = sats > 0 ? (uint32_t)sats : 0U;
+  if (sat_u32 > UINT8_MAX) {
+    sat_u32 = UINT8_MAX;
+  }
+  uint8_t sat_fallback = (uint8_t)sat_u32;
   if (hdop < 0.3) {
     hdop = 0.3;
   }
   s_uart_gps.accuracy_cm = (uint16_t)clamp_u16_u32((uint32_t)llround(hdop * 500.0));
   int64_t now = now_ms();
+  bool gsa_fresh =
+      s_gps_last_gsa_ms > 0 && (now - s_gps_last_gsa_ms) >= 0 &&
+      (now - s_gps_last_gsa_ms) <= WG_GPS_GSV_FRESH_MS;
+  if (!gsa_fresh || s_uart_gps.sat_in_use == 0) {
+    s_uart_gps.sat_in_use = sat_fallback;
+  }
   bool gsv_fresh =
       s_gps_last_gsv_ms > 0 && (now - s_gps_last_gsv_ms) >= 0 &&
       (now - s_gps_last_gsv_ms) <= WG_GPS_GSV_FRESH_MS;
-  if (!gsv_fresh) {
-    uint32_t sat_u32 = sats > 0 ? (uint32_t)sats : 0U;
-    if (sat_u32 > UINT8_MAX) {
-      sat_u32 = UINT8_MAX;
-    }
-    s_uart_gps.sat_count = (uint8_t)sat_u32;
-    s_gps_last_sats = sats;
+  if (!gsv_fresh || s_uart_gps.sat_in_view == 0) {
+    s_uart_gps.sat_in_view = sat_fallback;
   }
+  s_uart_gps.sat_count = s_uart_gps.sat_in_use;
+  s_gps_last_sats = s_uart_gps.sat_in_use;
+  s_gps_last_sats_in_view = s_uart_gps.sat_in_view;
   s_uart_gps.hdop_centi = clamp_u16_u32((uint32_t)llround(hdop * 100.0));
   s_uart_gps.received_ms = now;
   s_gps_fix_updates++;
@@ -4268,22 +4354,40 @@ static void parse_nmea_gga(char *line) {
 
 static void parse_nmea_gsa(char *line) {
   char *save = NULL;
+  bool gn_talker = nmea_sentence_is_gn_talker(line);
   char *token = strtok_r(line, ",", &save);
   int idx = 0;
-  int fix_type = 1;
+  int sats_in_use = 0;
   uint16_t pdop_centi = 0;
   uint16_t hdop_centi = 0;
+  uint16_t vdop_centi = 0;
 
   while (token != NULL) {
     switch (idx) {
-      case 2:
-        fix_type = atoi(token);
+      case 3:
+      case 4:
+      case 5:
+      case 6:
+      case 7:
+      case 8:
+      case 9:
+      case 10:
+      case 11:
+      case 12:
+      case 13:
+      case 14:
+        if (token[0] != '\0') {
+          sats_in_use++;
+        }
         break;
       case 15:
         pdop_centi = parse_nmea_dop_centi(token);
         break;
       case 16:
         hdop_centi = parse_nmea_dop_centi(token);
+        break;
+      case 17:
+        vdop_centi = parse_nmea_dop_centi(token);
         break;
       default:
         break;
@@ -4298,14 +4402,33 @@ static void parse_nmea_gsa(char *line) {
   if (pdop_centi > 0) {
     s_uart_gps.pdop_centi = pdop_centi;
   }
-  if (fix_type <= 1 && s_uart_gps.valid) {
-    s_uart_gps.valid = false;
-    recompute_effective_gps_fix();
+  if (vdop_centi > 0) {
+    s_uart_gps.vdop_centi = vdop_centi;
+  }
+
+  if (sats_in_use > 0) {
+    uint32_t sat_u32 = (uint32_t)sats_in_use;
+    if (sat_u32 > UINT8_MAX) {
+      sat_u32 = UINT8_MAX;
+    }
+    int64_t now = now_ms();
+    bool gn_recent = s_gps_last_gn_gsa_ms > 0 && (now - s_gps_last_gn_gsa_ms) >= 0 &&
+                     (now - s_gps_last_gn_gsa_ms) <= WG_GPS_GN_PREFERRED_STALE_MS;
+    if (gn_talker || !gn_recent) {
+      s_uart_gps.sat_in_use = (uint8_t)sat_u32;
+      s_uart_gps.sat_count = s_uart_gps.sat_in_use;
+      s_gps_last_sats = s_uart_gps.sat_in_use;
+      s_gps_last_gsa_ms = now;
+      if (gn_talker) {
+        s_gps_last_gn_gsa_ms = now;
+      }
+    }
   }
 }
 
 static void parse_nmea_gsv(char *line) {
   char *save = NULL;
+  bool gn_talker = nmea_sentence_is_gn_talker(line);
   char *token = strtok_r(line, ",", &save);
   int idx = 0;
   int sats_visible = -1;
@@ -4327,10 +4450,17 @@ static void parse_nmea_gsv(char *line) {
   if (sat_u32 > UINT8_MAX) {
     sat_u32 = UINT8_MAX;
   }
-  s_uart_gps.sat_count = (uint8_t)sat_u32;
-  s_gps_last_sats = sats_visible;
-  s_gps_last_gsv_ms = now_ms();
-  recompute_effective_gps_fix();
+  int64_t now = now_ms();
+  bool gn_recent = s_gps_last_gn_gsv_ms > 0 && (now - s_gps_last_gn_gsv_ms) >= 0 &&
+                   (now - s_gps_last_gn_gsv_ms) <= WG_GPS_GN_PREFERRED_STALE_MS;
+  if (gn_talker || !gn_recent) {
+    s_uart_gps.sat_in_view = (uint8_t)sat_u32;
+    s_gps_last_sats_in_view = sats_visible;
+    s_gps_last_gsv_ms = now;
+    if (gn_talker) {
+      s_gps_last_gn_gsv_ms = now;
+    }
+  }
 }
 
 static void parse_nmea_rmc(char *line) {
@@ -4416,6 +4546,9 @@ static void process_nmea_line(const char *line) {
   if (line == NULL || line[0] != '$') {
     return;
   }
+#if WG_GPS_NMEA_LOG_RAW
+  ESP_LOGI(TAG, "GPS NMEA %s", line);
+#endif
   s_gps_nmea_lines_total++;
   char copy[128] = {0};
   size_t n = strnlen(line, sizeof(copy) - 1);
@@ -4425,16 +4558,16 @@ static void process_nmea_line(const char *line) {
   if (star != NULL) {
     *star = '\0';
   }
-  if (strstr(copy, "GGA") != NULL) {
+  if (nmea_sentence_has_type(copy, "GGA")) {
     s_gps_nmea_gga++;
     parse_nmea_gga(copy);
-  } else if (strstr(copy, "RMC") != NULL) {
+  } else if (nmea_sentence_has_type(copy, "RMC")) {
     s_gps_nmea_rmc++;
     parse_nmea_rmc(copy);
-  } else if (strstr(copy, "GSA") != NULL) {
+  } else if (nmea_sentence_has_type(copy, "GSA")) {
     s_gps_nmea_gsa++;
     parse_nmea_gsa(copy);
-  } else if (strstr(copy, "GSV") != NULL) {
+  } else if (nmea_sentence_has_type(copy, "GSV")) {
     s_gps_nmea_gsv++;
     parse_nmea_gsv(copy);
   } else {
@@ -4484,6 +4617,11 @@ static void gps_uart_task(void *arg) {
   } else {
     s_gps_last_rate_change_ms = now_ms();
     ESP_LOGW(TAG, "GPS nav profile setup incomplete");
+  }
+  if (gps_apply_m9_profile()) {
+    ESP_LOGI(TAG, "GPS M9 profile configured: PSM off + multi-GNSS enabled");
+  } else {
+    ESP_LOGW(TAG, "GPS M9 profile setup incomplete");
   }
 
   int64_t last_rate_eval_ms = now_ms();
@@ -5716,9 +5854,12 @@ static bool notify_gps_frame(void) {
       .bearing_mdeg = s_latest_gps.bearing_mdeg,
       .unix_time_s = s_latest_gps.unix_time_s,
       .accuracy_cm = s_latest_gps.accuracy_cm,
+      .sat_in_use = s_latest_gps.sat_in_use,
+      .sat_in_view = s_latest_gps.sat_in_view,
       .sat_count = s_latest_gps.sat_count,
       .hdop_centi = s_latest_gps.hdop_centi,
       .pdop_centi = s_latest_gps.pdop_centi,
+      .vdop_centi = s_latest_gps.vdop_centi,
   };
   uint8_t bytes[WG_GPS_PAYLOAD_SIZE] = {0};
   const size_t len = wg_build_gps_payload(&payload, bytes, sizeof(bytes));
@@ -6277,9 +6418,12 @@ static uint8_t apply_command(const wg_command_t *cmd) {
           (cmd->gps_flags & WG_GPS_FLAG_HAS_BEARING) ? cmd->gps_bearing_mdeg : 0;
       s_phone_gps.unix_time_s = cmd->gps_unix_time_s;
       s_phone_gps.accuracy_cm = cmd->gps_accuracy_cm;
+      s_phone_gps.sat_in_use = 0;
+      s_phone_gps.sat_in_view = 0;
       s_phone_gps.sat_count = 0;
       s_phone_gps.hdop_centi = 0;
       s_phone_gps.pdop_centi = 0;
+      s_phone_gps.vdop_centi = 0;
       s_phone_gps.received_ms = now_ms();
       recompute_effective_gps_fix();
       node_send_config();

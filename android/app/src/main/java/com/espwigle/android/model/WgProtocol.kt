@@ -226,6 +226,9 @@ object WgProtocol {
     val satCount = if (payload.size >= 29) payload[28].toInt() and 0xFF else 0
     val hdopCenti = if (payload.size >= 31) bb.getShort(29).toInt() and 0xFFFF else 0
     val pdopCenti = if (payload.size >= 33) bb.getShort(31).toInt() and 0xFFFF else 0
+    val vdopCenti = if (payload.size >= 35) bb.getShort(33).toInt() and 0xFFFF else 0
+    val satInUse = if (payload.size >= 36) payload[35].toInt() and 0xFF else satCount
+    val satInView = if (payload.size >= 37) payload[36].toInt() and 0xFF else 0
     return EspGpsPayload(
       valid = valid,
       source = source,
@@ -237,8 +240,11 @@ object WgProtocol {
       unixTimeS = unixTimeS,
       accuracyCm = accuracyCm,
       satCount = satCount,
+      satInUse = satInUse,
+      satInView = satInView,
       hdopCenti = hdopCenti,
       pdopCenti = pdopCenti,
+      vdopCenti = vdopCenti,
     )
   }
 
@@ -564,8 +570,11 @@ data class EspGpsPayload(
   val unixTimeS: Int,
   val accuracyCm: Int,
   val satCount: Int,
+  val satInUse: Int,
+  val satInView: Int,
   val hdopCenti: Int,
   val pdopCenti: Int,
+  val vdopCenti: Int,
 )
 
 data class BacklogBlobMetaPayload(

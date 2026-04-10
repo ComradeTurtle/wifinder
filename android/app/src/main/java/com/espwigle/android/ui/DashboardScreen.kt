@@ -418,11 +418,19 @@ private fun gpsSourceLabel(source: Int): String = when (source) {
 
 @Composable
 private fun GpsDetailRow(state: AppUiState, modifier: Modifier = Modifier) {
+  val hdopText = if (state.gpsHdopCenti > 0) "%.2f".format(state.gpsHdopCenti / 100.0) else "—"
+  val vdopText = if (state.gpsVdopCenti > 0) "%.2f".format(state.gpsVdopCenti / 100.0) else "—"
   val pdopText = if (state.gpsPdopCenti > 0) "%.2f".format(state.gpsPdopCenti / 100.0) else "—"
-  val satText = if (state.gpsSatCount > 0) state.gpsSatCount.toString() else "—"
+  val satInUse = if (state.gpsSatInUse > 0) state.gpsSatInUse else state.gpsSatCount
+  val satText = when {
+    satInUse > 0 && state.gpsSatInView > 0 -> "$satInUse/${state.gpsSatInView}"
+    satInUse > 0 -> satInUse.toString()
+    else -> "—"
+  }
   val accText = if (state.gpsValid) "±${"%.1f".format(state.gpsAccuracyDm / 10.0)}m" else "—"
   val ageText = if (state.gpsValid) "${state.gpsAgeS}s" else "—"
   val rateText = "${if (state.gpsNavAppliedHz > 0) state.gpsNavAppliedHz else 1} Hz"
+  val dopText = "$hdopText/$vdopText/$pdopText"
 
   Row(
     modifier = modifier
@@ -432,8 +440,8 @@ private fun GpsDetailRow(state: AppUiState, modifier: Modifier = Modifier) {
     horizontalArrangement = Arrangement.SpaceEvenly,
     verticalAlignment = Alignment.CenterVertically,
   ) {
-    GpsMini(value = pdopText, label = "PDOP", color = pdopColor(state.gpsPdopCenti))
-    GpsMini(value = satText, label = "Sats", color = BrightLabel)
+    GpsMini(value = dopText, label = "H/V/P", color = pdopColor(state.gpsPdopCenti))
+    GpsMini(value = satText, label = "Use/View", color = BrightLabel)
     GpsMini(value = accText, label = "Acc", color = BrightLabel)
     GpsMini(
       value = gpsSourceLabel(state.gpsSource),

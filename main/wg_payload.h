@@ -124,13 +124,16 @@ typedef struct {
   uint32_t bearing_mdeg;
   uint32_t unix_time_s;
   uint16_t accuracy_cm;
+  uint8_t sat_in_use;
+  uint8_t sat_in_view;
   uint8_t sat_count;
   uint16_t hdop_centi;
   uint16_t pdop_centi;
+  uint16_t vdop_centi;
 } wg_gps_payload_t;
 
 #define WG_STATUS_PAYLOAD_SIZE 129
-#define WG_GPS_PAYLOAD_SIZE 33
+#define WG_GPS_PAYLOAD_SIZE 37
 
 size_t wg_build_status_payload(const wg_status_payload_t *status, uint8_t *out, size_t out_size);
 size_t wg_build_sighting_payload(const wg_sighting_payload_t *sighting, uint8_t *out,

@@ -75,8 +75,11 @@ data class ServiceState(
   val gpsAgeS: Int = 0,
   val gpsAccuracyDm: Int = 0,
   val gpsSatCount: Int = 0,
+  val gpsSatInUse: Int = 0,
+  val gpsSatInView: Int = 0,
   val gpsHdopCenti: Int = 0,
   val gpsPdopCenti: Int = 0,
+  val gpsVdopCenti: Int = 0,
   val nodeLinkUp: Boolean = false,
   val nodeLastSeenS: Int = 0,
   val nodePacketsPerSec: Int = 0,
@@ -826,8 +829,11 @@ class ScannerService : Service(), EspBleClient.Listener {
         gpsAgeS = if (!connected) 0 else current.gpsAgeS,
         gpsAccuracyDm = if (!connected) 0 else current.gpsAccuracyDm,
         gpsSatCount = if (!connected) 0 else current.gpsSatCount,
+        gpsSatInUse = if (!connected) 0 else current.gpsSatInUse,
+        gpsSatInView = if (!connected) 0 else current.gpsSatInView,
         gpsHdopCenti = if (!connected) 0 else current.gpsHdopCenti,
         gpsPdopCenti = if (!connected) 0 else current.gpsPdopCenti,
+        gpsVdopCenti = if (!connected) 0 else current.gpsVdopCenti,
         nodeLinkUp = if (!connected) false else current.nodeLinkUp,
         nodeLastSeenS = if (!connected) 0 else current.nodeLastSeenS,
         nodePacketsPerSec = if (!connected) 0 else current.nodePacketsPerSec,
@@ -1028,9 +1034,12 @@ class ScannerService : Service(), EspBleClient.Listener {
     _state.update { current ->
       current.copy(
         gpsSource = gps.source,
-        gpsSatCount = gps.satCount,
+        gpsSatCount = if (gps.satInUse > 0) gps.satInUse else gps.satCount,
+        gpsSatInUse = gps.satInUse,
+        gpsSatInView = gps.satInView,
         gpsHdopCenti = gps.hdopCenti,
         gpsPdopCenti = gps.pdopCenti,
+        gpsVdopCenti = gps.vdopCenti,
       )
     }
 
@@ -1041,7 +1050,7 @@ class ScannerService : Service(), EspBleClient.Listener {
           sample = sample,
           altitudeMeters = gps.altMm / 1000.0,
           hdop = if (gps.hdopCenti > 0) gps.hdopCenti / 100.0 else null,
-          satCount = gps.satCount.takeIf { it > 0 },
+          satCount = gps.satInUse.takeIf { it > 0 } ?: gps.satCount.takeIf { it > 0 },
         )
       }
     }

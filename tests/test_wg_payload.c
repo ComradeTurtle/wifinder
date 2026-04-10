@@ -210,6 +210,9 @@ static void test_gps_payload_encoding(void) {
       .sat_count = 11,
       .hdop_centi = 92,
       .pdop_centi = 146,
+      .vdop_centi = 173,
+      .sat_in_use = 11,
+      .sat_in_view = 29,
   };
 
   uint8_t out[WG_GPS_PAYLOAD_SIZE] = {0};
@@ -227,6 +230,9 @@ static void test_gps_payload_encoding(void) {
   assert_u8(out[28], gps.sat_count, "gps sat_count should encode");
   assert_u16(rd_u16(&out[29]), gps.hdop_centi, "gps hdop should encode");
   assert_u16(rd_u16(&out[31]), gps.pdop_centi, "gps pdop should encode");
+  assert_u16(rd_u16(&out[33]), gps.vdop_centi, "gps vdop should encode");
+  assert_u8(out[35], gps.sat_in_use, "gps sat_in_use should encode");
+  assert_u8(out[36], gps.sat_in_view, "gps sat_in_view should encode");
 }
 
 int main(void) {

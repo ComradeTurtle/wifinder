@@ -329,6 +329,10 @@ class WgProtocolTest {
       0x00,
       0x92.toByte(),
       0x00,
+      0xAD.toByte(),
+      0x00,
+      11,
+      29,
     )
 
     val gps = WgProtocol.decodeGpsPayload(payload)
@@ -343,8 +347,59 @@ class WgProtocolTest {
     assertEquals(1700000128, gps.unixTimeS)
     assertEquals(250, gps.accuracyCm)
     assertEquals(11, gps.satCount)
+    assertEquals(11, gps.satInUse)
+    assertEquals(29, gps.satInView)
     assertEquals(92, gps.hdopCenti)
     assertEquals(146, gps.pdopCenti)
+    assertEquals(173, gps.vdopCenti)
+  }
+
+  @Test
+  fun `decode gps payload keeps backward compatibility for legacy frames`() {
+    val payload = byteArrayOf(
+      1,
+      1,
+      0x10,
+      0x27,
+      0x4F,
+      0x16,
+      0xD2.toByte(),
+      0x04,
+      0x56,
+      0xB7.toByte(),
+      0x39,
+      0x30,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      0xFA.toByte(),
+      0x00,
+      7,
+      0x50,
+      0x00,
+      0x60,
+      0x00,
+    )
+
+    val gps = WgProtocol.decodeGpsPayload(payload)
+
+    assertEquals(7, gps.satCount)
+    assertEquals(7, gps.satInUse)
+    assertEquals(0, gps.satInView)
+    assertEquals(80, gps.hdopCenti)
+    assertEquals(96, gps.pdopCenti)
+    assertEquals(0, gps.vdopCenti)
   }
 
   @Test
