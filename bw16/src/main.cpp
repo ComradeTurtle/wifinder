@@ -18,7 +18,7 @@ constexpr uint8_t WG_NODE_FRAME_HEADER_SIZE = 10;
 constexpr uint16_t WG_NODE_FRAME_MAX_PAYLOAD = 96;
 
 constexpr uint16_t WG_DEFAULT_CHANNEL_MASK = 0x1FFF;
-constexpr uint8_t WG_NODE_5GHZ_MASK_BIT_COUNT = 43;
+constexpr uint8_t WG_NODE_5GHZ_MASK_BIT_COUNT = 25;
 constexpr uint64_t WG_NODE_5GHZ_MASK_ALL = (1ULL << WG_NODE_5GHZ_MASK_BIT_COUNT) - 1ULL;
 constexpr uint16_t WG_DEFAULT_HOP_MS = 250;
 constexpr uint16_t WG_MIN_HOP_MS = 50;
@@ -36,6 +36,10 @@ constexpr uint16_t WG_QUEUE_SCAN_BACKPRESSURE_HIGH = (WG_QUEUE_CAPACITY * 3U) / 
 constexpr uint16_t WG_QUEUE_SCAN_BACKPRESSURE_LOW = WG_QUEUE_CAPACITY / 2U;
 
 constexpr uint32_t WG_UART_BAUD = 115200;
+constexpr uint8_t WG_NODE_5GHZ_PRIMARY_CHANNELS[WG_NODE_5GHZ_MASK_BIT_COUNT] = {
+    36,  40,  44,  48,  52,  56,  60,  64,  100, 104, 108, 112, 116,
+    120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+};
 
 enum : uint8_t {
   WG_NODE_MSG_HELLO = 0x01,
@@ -206,14 +210,10 @@ bool channel_mask_24_format_is_valid(uint16_t mask) { return (mask & (uint16_t)(
 bool channel_mask_5ghz_is_valid(uint64_t mask) { return (mask & ~WG_NODE_5GHZ_MASK_ALL) == 0ULL; }
 
 int8_t channel_to_5ghz_bit(uint8_t channel) {
-  if (channel >= 32 && channel <= 176 && ((channel - 32U) % 4U) == 0U) {
-    return (int8_t)((channel - 32U) / 4U);
-  }
-  if (channel == 177) {
-    return 37;
-  }
-  if (channel >= 182 && channel <= 196 && ((channel - 182U) % 4U) == 0U) {
-    return (int8_t)(38 + ((channel - 182U) / 4U));
+  for (uint8_t i = 0; i < WG_NODE_5GHZ_MASK_BIT_COUNT; ++i) {
+    if (WG_NODE_5GHZ_PRIMARY_CHANNELS[i] == channel) {
+      return (int8_t)i;
+    }
   }
   return -1;
 }
@@ -228,7 +228,7 @@ bool channel_allowed(uint8_t channel) {
       const uint16_t bit = (uint16_t)(1U << (channel - 1));
       return (s_channel_mask & bit) != 0;
     }
-    return true;
+    return false;
   }
   if (is_5ghz_channel(channel)) {
     const int8_t bit = channel_to_5ghz_bit(channel);
@@ -238,6 +238,24 @@ bool channel_allowed(uint8_t channel) {
     return ((s_channel_mask_5ghz >> bit) & 1ULL) != 0ULL;
   }
   return false;
+}
+
+uint8_t build_scan_channel_list(uint8_t *out, uint8_t max_len) {
+  if (out == nullptr || max_len == 0) {
+    return 0;
+  }
+  uint8_t count = 0;
+  for (uint8_t ch = 1; ch <= 13 && count < max_len; ++ch) {
+    if ((s_channel_mask & (uint16_t)(1U << (ch - 1U))) != 0U) {
+      out[count++] = ch;
+    }
+  }
+  for (uint8_t bit = 0; bit < WG_NODE_5GHZ_MASK_BIT_COUNT && count < max_len; ++bit) {
+    if (((s_channel_mask_5ghz >> bit) & 1ULL) != 0ULL) {
+      out[count++] = WG_NODE_5GHZ_PRIMARY_CHANNELS[bit];
+    }
+  }
+  return count;
 }
 
 uint8_t pick_first_channel(uint16_t mask) {
@@ -937,11 +955,27 @@ void process_scan_buf_entry(const uint8_t *entry, uint8_t len, uint32_t ts_ms) {
 
 void run_scan_once(uint32_t now_ms) {
   static uint8_t scan_buf_mem[WG_SCAN_BUF_LEN] = {0};
+  uint8_t scan_channels[13 + WG_NODE_5GHZ_MASK_BIT_COUNT] = {0};
+  uint8_t pscan_cfg[13 + WG_NODE_5GHZ_MASK_BIT_COUNT] = {0};
   scan_buf_arg scan_buf = {
       .buf = reinterpret_cast<char *>(scan_buf_mem),
       .buf_len = WG_SCAN_BUF_LEN,
   };
   memset(scan_buf_mem, 0, sizeof(scan_buf_mem));
+
+  const uint8_t scan_count =
+      build_scan_channel_list(scan_channels, (uint8_t)(sizeof(scan_channels) / sizeof(scan_channels[0])));
+  if (scan_count == 0) {
+    s_next_scan_earliest_ms = now_ms + WG_SCAN_RETRY_BACKOFF_MS;
+    return;
+  }
+  for (uint8_t i = 0; i < scan_count; ++i) {
+    pscan_cfg[i] = PSCAN_ENABLE;
+  }
+  if (wifi_set_pscan_chan(scan_channels, pscan_cfg, scan_count) < 0) {
+    s_next_scan_earliest_ms = now_ms + WG_SCAN_RETRY_BACKOFF_MS;
+    return;
+  }
 
   s_scan_ts_ms = now_ms;
   s_current_channel = 0;

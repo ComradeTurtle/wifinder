@@ -1,0 +1,2 @@
+"""WIFINDER desktop client package."""
+

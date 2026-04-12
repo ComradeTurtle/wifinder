@@ -14,5 +14,5 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "espwigle-android"
+rootProject.name = "wifinder-android"
 include(":app")

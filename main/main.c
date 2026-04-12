@@ -64,18 +64,18 @@
 extern void ble_store_config_init(void);
 
 #if CONFIG_IDF_TARGET_ESP32C6
-#define WG_DEVICE_NAME "ESPWIGLE-C6"
-#define WG_DEVICE_INFO_TEXT "ESPWIGLE-C6 FW1"
+#define WG_DEVICE_NAME "WIFINDER-C6"
+#define WG_DEVICE_INFO_TEXT "WIFINDER-C6 FW1"
 #else
-#define WG_DEVICE_NAME "ESPWIGLE-S3"
-#define WG_DEVICE_INFO_TEXT "ESPWIGLE-S3 FW1"
+#define WG_DEVICE_NAME "WIFINDER-S3"
+#define WG_DEVICE_INFO_TEXT "WIFINDER-S3 FW1"
 #endif
 
 #define WG_DEFAULT_HOP_MS 250
 #define WG_MIN_HOP_MS 50
 #define WG_MAX_HOP_MS 2000
 #define WG_DEFAULT_CHANNEL_MASK 0x1FFFU
-#define WG_NODE_5GHZ_MASK_BIT_COUNT 43U
+#define WG_NODE_5GHZ_MASK_BIT_COUNT 25U
 #define WG_NODE_5GHZ_MASK_ALL ((1ULL << WG_NODE_5GHZ_MASK_BIT_COUNT) - 1ULL)
 #define WG_SIGHTING_NOTIFY_INTERVAL_MS 5000
 #define WG_SEEN_CAPACITY 512
@@ -346,7 +346,7 @@ typedef struct __attribute__((packed)) {
   uint32_t crc32;
 } wg_session_manifest_t;
 
-static const char *TAG = "espwigle";
+static const char *TAG = "wifinder";
 
 static ap_entry_t s_seen[WG_SEEN_CAPACITY];
 static uint8_t s_unique_hll_regs[WG_UNIQUE_HLL_REGISTERS] = {0};
@@ -1528,7 +1528,7 @@ static bool storage_open_gpx_session_locked(uint64_t session_id) {
 
   int n = fprintf(fp,
                   "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                  "<gpx version=\"1.1\" creator=\"espwigle\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n"
+                  "<gpx version=\"1.1\" creator=\"wifinder\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n"
                   "<trk><name>session-%016llX</name><trkseg>\n",
                   (unsigned long long)session_id);
   if (n <= 0 || !storage_commit_file(fp, "gpx header", session_id)) {
@@ -6165,7 +6165,7 @@ out:
 
 static void save_runtime_config(void) {
   nvs_handle_t h = 0;
-  if (nvs_open("espwigle", NVS_READWRITE, &h) != ESP_OK) {
+  if (nvs_open("wifinder", NVS_READWRITE, &h) != ESP_OK) {
     ESP_LOGW(TAG, "nvs open failed for save");
     return;
   }
@@ -6187,7 +6187,7 @@ static void load_runtime_config(void) {
   split_channel_mask(s_channel_mask, &s_local_channel_mask, &s_node_channel_mask);
 
   nvs_handle_t h = 0;
-  if (nvs_open("espwigle", NVS_READONLY, &h) != ESP_OK) {
+  if (nvs_open("wifinder", NVS_READONLY, &h) != ESP_OK) {
     apply_channel_plan(s_local_channel_mask, s_node_channel_mask, s_node_channel_mask_5ghz);
     return;
   }

@@ -97,7 +97,7 @@ except Exception:
     print("Install with: python3 -m pip install --user pyserial", file=sys.stderr)
     sys.exit(3)
 
-from desktop.espwigle_desktop.protocol import (  # type: ignore
+from desktop.wifinder_desktop.protocol import (  # type: ignore
     COMMANDS,
     FRAME_HEADER_SIZE,
     MAGIC0,

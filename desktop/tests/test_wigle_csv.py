@@ -7,12 +7,12 @@ _DESKTOP_ROOT = Path(__file__).resolve().parents[1]
 if str(_DESKTOP_ROOT) not in sys.path:
     sys.path.insert(0, str(_DESKTOP_ROOT))
 
-from espwigle_desktop.wigle_csv import WigleCsvFormatter, WigleCsvLogger, WigleWifiRow
+from wifinder_desktop.wigle_csv import WigleCsvFormatter, WigleCsvLogger, WigleWifiRow
 
 
 class WigleCsvTests(unittest.TestCase):
     def test_header_and_auth_format(self) -> None:
-        header = WigleCsvFormatter.header(app_release="espwigle-desktop-1")
+        header = WigleCsvFormatter.header(app_release="wifinder-desktop-1")
         self.assertEqual(len(header), 2)
         self.assertTrue(header[0].startswith("WigleWifi-1.6"))
         self.assertEqual(
@@ -28,7 +28,7 @@ class WigleCsvTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "wigle-test.csv"
             logger = WigleCsvLogger()
-            logger.start_session(path, app_release="espwigle-desktop-1")
+            logger.start_session(path, app_release="wifinder-desktop-1")
             row = WigleWifiRow(
                 mac="40:ED:00:25:E0:02",
                 ssid="Red Dragon",

@@ -1,4 +1,4 @@
-menu "ESPWIGLE"
+menu "WIFINDER"
 
 config WG_RGB_LED_ENABLE
     bool "Enable RGB status LED"

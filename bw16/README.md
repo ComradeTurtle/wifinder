@@ -32,5 +32,7 @@ Optional:
 ## Notes
 
 - Node UART baud: `115200`
-- The existing 16-bit channel mask controls 2.4 GHz channels (`1..13`) only.
-- 5 GHz sightings are always forwarded by BW16 for compatibility with the current protocol.
+- 2.4 GHz mask controls channels `1..13`.
+- 5 GHz mask controls only primary 20 MHz channels:
+  `36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165`.
+- BW16 applies both masks at scan source via partial-scan channel lists (not post-filter only).

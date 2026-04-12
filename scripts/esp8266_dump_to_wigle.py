@@ -280,14 +280,14 @@ def format_auth_mode_wigle(label: str) -> str:
     return "".join(f"[{c}]" for c in unique) + "[ESS]"
 
 
-def wigle_preheader(app_release: str = "espwigle-esp8266-v1") -> str:
+def wigle_preheader(app_release: str = "wifinder-esp8266-v1") -> str:
     fields = [
         "WigleWifi-1.6",
         f"appRelease={app_release}",
         "model=ESP8266",
         "release=standalone",
         "device=nodemcu-v3",
-        "display=espwigle",
+        "display=wifinder",
         "board=esp-12e",
         "brand=espressif",
         "star=Sol",
@@ -304,7 +304,7 @@ def format_time_utc(unix_s: int) -> str:
     return dt.datetime.fromtimestamp(unix_s, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def records_to_wigle_csv(records: list[SightingRecord], app_release: str = "espwigle-esp8266-v1") -> str:
+def records_to_wigle_csv(records: list[SightingRecord], app_release: str = "wifinder-esp8266-v1") -> str:
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\n")
     writer.writerow(wigle_preheader(app_release).split(","))

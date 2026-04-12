@@ -1,4 +1,4 @@
-# espwigle (ESP32 scanner + Web/Android/Desktop clients)
+# wifinder (ESP32 scanner + Web/Android/Desktop clients)
 
 This project runs a BLE-controlled Wi-Fi wardriving scanner stack centered on
 an `ESP32-C6` master (optionally with an `ESP8266` or `BW16` wired slave node), with:
@@ -87,7 +87,7 @@ In the app:
   frame-only mode (ESP logs are suppressed on that stream to avoid protocol noise)
 
 CSV output path on PC:
-- `~/Downloads/espwigle/wigle-YYYYMMDD-HHMMSS.csv`
+- `~/Downloads/wifinder/wigle-YYYYMMDD-HHMMSS.csv`
 
 ## Android app (BLE + GPS + CSV)
 
@@ -121,13 +121,13 @@ GRADLE_USER_HOME=/tmp/gradle-home ./android/gradlew -p android installDebug
 
 CSV output path on phone:
 - public Downloads subfolder:
-  - `Downloads/espwigle/wigle-YYYYMMDD-HHMMSS.csv`
+  - `Downloads/wifinder/wigle-YYYYMMDD-HHMMSS.csv`
 
 ## Wireshark protocol decoding
 
-You can decode ESPWIGLE frames in BLE ATT traffic with the Lua post-dissector:
+You can decode WIFINDER frames in BLE ATT traffic with the Lua post-dissector:
 
-- Script path: `tools/wireshark/espwigle.lua`
+- Script path: `tools/wireshark/wifinder.lua`
 - It parses WG frame headers and payloads for:
   - `STATUS`, `SIGHTING`, `ACK`, `ERROR`, `SNAPSHOT_END`, `CONFIG`, `GPS`, `REPLAY_ACK`, `NODE_TABLE`, `COMMAND`
 
@@ -135,12 +135,12 @@ Install:
 
 ```bash
 mkdir -p ~/.local/lib/wireshark/plugins
-cp tools/wireshark/espwigle.lua ~/.local/lib/wireshark/plugins/
+cp tools/wireshark/wifinder.lua ~/.local/lib/wireshark/plugins/
 ```
 
 Then restart Wireshark and filter as usual (for example `btatt`).  
 Any ATT value beginning with WG magic (`57 47`) is decoded under a new
-`ESPWIGLE Frame` tree and tagged in the packet Info column.
+`WIFINDER Frame` tree and tagged in the packet Info column.
 
 ## Tests
 

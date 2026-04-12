@@ -1,4 +1,4 @@
-from espwigle_desktop.app import run
+from wifinder_desktop.app import run
 
 
 if __name__ == "__main__":

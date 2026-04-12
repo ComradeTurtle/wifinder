@@ -6,7 +6,7 @@ _DESKTOP_ROOT = Path(__file__).resolve().parents[1]
 if str(_DESKTOP_ROOT) not in sys.path:
     sys.path.insert(0, str(_DESKTOP_ROOT))
 
-from espwigle_desktop.state import ConsoleState
+from wifinder_desktop.state import ConsoleState
 
 
 class StateTests(unittest.TestCase):

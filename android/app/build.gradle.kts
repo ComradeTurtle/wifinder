@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-  namespace = "com.espwigle.android"
+  namespace = "com.wifinder.android"
   compileSdk = 34
 
   defaultConfig {
-    applicationId = "com.espwigle.android"
+    applicationId = "com.wifinder.android"
     minSdk = 26
     targetSdk = 34
     versionCode = 1

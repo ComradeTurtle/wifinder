@@ -1,6 +1,6 @@
 import "./styles.css";
 
-import { EspWigleBleClient } from "./ble";
+import { WiFinderBleClient } from "./ble";
 import { decodeSightingPayload, decodeStatusPayload, MESSAGE_TYPES } from "./protocol";
 import { applySighting, createState, pruneSightings, summarizeState, toRows } from "./state";
 
@@ -194,7 +194,7 @@ function setupUI() {
 <main class="layout">
   <header class="hero">
     <div>
-      <h1>ESPWIGLE Console</h1>
+      <h1>WIFINDER Console</h1>
       <p>BLE control + live wardriving telemetry</p>
     </div>
     <button id="connectBtn" class="accent">Connect</button>
@@ -299,7 +299,7 @@ renderStatus();
 renderTable();
 renderOps();
 
-const client = new EspWigleBleClient({
+const client = new WiFinderBleClient({
   onFrame: (frame) => {
     if (frame.type === MESSAGE_TYPES.STATUS) {
       const payload = decodeStatusPayload(frame.payload);

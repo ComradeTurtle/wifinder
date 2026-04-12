@@ -29,7 +29,7 @@ export type BleCallbacks = {
   onInfo: (message: string) => void;
 };
 
-export class EspWigleBleClient {
+export class WiFinderBleClient {
   private device: BluetoothDevice | null = null;
   private server: BluetoothRemoteGATTServer | null = null;
   private controlChar: BluetoothRemoteGATTCharacteristic | null = null;
@@ -131,7 +131,7 @@ export class EspWigleBleClient {
     if (!("bluetooth" in navigator) || !navigator.bluetooth.getDevices) return false;
     const devices = await navigator.bluetooth.getDevices();
     const match = devices.find(
-      (d) => d.name?.includes("ESPWIGLE") || d.name?.includes("WIGLE")
+      (d) => d.name?.includes("WIFINDER") || d.name?.includes("WIGLE")
     );
     if (!match) return false;
     await this.establishConnection(match);
@@ -142,7 +142,7 @@ export class EspWigleBleClient {
     const device = await navigator.bluetooth.requestDevice({
       // Linux/BlueZ can be unreliable with strict 128-bit service filters during scan.
       // Name-prefix matching keeps the chooser targeted while remaining more compatible.
-      filters: [{ namePrefix: "ESPWIGLE" }, { namePrefix: "ESP" }, { services: [UUIDS.service] }],
+      filters: [{ namePrefix: "WIFINDER" }, { namePrefix: "ESP" }, { services: [UUIDS.service] }],
       optionalServices: [UUIDS.service],
     });
     await this.establishConnection(device);
