@@ -28,6 +28,7 @@ web/*.tsbuildinfo
 .mypy_cache/
 downloads/
 .codex
+.local/
 
 # ---- IDE / OS noise ----
 .idea/
