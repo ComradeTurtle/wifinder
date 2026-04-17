@@ -6,6 +6,8 @@ an `ESP32-C6` master (optionally with an `ESP8266` or `BW16` wired slave node), 
 - an Android app that adds GPS ingestion and Wigle CSV logging on phone
 - a desktop app (Python + Qt) for direct USB serial debugging/control
 
+The end goal for WiFinder is an all-in-one wardriving PCB, featuring an ESP32-S3 acting as the master/controller node and 10 ESP32-C5 scan nodes, alongside a dual-band GNSS receiver and other extras. PCB design is currently WIP (soon™) and will be open-sourced once ready.
+
 ## What current firmware includes
 
 - Wi-Fi management sniffing (beacon + probe response) on 2.4 GHz
