@@ -107,7 +107,7 @@ _Static_assert(WG_NODE_5GHZ_MASK_BIT_COUNT < 64, "WG_NODE_5GHZ_MASK_BIT_COUNT mu
 #define WG_GPS_PHONE_MAX_AGE_MS 5000
 #define WG_GPS_UART_ACCURACY_FALLBACK_CM 5000
 #define WG_GPS_GSV_FRESH_MS 5000
-#define WG_GPS_GN_PREFERRED_STALE_MS 4000
+#define WG_GPS_TALKER_BUCKETS 8
 #define WG_GPS_RATE_EVAL_MS 2000
 #define WG_GPS_RATE_SWITCH_MIN_MS 12000
 #define WG_GPS_RATE_SPEED_2HZ_UP_MMPS 3000
@@ -273,6 +273,12 @@ typedef struct {
   int64_t received_ms;
 } gps_fix_t;
 
+typedef struct {
+  uint16_t key;
+  uint8_t sat_count;
+  int64_t updated_ms;
+} gps_talker_sat_t;
+
 typedef enum {
   WG_GPS_SRC_NONE = 0,
   WG_GPS_SRC_UART = 1,
@@ -401,8 +407,8 @@ static volatile int s_gps_last_sats_in_view = -1;
 static volatile char s_gps_last_rmc_status = '?';
 static volatile int64_t s_gps_last_gsa_ms = 0;
 static volatile int64_t s_gps_last_gsv_ms = 0;
-static volatile int64_t s_gps_last_gn_gsa_ms = 0;
-static volatile int64_t s_gps_last_gn_gsv_ms = 0;
+static gps_talker_sat_t s_gps_gsa_sat_by_talker[WG_GPS_TALKER_BUCKETS] = {0};
+static gps_talker_sat_t s_gps_gsv_sat_by_talker[WG_GPS_TALKER_BUCKETS] = {0};
 static volatile int s_gps_uart_baud_active = WG_GPS_UART_BAUD;
 static volatile uint8_t s_gps_nav_rate_hz = 1;
 static volatile uint8_t s_gps_nav_mode = WG_GPS_NAV_MODE_AUTO;
@@ -4055,12 +4061,77 @@ static bool nmea_sentence_has_type(const char *line, const char *type3) {
   return line[0] == '$' && strncmp(&line[3], type3, 3) == 0;
 }
 
-static bool nmea_sentence_is_gn_talker(const char *line) {
+static uint16_t nmea_sentence_talker_key(const char *line) {
   if (line == NULL) {
-    return false;
+    return 0;
   }
   size_t len = strnlen(line, 8);
-  return len >= 3 && line[0] == '$' && line[1] == 'G' && line[2] == 'N';
+  if (len < 3 || line[0] != '$') {
+    return 0;
+  }
+  return (((uint16_t)(uint8_t)line[1]) << 8) | (uint16_t)(uint8_t)line[2];
+}
+
+static bool talker_key_is_gn(uint16_t key) {
+  return key == ((((uint16_t)'G') << 8) | (uint16_t)'N');
+}
+
+static void gps_update_talker_sat(gps_talker_sat_t *buckets, size_t bucket_count, uint16_t talker_key,
+                                  uint8_t sat_count, int64_t now) {
+  if (buckets == NULL || bucket_count == 0 || talker_key == 0 || now <= 0) {
+    return;
+  }
+  size_t slot = bucket_count;
+  size_t oldest_slot = 0;
+  int64_t oldest_ms = INT64_MAX;
+  for (size_t i = 0; i < bucket_count; ++i) {
+    if (buckets[i].key == talker_key || buckets[i].key == 0) {
+      slot = i;
+      break;
+    }
+    if (buckets[i].updated_ms < oldest_ms) {
+      oldest_ms = buckets[i].updated_ms;
+      oldest_slot = i;
+    }
+  }
+  if (slot >= bucket_count) {
+    slot = oldest_slot;
+  }
+  buckets[slot].key = talker_key;
+  buckets[slot].sat_count = sat_count;
+  buckets[slot].updated_ms = now;
+}
+
+// gn_filter: -1 = any, 0 = non-GN only, 1 = GN only.
+static uint8_t gps_sum_recent_talker_sat(const gps_talker_sat_t *buckets, size_t bucket_count,
+                                         int64_t now, int64_t fresh_ms, int gn_filter,
+                                         bool *has_any) {
+  bool any = false;
+  uint32_t total = 0;
+  if (buckets != NULL && now > 0 && fresh_ms > 0) {
+    for (size_t i = 0; i < bucket_count; ++i) {
+      if (buckets[i].key == 0 || buckets[i].sat_count == 0 || buckets[i].updated_ms <= 0) {
+        continue;
+      }
+      int64_t age = now - buckets[i].updated_ms;
+      if (age < 0 || age > fresh_ms) {
+        continue;
+      }
+      bool is_gn = talker_key_is_gn(buckets[i].key);
+      if ((gn_filter == 0 && is_gn) || (gn_filter == 1 && !is_gn)) {
+        continue;
+      }
+      any = true;
+      total += buckets[i].sat_count;
+    }
+  }
+  if (total > UINT8_MAX) {
+    total = UINT8_MAX;
+  }
+  if (has_any != NULL) {
+    *has_any = any;
+  }
+  return (uint8_t)total;
 }
 
 static bool gps_send_ubx(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t payload_len) {
@@ -4330,12 +4401,14 @@ static void parse_nmea_gga(char *line) {
   if (fix_quality <= 0 || sats < 3) {
     s_gps_gga_reject_fix++;
     s_uart_gps.valid = false;
+    s_uart_gps.flags &= (uint8_t)~(WG_GPS_FLAG_VALID | WG_GPS_FLAG_HAS_ALT);
     recompute_effective_gps_fix();
     return;
   }
 
   s_uart_gps.valid = true;
-  s_uart_gps.flags = WG_GPS_FLAG_VALID | WG_GPS_FLAG_HAS_ALT;
+  s_uart_gps.flags &= (uint8_t)~(WG_GPS_FLAG_VALID | WG_GPS_FLAG_HAS_ALT);
+  s_uart_gps.flags |= (WG_GPS_FLAG_VALID | WG_GPS_FLAG_HAS_ALT);
   s_uart_gps.lat_e7 = lat_e7;
   s_uart_gps.lon_e7 = lon_e7;
   s_uart_gps.alt_mm = (int32_t)llround(alt_m * 1000.0);
@@ -4371,8 +4444,8 @@ static void parse_nmea_gga(char *line) {
 }
 
 static void parse_nmea_gsa(char *line) {
+  const uint16_t talker_key = nmea_sentence_talker_key(line);
   char *save = NULL;
-  bool gn_talker = nmea_sentence_is_gn_talker(line);
   char *token = strtok_r(line, ",", &save);
   int idx = 0;
   int sats_in_use = 0;
@@ -4430,23 +4503,24 @@ static void parse_nmea_gsa(char *line) {
       sat_u32 = UINT8_MAX;
     }
     int64_t now = now_ms();
-    bool gn_recent = s_gps_last_gn_gsa_ms > 0 && (now - s_gps_last_gn_gsa_ms) >= 0 &&
-                     (now - s_gps_last_gn_gsa_ms) <= WG_GPS_GN_PREFERRED_STALE_MS;
-    if (gn_talker || !gn_recent) {
-      s_uart_gps.sat_in_use = (uint8_t)sat_u32;
-      s_uart_gps.sat_count = s_uart_gps.sat_in_use;
-      s_gps_last_sats = s_uart_gps.sat_in_use;
-      s_gps_last_gsa_ms = now;
-      if (gn_talker) {
-        s_gps_last_gn_gsa_ms = now;
-      }
-    }
+    gps_update_talker_sat(s_gps_gsa_sat_by_talker, WG_GPS_TALKER_BUCKETS, talker_key,
+                          (uint8_t)sat_u32, now);
+    bool have_non_gn = false;
+    bool have_gn = false;
+    uint8_t sats_non_gn = gps_sum_recent_talker_sat(
+        s_gps_gsa_sat_by_talker, WG_GPS_TALKER_BUCKETS, now, WG_GPS_GSV_FRESH_MS, 0, &have_non_gn);
+    uint8_t sats_gn = gps_sum_recent_talker_sat(s_gps_gsa_sat_by_talker, WG_GPS_TALKER_BUCKETS,
+                                                now, WG_GPS_GSV_FRESH_MS, 1, &have_gn);
+    s_uart_gps.sat_in_use = have_non_gn ? sats_non_gn : (have_gn ? sats_gn : (uint8_t)sat_u32);
+    s_uart_gps.sat_count = s_uart_gps.sat_in_use;
+    s_gps_last_sats = s_uart_gps.sat_in_use;
+    s_gps_last_gsa_ms = now;
   }
 }
 
 static void parse_nmea_gsv(char *line) {
+  const uint16_t talker_key = nmea_sentence_talker_key(line);
   char *save = NULL;
-  bool gn_talker = nmea_sentence_is_gn_talker(line);
   char *token = strtok_r(line, ",", &save);
   int idx = 0;
   int sats_visible = -1;
@@ -4469,16 +4543,17 @@ static void parse_nmea_gsv(char *line) {
     sat_u32 = UINT8_MAX;
   }
   int64_t now = now_ms();
-  bool gn_recent = s_gps_last_gn_gsv_ms > 0 && (now - s_gps_last_gn_gsv_ms) >= 0 &&
-                   (now - s_gps_last_gn_gsv_ms) <= WG_GPS_GN_PREFERRED_STALE_MS;
-  if (gn_talker || !gn_recent) {
-    s_uart_gps.sat_in_view = (uint8_t)sat_u32;
-    s_gps_last_sats_in_view = sats_visible;
-    s_gps_last_gsv_ms = now;
-    if (gn_talker) {
-      s_gps_last_gn_gsv_ms = now;
-    }
-  }
+  gps_update_talker_sat(s_gps_gsv_sat_by_talker, WG_GPS_TALKER_BUCKETS, talker_key,
+                        (uint8_t)sat_u32, now);
+  bool have_non_gn = false;
+  bool have_gn = false;
+  uint8_t sats_non_gn = gps_sum_recent_talker_sat(
+      s_gps_gsv_sat_by_talker, WG_GPS_TALKER_BUCKETS, now, WG_GPS_GSV_FRESH_MS, 0, &have_non_gn);
+  uint8_t sats_gn = gps_sum_recent_talker_sat(s_gps_gsv_sat_by_talker, WG_GPS_TALKER_BUCKETS, now,
+                                              WG_GPS_GSV_FRESH_MS, 1, &have_gn);
+  s_uart_gps.sat_in_view = have_non_gn ? sats_non_gn : (have_gn ? sats_gn : (uint8_t)sat_u32);
+  s_gps_last_sats_in_view = s_uart_gps.sat_in_view;
+  s_gps_last_gsv_ms = now;
 }
 
 static void parse_nmea_rmc(char *line) {

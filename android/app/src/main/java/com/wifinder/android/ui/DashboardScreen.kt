@@ -416,6 +416,15 @@ private fun gpsSourceLabel(source: Int): String = when (source) {
   else -> "NONE"
 }
 
+private fun gpsNavRateCompact(mode: Int, appliedHz: Int): String {
+  val selected = when (mode) {
+    1, 2, 4 -> mode.toString()
+    else -> "A"
+  }
+  val applied = if (appliedHz > 0) appliedHz else 1
+  return "${selected}/${applied}Hz"
+}
+
 @Composable
 private fun GpsDetailRow(state: AppUiState, modifier: Modifier = Modifier) {
   val hdopText = if (state.gpsHdopCenti > 0) "%.2f".format(state.gpsHdopCenti / 100.0) else "—"
@@ -429,7 +438,7 @@ private fun GpsDetailRow(state: AppUiState, modifier: Modifier = Modifier) {
   }
   val accText = if (state.gpsValid) "±${"%.1f".format(state.gpsAccuracyDm / 10.0)}m" else "—"
   val ageText = if (state.gpsValid) "${state.gpsAgeS}s" else "—"
-  val rateText = "${if (state.gpsNavAppliedHz > 0) state.gpsNavAppliedHz else 1} Hz"
+  val rateText = gpsNavRateCompact(state.gpsNavMode, state.gpsNavAppliedHz)
   val dopText = "$hdopText/$vdopText/$pdopText"
 
   Row(

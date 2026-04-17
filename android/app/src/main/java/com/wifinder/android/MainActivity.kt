@@ -54,8 +54,12 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -709,12 +713,39 @@ private fun QuickActions(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
       ) {
         CompactButton(label = "Clear", primary = false, modifier = Modifier.weight(1f), onClick = onClearSightings)
+
+        var showClearEspConfirm by remember { mutableStateOf(false) }
         CompactButton(
           label = "Clear ESP",
           primary = false,
           modifier = Modifier.weight(1f),
-          onClick = onClearEspStorage,
+          onClick = { showClearEspConfirm = true },
         )
+        if (showClearEspConfirm) {
+          AlertDialog(
+            onDismissRequest = { showClearEspConfirm = false },
+            title = { Text("Erase ESP Storage?") },
+            text = {
+              Text(
+                "This will permanently delete ALL recorded sessions on the ESP.\n\n" +
+                  "This action cannot be undone.",
+              )
+            },
+            confirmButton = {
+              TextButton(onClick = {
+                showClearEspConfirm = false
+                onClearEspStorage()
+              }) {
+                Text("Delete Everything", color = MaterialTheme.colorScheme.error)
+              }
+            },
+            dismissButton = {
+              TextButton(onClick = { showClearEspConfirm = false }) {
+                Text("Cancel")
+              }
+            },
+          )
+        }
         if (state.loggingEnabled) {
           CompactButton(label = "Stop CSV", primary = false, modifier = Modifier.weight(1f), onClick = onStopLogging)
         } else {
