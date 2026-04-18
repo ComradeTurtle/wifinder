@@ -1,10 +1,12 @@
 package com.wifinder.android.service
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.location.Location
 import android.net.ConnectivityManager
@@ -49,6 +51,7 @@ import java.util.zip.CRC32
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.coroutines.resume
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -621,9 +624,6 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     }
     synchronized(ackLock) {
       sessionAcks.clear()
-    }
-    if (!bleClient.setBacklogBlobEnabled(false)) {
-      appendLog("Backlog download warning: failed to disable legacy blob stream")
     }
     val okWifiDump = bleClient.setWifiDumpEnabled(true)
     if (!okWifiDump) {
@@ -1684,7 +1684,26 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       appendLog("Backlog Wi-Fi dump requires Android 10+")
       return null
     }
-    val cm = getSystemService(ConnectivityManager::class.java) ?: return null
+    if (ContextCompat.checkSelfPermission(
+        this,
+        Manifest.permission.ACCESS_FINE_LOCATION,
+      ) != PackageManager.PERMISSION_GRANTED) {
+      appendLog("Backlog Wi-Fi dump blocked: ACCESS_FINE_LOCATION permission missing")
+      return null
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+      ContextCompat.checkSelfPermission(
+        this,
+        Manifest.permission.NEARBY_WIFI_DEVICES,
+      ) != PackageManager.PERMISSION_GRANTED) {
+      appendLog("Backlog Wi-Fi dump blocked: NEARBY_WIFI_DEVICES permission missing")
+      return null
+    }
+    val cm = getSystemService(ConnectivityManager::class.java)
+    if (cm == null) {
+      appendLog("Backlog Wi-Fi dump failed: ConnectivityManager unavailable")
+      return null
+    }
     val request = NetworkRequest.Builder()
       .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
       .setNetworkSpecifier(
@@ -1705,10 +1724,12 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         }
         callback = object : ConnectivityManager.NetworkCallback() {
           override fun onAvailable(network: Network) {
+            appendLog("Backlog Wi-Fi network acquired: $WIFI_DUMP_AP_SSID")
             finish(network to this)
           }
 
           override fun onUnavailable() {
+            appendLog("Backlog Wi-Fi network unavailable: $WIFI_DUMP_AP_SSID")
             try {
               cm.unregisterNetworkCallback(this)
             } catch (_: Exception) {}
@@ -1717,6 +1738,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
 
           override fun onLost(network: Network) {
             if (!completed) {
+              appendLog("Backlog Wi-Fi network lost before transfer")
               try {
                 cm.unregisterNetworkCallback(this)
               } catch (_: Exception) {}
@@ -1726,7 +1748,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         }
         try {
           cm.requestNetwork(request, callback)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+          appendLog("Backlog Wi-Fi request failed: ${e.javaClass.simpleName}${if (e.message.isNullOrBlank()) "" else " (${e.message})"}")
           finish(null)
           return@suspendCancellableCoroutine
         }
@@ -1736,7 +1759,11 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
           } catch (_: Exception) {}
         }
       }
-    } ?: return null
+    }
+    if (acquired == null) {
+      appendLog("Backlog Wi-Fi request timed out (${WIFI_DUMP_NETWORK_WAIT_MS}ms)")
+      return null
+    }
 
     val network = acquired.first
     val callback = acquired.second
@@ -1747,6 +1774,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       false
     }
     if (!bound) {
+      appendLog("Backlog Wi-Fi bindProcessToNetwork failed")
       try {
         cm.unregisterNetworkCallback(callback)
       } catch (_: Exception) {}
