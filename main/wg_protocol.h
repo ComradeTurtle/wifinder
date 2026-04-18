@@ -49,6 +49,8 @@ typedef enum {
   WG_CMD_DEBUG_SEED_STORAGE = 0x0E,
   WG_CMD_SET_CHANNEL_PLAN = 0x0F,
   WG_CMD_BACKLOG_BLOB_CHUNK_REPLY = 0x10,
+  WG_CMD_SET_WIFI_DUMP = 0x11,
+  WG_CMD_COMMIT_WIFI_DUMP = 0x12,
 } wg_command_id_t;
 
 typedef enum {
@@ -66,6 +68,8 @@ typedef enum {
 #define WG_DEBUG_SEED_STORAGE_PAYLOAD_SIZE 4
 #define WG_CHANNEL_PLAN_PAYLOAD_SIZE 12
 #define WG_BACKLOG_BLOB_CHUNK_REPLY_PAYLOAD_SIZE 15
+#define WG_WIFI_DUMP_TOGGLE_PAYLOAD_SIZE 1
+#define WG_WIFI_DUMP_COMMIT_PAYLOAD_SIZE 8
 #define WG_BACKLOG_BLOB_CHUNK_REPLY_NAK 0
 #define WG_BACKLOG_BLOB_CHUNK_REPLY_ACK 1
 
@@ -104,6 +108,8 @@ typedef struct {
   uint32_t backlog_blob_chunk_offset;
   uint16_t backlog_blob_chunk_len;
   uint8_t backlog_blob_chunk_reply;
+  uint8_t wifi_dump_enable;
+  uint64_t wifi_dump_run_id;
 } wg_command_t;
 
 wg_result_t wg_frame_encode(const wg_frame_t *frame, uint8_t *out, size_t out_capacity,

@@ -166,6 +166,18 @@ class WiFinderBleClient(
       WgProtocol.encodeBacklogBlobChunkReplyPayload(sessionId, chunkOffset, chunkLen, accepted),
     )
 
+  fun setWifiDumpEnabled(enabled: Boolean): Boolean =
+    sendCommand(
+      WgProtocol.Command.SET_WIFI_DUMP,
+      WgProtocol.encodeWifiDumpTogglePayload(enabled),
+    )
+
+  fun commitWifiDump(runId: Long): Boolean =
+    sendCommand(
+      WgProtocol.Command.COMMIT_WIFI_DUMP,
+      WgProtocol.encodeWifiDumpCommitPayload(runId),
+    )
+
   fun seedDebugStorage(targetBytes: Int): Boolean =
     sendCommand(
       WgProtocol.Command.DEBUG_SEED_STORAGE,

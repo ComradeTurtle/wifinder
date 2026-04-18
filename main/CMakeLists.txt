@@ -16,6 +16,7 @@ idf_component_register(
     esp_event
     esp_netif
     esp_timer
+    esp_http_server
     spiffs
     fatfs
     sdmmc

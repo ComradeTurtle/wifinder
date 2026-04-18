@@ -7,6 +7,11 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.location.Location
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.wifi.WifiNetworkSpecifier
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -32,6 +37,8 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -41,19 +48,26 @@ import java.util.TreeSet
 import java.util.zip.CRC32
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import org.json.JSONObject
 
 /**
  * Shared state exposed by the service to the UI layer via binding.
@@ -163,6 +177,14 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     private const val DEBUG_SEED_TARGET_BYTES = 768 * 1024
     private const val DEBUG_SEED_MIN_BYTES = 512 * 1024
     private const val DEBUG_SEED_MAX_BYTES = 1024 * 1024
+    private const val WIFI_DUMP_AP_SSID = "WIFINDER-DUMP"
+    private const val WIFI_DUMP_AP_HOST = "192.168.4.1"
+    private const val WIFI_DUMP_MANIFEST_PATH = "/wifinder/dump/manifest.json"
+    private const val WIFI_DUMP_FILE_PATH = "/wifinder/dump/file"
+    private const val WIFI_DUMP_HTTP_CONNECT_TIMEOUT_MS = 8_000
+    private const val WIFI_DUMP_HTTP_READ_TIMEOUT_MS = 20_000
+    private const val WIFI_DUMP_NETWORK_WAIT_MS = 25_000L
+    private const val WIFI_DUMP_PROGRESS_UI_INTERVAL_MS = 150L
 
     internal fun normalizeGpsNavMode(mode: Int): Int = when (mode) {
       0, 1, 2, 4 -> mode
@@ -210,6 +232,19 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     val highestSeq: Long,
     val gapDetected: Boolean,
     val badBlocks: Int,
+  )
+
+  private data class WifiDumpSession(
+    val sessionId: Long,
+    val datBytes: Long,
+    val gpxBytes: Long,
+    val writtenSeq: Long,
+    val ackedSeq: Long,
+  )
+
+  private data class WifiDumpManifest(
+    val runId: Long,
+    val sessions: List<WifiDumpSession>,
   )
 
   inner class LocalBinder : Binder() {
@@ -260,6 +295,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
   @Volatile private var backlogBlobRx: BacklogBlobReceiver? = null
   @Volatile private var blobProgressUiLastMs: Long = 0L
   @Volatile private var blobProgressUiLastBytes: Long = 0L
+  @Volatile private var wifiDumpInProgress: Boolean = false
+  @Volatile private var wifiDumpJob: Job? = null
 
   override fun onCreate() {
     super.onCreate()
@@ -334,7 +371,11 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
   override fun onDestroy() {
     super.onDestroy()
     scope.cancel()
+    wifiDumpJob?.cancel()
+    wifiDumpJob = null
+    wifiDumpInProgress = false
     try { bleClient.sendGpsClear() } catch (_: Exception) {}
+    try { bleClient.setWifiDumpEnabled(false) } catch (_: Exception) {}
     stopLiveGpxSession(reason = null)
     resetBacklogBlobReceiver(discardFile = true)
     bleClient.disconnect()
@@ -386,10 +427,14 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
   }
 
   fun doDisconnect() {
+    wifiDumpJob?.cancel()
+    wifiDumpJob = null
+    wifiDumpInProgress = false
     phoneGpsPushActive = false
     stopLiveGpxSession(reason = null)
     if (controlLinkReadySilent()) {
       bleClient.setBacklogBlobEnabled(false)
+      bleClient.setWifiDumpEnabled(false)
     }
     val shouldAutoStopCsv = downloadBacklogAutoStop
     downloadBacklogAutoStop = false
@@ -542,8 +587,12 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       }
     }
     if (_state.value.downloadBacklogActive) {
-      val ok = bleClient.setBacklogBlobEnabled(false)
-      if (!ok) {
+      wifiDumpJob?.cancel()
+      wifiDumpJob = null
+      wifiDumpInProgress = false
+      val okWifiDump = bleClient.setWifiDumpEnabled(false)
+      val okBlob = bleClient.setBacklogBlobEnabled(false)
+      if (!okWifiDump && !okBlob) {
         appendLog("Backlog stop command failed")
         return false
       }
@@ -573,8 +622,11 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     synchronized(ackLock) {
       sessionAcks.clear()
     }
-    val okBlob = bleClient.setBacklogBlobEnabled(true)
-    if (!okBlob) {
+    if (!bleClient.setBacklogBlobEnabled(false)) {
+      appendLog("Backlog download warning: failed to disable legacy blob stream")
+    }
+    val okWifiDump = bleClient.setWifiDumpEnabled(true)
+    if (!okWifiDump) {
       downloadBacklogStartMs = 0L
       _state.update {
         it.copy(
@@ -592,17 +644,23 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       downloadBacklogAutoStop = false
       return false
     }
+
     downloadBacklogStartMs = System.currentTimeMillis()
+    wifiDumpInProgress = true
     _state.update {
       it.copy(
         downloadBacklogActive = true,
-        blobActive = false,
+        blobActive = true,
         blobSessionId = 0L,
         blobBytesSent = 0L,
         blobBytesTotal = 0L,
       )
     }
-    appendLog("Backlog download started")
+    appendLog("Backlog download started (Wi-Fi dump)")
+    wifiDumpJob?.cancel()
+    wifiDumpJob = scope.launch {
+      runWifiDumpTransfer()
+    }
     bleClient.requestStatus()
     return true
   }
@@ -799,6 +857,9 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
 
   override fun onConnectState(connected: Boolean) {
     if (!connected) {
+      wifiDumpJob?.cancel()
+      wifiDumpJob = null
+      wifiDumpInProgress = false
       lastEspGps = null
       lastEspFixMs = -1L
       stopLiveGpxSession(reason = null)
@@ -945,10 +1006,10 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         spiffsUsedBytes = status.spiffsUsedBytes,
         spiffsFreeBytes = status.spiffsFreeBytes,
         dieTempCenti = status.dieTempCenti,
-        blobActive = status.blobActive,
-        blobSessionId = status.blobSessionId,
-        blobBytesSent = status.blobBytesSent,
-        blobBytesTotal = status.blobBytesTotal,
+        blobActive = if (wifiDumpInProgress) current.blobActive else status.blobActive,
+        blobSessionId = if (wifiDumpInProgress) current.blobSessionId else status.blobSessionId,
+        blobBytesSent = if (wifiDumpInProgress) current.blobBytesSent else status.blobBytesSent,
+        blobBytesTotal = if (wifiDumpInProgress) current.blobBytesTotal else status.blobBytesTotal,
       )
     }
 
@@ -967,6 +1028,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         stopLogging()
       }
     } else if (_state.value.downloadBacklogActive &&
+      !wifiDumpInProgress &&
       status.queuedRecords == 0L &&
       !status.replayActive &&
       !status.blobActive) {
@@ -1453,6 +1515,392 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
           backlogBlobRecoveryInFlight = false
         }
       }
+    }
+  }
+
+  private suspend fun runWifiDumpTransfer() {
+    var success = false
+    var cancelled = false
+    var runId: Long = 0L
+    try {
+      val transferOk = withWifiDumpNetwork { network ->
+        val manifest = fetchWifiDumpManifest(network)
+        if (manifest == null) {
+          appendLog("Backlog download failed: Wi-Fi dump manifest unavailable")
+          return@withWifiDumpNetwork false
+        }
+        runId = manifest.runId
+        if (manifest.sessions.isEmpty()) {
+          appendLog("Backlog download: no pending sessions")
+          return@withWifiDumpNetwork true
+        }
+
+        val dumpDirName = "wifi-dump-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}"
+        val dumpDir = File(getExternalFilesDir(null), dumpDirName)
+        dumpDir.mkdirs()
+
+        appendLog(
+          "Backlog Wi-Fi dump manifest run=0x${toHex64(runId)} sessions=${manifest.sessions.size}",
+        )
+
+        for ((index, session) in manifest.sessions.withIndex()) {
+          if (!currentCoroutineContext().isActive) {
+            cancelled = true
+            return@withWifiDumpNetwork false
+          }
+          val sidHex = toHex64(session.sessionId)
+          appendLog(
+            "Backlog Wi-Fi session ${index + 1}/${manifest.sessions.size} sid=0x$sidHex dat=${session.datBytes}B gpx=${session.gpxBytes}B",
+          )
+
+          val datFile = File(dumpDir, "session-$sidHex.dat")
+          _state.update {
+            it.copy(
+              blobActive = true,
+              blobSessionId = session.sessionId,
+              blobBytesSent = 0L,
+              blobBytesTotal = session.datBytes,
+            )
+          }
+
+          val datOk = downloadWifiDumpFile(
+            network = network,
+            sessionId = session.sessionId,
+            type = "dat",
+            expectedBytes = session.datBytes,
+            outFile = datFile,
+          ) { downloaded ->
+            _state.update { state ->
+              state.copy(
+                blobActive = true,
+                blobSessionId = session.sessionId,
+                blobBytesSent = downloaded.coerceAtLeast(0L),
+                blobBytesTotal = session.datBytes,
+              )
+            }
+          }
+          if (!datOk) {
+            appendLog("Backlog Wi-Fi session failed sid=0x$sidHex (dat download)")
+            return@withWifiDumpNetwork false
+          }
+
+          val result = parseBacklogBlobFile(datFile, session.sessionId)
+          val targetSeq = if (session.writtenSeq > 0L) session.writtenSeq else result.highestSeq
+          val importComplete =
+            targetSeq > 0L &&
+              result.badBlocks == 0 &&
+              !result.gapDetected &&
+              result.highestSeq >= targetSeq
+          appendLog(
+            "Backlog Wi-Fi import sid=0x$sidHex records=${result.records} highest_seq=${result.highestSeq} bad_blocks=${result.badBlocks} gap=${result.gapDetected}",
+          )
+          if (!importComplete) {
+            appendLog("Backlog Wi-Fi import failed integrity check sid=0x$sidHex")
+            return@withWifiDumpNetwork false
+          }
+          try {
+            datFile.delete()
+          } catch (_: Exception) {}
+
+          if (session.gpxBytes > 0L) {
+            val gpxFile = File(dumpDir, "session-$sidHex.gpx")
+            val gpxOk = downloadWifiDumpFile(
+              network = network,
+              sessionId = session.sessionId,
+              type = "gpx",
+              expectedBytes = session.gpxBytes,
+              outFile = gpxFile,
+            )
+            if (!gpxOk) {
+              appendLog("Backlog Wi-Fi session sid=0x$sidHex gpx download failed")
+              return@withWifiDumpNetwork false
+            }
+            try {
+              gpxFile.delete()
+            } catch (_: Exception) {}
+          }
+        }
+        true
+      } ?: false
+      if (!transferOk) {
+        return
+      }
+
+      if (!bleClient.commitWifiDump(runId)) {
+        appendLog("Backlog commit failed (run=0x${toHex64(runId)})")
+        return
+      }
+      bleClient.requestStatus()
+      success = true
+      appendLog("Backlog Wi-Fi download complete")
+    } catch (e: kotlinx.coroutines.CancellationException) {
+      cancelled = true
+    } catch (e: Exception) {
+      appendLog("Backlog Wi-Fi transfer error: ${e.message}")
+    } finally {
+      wifiDumpInProgress = false
+      wifiDumpJob = null
+      downloadBacklogStartMs = 0L
+      resetBacklogBlobReceiver(discardFile = true)
+      if (controlLinkReadySilent()) {
+        bleClient.setWifiDumpEnabled(false)
+        bleClient.setBacklogBlobEnabled(false)
+        bleClient.requestStatus()
+      }
+      _state.update {
+        it.copy(
+          downloadBacklogActive = false,
+          blobActive = false,
+          blobSessionId = 0L,
+          blobBytesSent = 0L,
+          blobBytesTotal = 0L,
+        )
+      }
+      val shouldAutoStopCsv = downloadBacklogAutoStop
+      downloadBacklogAutoStop = false
+      if (shouldAutoStopCsv && csvLogger.isActive) {
+        stopLogging()
+      }
+      if (!success && !cancelled) {
+        appendLog(
+          if (runId != 0L) {
+            "Backlog Wi-Fi download ended with errors (run=0x${toHex64(runId)})"
+          } else {
+            "Backlog Wi-Fi download ended with errors"
+          },
+        )
+      } else if (cancelled) {
+        appendLog("Backlog download stopped")
+      }
+    }
+  }
+
+  private fun toHex64(value: Long): String =
+    java.lang.Long.toUnsignedString(value, 16).uppercase(Locale.US).padStart(16, '0')
+
+  @SuppressLint("MissingPermission")
+  private suspend fun <T> withWifiDumpNetwork(block: suspend (Network) -> T?): T? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+      appendLog("Backlog Wi-Fi dump requires Android 10+")
+      return null
+    }
+    val cm = getSystemService(ConnectivityManager::class.java) ?: return null
+    val request = NetworkRequest.Builder()
+      .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+      .setNetworkSpecifier(
+        WifiNetworkSpecifier.Builder()
+          .setSsid(WIFI_DUMP_AP_SSID)
+          .build(),
+      )
+      .build()
+
+    val acquired = withTimeoutOrNull(WIFI_DUMP_NETWORK_WAIT_MS) {
+      suspendCancellableCoroutine<Pair<Network, ConnectivityManager.NetworkCallback>?> { cont ->
+        var completed = false
+        lateinit var callback: ConnectivityManager.NetworkCallback
+        fun finish(value: Pair<Network, ConnectivityManager.NetworkCallback>?) {
+          if (completed) return
+          completed = true
+          cont.resume(value)
+        }
+        callback = object : ConnectivityManager.NetworkCallback() {
+          override fun onAvailable(network: Network) {
+            finish(network to this)
+          }
+
+          override fun onUnavailable() {
+            try {
+              cm.unregisterNetworkCallback(this)
+            } catch (_: Exception) {}
+            finish(null)
+          }
+
+          override fun onLost(network: Network) {
+            if (!completed) {
+              try {
+                cm.unregisterNetworkCallback(this)
+              } catch (_: Exception) {}
+              finish(null)
+            }
+          }
+        }
+        try {
+          cm.requestNetwork(request, callback)
+        } catch (_: Exception) {
+          finish(null)
+          return@suspendCancellableCoroutine
+        }
+        cont.invokeOnCancellation {
+          try {
+            cm.unregisterNetworkCallback(callback)
+          } catch (_: Exception) {}
+        }
+      }
+    } ?: return null
+
+    val network = acquired.first
+    val callback = acquired.second
+    val previous = cm.boundNetworkForProcess
+    val bound = try {
+      cm.bindProcessToNetwork(network)
+    } catch (_: Exception) {
+      false
+    }
+    if (!bound) {
+      try {
+        cm.unregisterNetworkCallback(callback)
+      } catch (_: Exception) {}
+      return null
+    }
+
+    return try {
+      block(network)
+    } finally {
+      try {
+        cm.bindProcessToNetwork(previous)
+      } catch (_: Exception) {}
+      try {
+        cm.unregisterNetworkCallback(callback)
+      } catch (_: Exception) {}
+    }
+  }
+
+  private suspend fun fetchWifiDumpManifest(network: Network): WifiDumpManifest? =
+    withContext(Dispatchers.IO) {
+      val url = URL("http://$WIFI_DUMP_AP_HOST$WIFI_DUMP_MANIFEST_PATH")
+      val conn = (network.openConnection(url) as? HttpURLConnection) ?: return@withContext null
+      try {
+        conn.requestMethod = "GET"
+        conn.connectTimeout = WIFI_DUMP_HTTP_CONNECT_TIMEOUT_MS
+        conn.readTimeout = WIFI_DUMP_HTTP_READ_TIMEOUT_MS
+        conn.setRequestProperty("Connection", "close")
+        val code = conn.responseCode
+        if (code != HttpURLConnection.HTTP_OK) {
+          return@withContext null
+        }
+        val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val root = JSONObject(body)
+        val runId = root.optString("run_id").trim()
+        if (runId.isEmpty()) {
+          return@withContext null
+        }
+        val runValue = try {
+          runId.toULong(16).toLong()
+        } catch (_: Exception) {
+          return@withContext null
+        }
+        val sessionsJson = root.optJSONArray("sessions") ?: return@withContext WifiDumpManifest(
+          runId = runValue,
+          sessions = emptyList(),
+        )
+        val sessions = mutableListOf<WifiDumpSession>()
+        for (i in 0 until sessionsJson.length()) {
+          val item = sessionsJson.optJSONObject(i) ?: continue
+          val sidHex = item.optString("sid").trim()
+          if (sidHex.isEmpty()) {
+            continue
+          }
+          val sid = try {
+            sidHex.toULong(16).toLong()
+          } catch (_: Exception) {
+            continue
+          }
+          val datBytes = item.optLong("dat_bytes", 0L).coerceAtLeast(0L)
+          if (datBytes <= 0L) {
+            continue
+          }
+          sessions += WifiDumpSession(
+            sessionId = sid,
+            datBytes = datBytes,
+            gpxBytes = item.optLong("gpx_bytes", 0L).coerceAtLeast(0L),
+            writtenSeq = item.optLong("written_seq", 0L).coerceAtLeast(0L),
+            ackedSeq = item.optLong("acked_seq", 0L).coerceAtLeast(0L),
+          )
+        }
+        WifiDumpManifest(runId = runValue, sessions = sessions)
+      } finally {
+        conn.disconnect()
+      }
+    }
+
+  private suspend fun downloadWifiDumpFile(
+    network: Network,
+    sessionId: Long,
+    type: String,
+    expectedBytes: Long,
+    outFile: File,
+    onProgress: ((Long) -> Unit)? = null,
+  ): Boolean = withContext(Dispatchers.IO) {
+    if (expectedBytes <= 0L) {
+      return@withContext false
+    }
+    outFile.parentFile?.mkdirs()
+    val tmpFile = File(outFile.parentFile, "${outFile.name}.part")
+    if (tmpFile.exists()) {
+      tmpFile.delete()
+    }
+
+    val sidHex = toHex64(sessionId)
+    val url = URL("http://$WIFI_DUMP_AP_HOST$WIFI_DUMP_FILE_PATH?sid=$sidHex&type=$type")
+    val conn = (network.openConnection(url) as? HttpURLConnection) ?: return@withContext false
+    try {
+      conn.requestMethod = "GET"
+      conn.connectTimeout = WIFI_DUMP_HTTP_CONNECT_TIMEOUT_MS
+      conn.readTimeout = WIFI_DUMP_HTTP_READ_TIMEOUT_MS
+      conn.setRequestProperty("Connection", "close")
+      val code = conn.responseCode
+      if (code != HttpURLConnection.HTTP_OK && code != HttpURLConnection.HTTP_PARTIAL) {
+        return@withContext false
+      }
+      val input = conn.inputStream ?: return@withContext false
+      var written = 0L
+      var lastUiMs = 0L
+      input.use { stream ->
+        BufferedInputStream(stream, 64 * 1024).use { bin ->
+          FileOutputStream(tmpFile, false).use { fout ->
+            BufferedOutputStream(fout, 64 * 1024).use { bout ->
+              val buffer = ByteArray(64 * 1024)
+              while (true) {
+                val read = bin.read(buffer)
+                if (read < 0) {
+                  break
+                }
+                if (read == 0) {
+                  continue
+                }
+                bout.write(buffer, 0, read)
+                written += read.toLong()
+                if (onProgress != null) {
+                  val now = System.currentTimeMillis()
+                  if (written == expectedBytes ||
+                    lastUiMs == 0L ||
+                    now - lastUiMs >= WIFI_DUMP_PROGRESS_UI_INTERVAL_MS) {
+                    lastUiMs = now
+                    onProgress(written)
+                  }
+                }
+              }
+              bout.flush()
+            }
+          }
+        }
+      }
+      if (written != expectedBytes) {
+        tmpFile.delete()
+        return@withContext false
+      }
+      if (outFile.exists()) {
+        outFile.delete()
+      }
+      if (!tmpFile.renameTo(outFile)) {
+        return@withContext false
+      }
+      true
+    } catch (_: Exception) {
+      tmpFile.delete()
+      false
+    } finally {
+      conn.disconnect()
     }
   }
 

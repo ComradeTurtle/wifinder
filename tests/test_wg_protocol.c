@@ -233,6 +233,34 @@ static void test_backlog_blob_chunk_reply_command_decode(void) {
               "backlog blob chunk reply code should decode");
 }
 
+static void test_set_wifi_dump_command_decode(void) {
+  uint8_t payload[] = {
+      WG_CMD_SET_WIFI_DUMP,
+      0x01,
+  };
+
+  wg_command_t cmd = {0};
+  assert_true(wg_command_decode(payload, sizeof(payload), &cmd) == WG_OK,
+              "set wifi dump command decode should succeed");
+  assert_true(cmd.id == WG_CMD_SET_WIFI_DUMP, "set wifi dump command id should match");
+  assert_true(cmd.wifi_dump_enable == 1, "set wifi dump enable should decode");
+}
+
+static void test_commit_wifi_dump_command_decode(void) {
+  uint8_t payload[] = {
+      WG_CMD_COMMIT_WIFI_DUMP,
+      0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,  // run id (little-endian)
+  };
+
+  wg_command_t cmd = {0};
+  assert_true(wg_command_decode(payload, sizeof(payload), &cmd) == WG_OK,
+              "commit wifi dump command decode should succeed");
+  assert_true(cmd.id == WG_CMD_COMMIT_WIFI_DUMP,
+              "commit wifi dump command id should match");
+  assert_true(cmd.wifi_dump_run_id == 0x0123456789ABCDEFULL,
+              "commit wifi dump run id should decode");
+}
+
 int main(void) {
   test_frame_roundtrip();
   test_command_decode();
@@ -246,6 +274,8 @@ int main(void) {
   test_set_backlog_blob_command_decode();
   test_debug_seed_storage_command_decode();
   test_backlog_blob_chunk_reply_command_decode();
+  test_set_wifi_dump_command_decode();
+  test_commit_wifi_dump_command_decode();
   printf("PASS: %d tests\n", tests_run);
   return 0;
 }
