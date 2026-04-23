@@ -1829,8 +1829,15 @@ static void storage_manifest_generation_set(wg_session_manifest_t *manifest, uin
   if (manifest == NULL) {
     return;
   }
-  wg_storage_manifest_generation_set(&manifest->reserved0, manifest->reserved1,
-                                     WG_STORAGE_MANIFEST_GEN_MAGIC, generation);
+  uint16_t reserved0 = manifest->reserved0;
+  uint8_t reserved1[sizeof(manifest->reserved1)] = {0};
+  memcpy(reserved1, manifest->reserved1, sizeof(reserved1));
+
+  wg_storage_manifest_generation_set(&reserved0, reserved1, WG_STORAGE_MANIFEST_GEN_MAGIC,
+                                     generation);
+
+  manifest->reserved0 = reserved0;
+  memcpy(manifest->reserved1, reserved1, sizeof(reserved1));
 }
 
 static int storage_manifest_generation_cmp(uint32_t lhs, uint32_t rhs) {
