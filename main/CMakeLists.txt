@@ -7,6 +7,9 @@ idf_component_register(
     "wg_payload.c"
     "ble_security_policy.c"
     "scan_policy.c"
+    "wg_session_transport.c"
+    "wg_storage_backlog.c"
+    "wg_gps_nmea.c"
   INCLUDE_DIRS
     "."
   REQUIRES

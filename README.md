@@ -170,6 +170,21 @@ Desktop protocol/state/CSV tests:
 python -m unittest discover -s desktop/tests -v
 ```
 
+Android unit tests:
+
+```bash
+GRADLE_USER_HOME=/tmp/gradle-home ./android/gradlew -p android testDebugUnitTest --no-daemon
+```
+
+## CI required checks
+
+GitHub Actions now publishes four stable check names intended for branch-protection required checks:
+
+- `firmware-host-tests` → `./scripts/run_host_tests.sh`
+- `android-unit-tests` → `GRADLE_USER_HOME=/tmp/gradle-home ./android/gradlew -p android testDebugUnitTest --no-daemon`
+- `desktop-tests` → `python -m unittest discover -s desktop/tests -v`
+- `web-core-tests` → `npm --prefix web ci && npm --prefix web run test:core`
+
 ## Notes
 
 - ESP32 scanning in this project is 2.4 GHz only.

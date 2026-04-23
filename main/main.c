@@ -60,8 +60,11 @@
 #include "ble_security_policy.h"
 #include "scan_policy.h"
 #include "sniffer_logic.h"
+#include "wg_gps_nmea.h"
 #include "wg_payload.h"
 #include "wg_protocol.h"
+#include "wg_session_transport.h"
+#include "wg_storage_backlog.h"
 
 extern void ble_store_config_init(void);
 
@@ -1807,56 +1810,31 @@ static bool storage_finalize_stale_gpx_session(uint64_t session_id) {
 }
 
 static bool storage_parse_meta_filename(const char *name, uint64_t *session_id_out) {
-  if (name == NULL || session_id_out == NULL) {
-    return false;
-  }
-  const size_t prefix_len = strlen(WG_STORAGE_FILE_PREFIX);
-  const size_t n = strlen(name);
-  if (n != (prefix_len + 16 + 5) || strncmp(name, WG_STORAGE_FILE_PREFIX, prefix_len) != 0 ||
-      strcmp(name + prefix_len + 16, ".meta") != 0) {
-    return false;
-  }
-  char hex[17] = {0};
-  memcpy(hex, name + prefix_len, 16);
-  errno = 0;
-  char *end = NULL;
-  unsigned long long parsed = strtoull(hex, &end, 16);
-  if (errno != 0 || end == NULL || *end != '\0') {
-    return false;
-  }
-  *session_id_out = (uint64_t)parsed;
-  return true;
+  return wg_storage_parse_meta_filename(name, WG_STORAGE_FILE_PREFIX, session_id_out);
 }
 
 static uint32_t storage_manifest_generation_get(const wg_session_manifest_t *manifest,
                                                 bool *valid_out) {
-  bool valid = (manifest != NULL && manifest->reserved1[2] == WG_STORAGE_MANIFEST_GEN_MAGIC);
-  if (valid_out != NULL) {
-    *valid_out = valid;
-  }
-  if (!valid) {
+  if (manifest == NULL) {
+    if (valid_out != NULL) {
+      *valid_out = false;
+    }
     return 0;
   }
-  return (uint32_t)manifest->reserved0 | ((uint32_t)manifest->reserved1[0] << 16) |
-         ((uint32_t)manifest->reserved1[1] << 24);
+  return wg_storage_manifest_generation_get(manifest->reserved0, manifest->reserved1,
+                                            WG_STORAGE_MANIFEST_GEN_MAGIC, valid_out);
 }
 
 static void storage_manifest_generation_set(wg_session_manifest_t *manifest, uint32_t generation) {
   if (manifest == NULL) {
     return;
   }
-  manifest->reserved0 = (uint16_t)(generation & 0xFFFFU);
-  manifest->reserved1[0] = (uint8_t)((generation >> 16) & 0xFFU);
-  manifest->reserved1[1] = (uint8_t)((generation >> 24) & 0xFFU);
-  manifest->reserved1[2] = WG_STORAGE_MANIFEST_GEN_MAGIC;
+  wg_storage_manifest_generation_set(&manifest->reserved0, manifest->reserved1,
+                                     WG_STORAGE_MANIFEST_GEN_MAGIC, generation);
 }
 
 static int storage_manifest_generation_cmp(uint32_t lhs, uint32_t rhs) {
-  if (lhs == rhs) {
-    return 0;
-  }
-  uint32_t delta = lhs - rhs;
-  return (delta < 0x80000000U) ? 1 : -1;
+  return wg_storage_manifest_generation_cmp(lhs, rhs);
 }
 
 static int storage_manifest_compare_freshness(const wg_session_manifest_t *lhs,
@@ -4856,65 +4834,23 @@ static void recompute_effective_gps_fix(void) {
 }
 
 static bool parse_nmea_latlon(const char *value, const char *hemi, int32_t *out_e7) {
-  if (value == NULL || hemi == NULL || out_e7 == NULL || value[0] == '\0' || hemi[0] == '\0') {
-    return false;
-  }
-  char *end = NULL;
-  double raw = strtod(value, &end);
-  if (end == value || raw <= 0.0) {
-    return false;
-  }
-  int degrees = (int)(raw / 100.0);
-  double minutes = raw - (double)degrees * 100.0;
-  double dec = (double)degrees + minutes / 60.0;
-  if (hemi[0] == 'S' || hemi[0] == 'W') {
-    dec = -dec;
-  } else if (hemi[0] != 'N' && hemi[0] != 'E') {
-    return false;
-  }
-  *out_e7 = (int32_t)llround(dec * 10000000.0);
-  return true;
+  return wg_gps_parse_nmea_latlon(value, hemi, out_e7);
 }
 
 static uint16_t parse_nmea_dop_centi(const char *token) {
-  if (token == NULL || token[0] == '\0') {
-    return 0;
-  }
-  char *end = NULL;
-  double dop = strtod(token, &end);
-  if (end == token || !isfinite(dop) || dop <= 0.0) {
-    return 0;
-  }
-  if (dop > 999.99) {
-    dop = 999.99;
-  }
-  return clamp_u16_u32((uint32_t)llround(dop * 100.0));
+  return wg_gps_parse_nmea_dop_centi(token);
 }
 
 static bool nmea_sentence_has_type(const char *line, const char *type3) {
-  if (line == NULL || type3 == NULL) {
-    return false;
-  }
-  size_t len = strnlen(line, 16);
-  if (len < 6) {
-    return false;
-  }
-  return line[0] == '$' && strncmp(&line[3], type3, 3) == 0;
+  return wg_gps_nmea_sentence_has_type(line, type3);
 }
 
 static uint16_t nmea_sentence_talker_key(const char *line) {
-  if (line == NULL) {
-    return 0;
-  }
-  size_t len = strnlen(line, 8);
-  if (len < 3 || line[0] != '$') {
-    return 0;
-  }
-  return (((uint16_t)(uint8_t)line[1]) << 8) | (uint16_t)(uint8_t)line[2];
+  return wg_gps_nmea_sentence_talker_key(line);
 }
 
 static bool talker_key_is_gn(uint16_t key) {
-  return key == ((((uint16_t)'G') << 8) | (uint16_t)'N');
+  return wg_gps_talker_key_is_gn(key);
 }
 
 static void gps_update_talker_sat(gps_talker_sat_t *buckets, size_t bucket_count, uint16_t talker_key,
@@ -6129,23 +6065,18 @@ static bool send_snapshot_end(void) {
   return sent;
 }
 
-static uint16_t rd_u16_le(const uint8_t *in) { return (uint16_t)in[0] | ((uint16_t)in[1] << 8); }
+static uint16_t rd_u16_le(const uint8_t *in) { return wg_transport_rd_u16_le(in); }
 
 static void wr_u16_le(uint8_t *out, uint16_t value) {
-  out[0] = (uint8_t)(value & 0xFF);
-  out[1] = (uint8_t)((value >> 8) & 0xFF);
+  wg_transport_wr_u16_le(out, value);
 }
 
 static void wr_u32_le(uint8_t *out, uint32_t value) {
-  out[0] = (uint8_t)(value & 0xFF);
-  out[1] = (uint8_t)((value >> 8) & 0xFF);
-  out[2] = (uint8_t)((value >> 16) & 0xFF);
-  out[3] = (uint8_t)((value >> 24) & 0xFF);
+  wg_transport_wr_u32_le(out, value);
 }
 
 static void wr_u64_le(uint8_t *out, uint64_t value) {
-  wr_u32_le(out, (uint32_t)(value & 0xFFFFFFFFULL));
-  wr_u32_le(out + 4, (uint32_t)((value >> 32) & 0xFFFFFFFFULL));
+  wg_transport_wr_u64_le(out, value);
 }
 
 static uint8_t rsn_cipher_flags_from_suite(const uint8_t *suite) {
@@ -7586,48 +7517,13 @@ static void refresh_link_security_state(uint16_t conn_handle) {
 }
 
 static const char *ble_phy_name(uint8_t phy) {
-  switch (phy) {
-    case BLE_GAP_LE_PHY_1M:
-      return "1M";
-    case BLE_GAP_LE_PHY_2M:
-      return "2M";
-    case BLE_GAP_LE_PHY_CODED:
-      return "CODED";
-    default:
-      return "unknown";
-  }
+  return wg_transport_ble_phy_name(phy);
 }
 
 static uint16_t ble_notify_frame_payload_limit(void) {
-  uint16_t mtu = s_ble_att_mtu;
-  if (mtu < 23) {
-    mtu = 23;
-  }
-  if (mtu <= (WG_FRAME_HEADER_SIZE + 3)) {
-    return 0;
-  }
-  uint16_t limit = (uint16_t)(mtu - WG_FRAME_HEADER_SIZE - 3);
-  if (limit > WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX) {
-    limit = WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX;
-  }
-  // Cap payload so the entire BLE notification fits within 2 LL PDU fragments.
-  // Some Android BLE stacks silently fail to reassemble L2CAP PDUs spanning 3+
-  // LL fragments.  With DLE=251 and encryption (4-byte MIC), each fragment
-  // carries at most 247 bytes of L2CAP data.  Two fragments = 494 bytes L2CAP
-  // → 490 ATT PDU → 487 notification value → 475 WG frame payload.
-  const uint16_t dle = WG_BLE_DATA_LEN_OCTETS;
-  const uint16_t mic = s_ble_encrypted ? 4 : 0;
-  const uint16_t l2cap_per_frag = (dle > mic) ? (uint16_t)(dle - mic) : 1;
-  const uint16_t safe_l2cap = (uint16_t)(l2cap_per_frag * 2U);
-  const uint16_t safe_att = (safe_l2cap > 4) ? (uint16_t)(safe_l2cap - 4) : 0;
-  const uint16_t safe_notify = (safe_att > 3) ? (uint16_t)(safe_att - 3) : 0;
-  const uint16_t safe_payload = (safe_notify > WG_FRAME_HEADER_SIZE)
-                                    ? (uint16_t)(safe_notify - WG_FRAME_HEADER_SIZE)
-                                    : 0;
-  if (limit > safe_payload) {
-    limit = safe_payload;
-  }
-  return limit;
+  return wg_transport_ble_notify_payload_limit(s_ble_att_mtu, WG_FRAME_HEADER_SIZE,
+                                               WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX,
+                                               WG_BLE_DATA_LEN_OCTETS, s_ble_encrypted);
 }
 
 static void refresh_ble_link_metrics(uint16_t conn_handle, const char *reason_tag) {

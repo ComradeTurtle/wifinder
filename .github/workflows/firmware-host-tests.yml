@@ -1,0 +1,19 @@
+name: Firmware Host Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  firmware-host-tests:
+    name: firmware-host-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run firmware host tests
+        run: ./scripts/run_host_tests.sh

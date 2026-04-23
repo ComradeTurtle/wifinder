@@ -285,6 +285,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
   fun downloadBacklog() { service?.downloadBacklogToCsv() }
   fun seedDebugBacklog() { service?.seedDebugBacklog() }
   fun pushPhoneGpsNow() { service?.pushPhoneGpsNow() }
+  fun selectBleDevice(address: String) { service?.selectBleDevice(address) }
+  fun dismissBleDevicePicker() { service?.dismissBleDevicePicker() }
+  fun forgetPreferredBleDevice() { service?.forgetPreferredBleDevice() }
 
   // ── State merging ─────────────────────────────────────────
 
@@ -359,6 +362,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         gpxPointCount = svc.gpxPointCount,
         loggingEnabled = svc.loggingEnabled,
         csvPath = svc.csvPath,
+        preferredBleDeviceAddress = svc.preferredBleDeviceAddress,
+        preferredBleDeviceName = svc.preferredBleDeviceName,
+        bleDevicePickerVisible = svc.bleDevicePickerVisible,
+        bleDeviceCandidates = svc.bleDeviceCandidates.map {
+          BleDeviceCandidateUi(
+            address = it.address,
+            name = it.name,
+            rssi = it.rssi,
+            remembered = it.remembered,
+          )
+        },
         sightings = svc.sightings,
         logs = svc.logs,
         hopInputMs = if (!ui.hopInputDirty) svc.autoHopBaseMs else ui.hopInputMs,

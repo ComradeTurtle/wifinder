@@ -17,6 +17,7 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import com.wifinder.android.ble.BleDeviceCandidate
 import com.wifinder.android.ble.WiFinderBleClient
 import com.wifinder.android.logging.GpxTrackLogger
 import com.wifinder.android.gps.GpsTracker
@@ -139,8 +140,19 @@ data class ServiceState(
   val gpxPointCount: Long = 0L,
   val loggingEnabled: Boolean = false,
   val csvPath: String = "",
+  val preferredBleDeviceAddress: String = "",
+  val preferredBleDeviceName: String = "",
+  val bleDevicePickerVisible: Boolean = false,
+  val bleDeviceCandidates: List<ServiceBleDeviceCandidate> = emptyList(),
   val sightings: List<SightingUi> = emptyList(),
   val logs: List<String> = emptyList(),
+)
+
+data class ServiceBleDeviceCandidate(
+  val address: String,
+  val name: String,
+  val rssi: Int,
+  val remembered: Boolean,
 )
 
 class ScannerService : Service(), WiFinderBleClient.Listener {
@@ -168,6 +180,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     private const val PREF_AUTO_HOP_BASE_MS = "auto_hop_base_ms"
     private const val PREF_GPS_NAV_MODE = "gps_nav_mode"
     private const val PREF_GPX_ENABLED = "gpx_enabled"
+    private const val PREF_PREFERRED_BLE_DEVICE_ADDRESS = "preferred_ble_device_address"
+    private const val PREF_PREFERRED_BLE_DEVICE_NAME = "preferred_ble_device_name"
     private const val GPX_MIN_ELAPSED_MS = 1000L
     private const val GPX_MIN_DISTANCE_METERS = 5.0
     private const val BLOB_BLOCK_SIZE = 1024
@@ -258,6 +272,10 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
   private val _state = MutableStateFlow(ServiceState())
+  private val backlogTransferCoordinator = BacklogTransferCoordinator(
+    onSnapshot = ::applyBacklogTransferSnapshot,
+    onLog = ::appendLog,
+  )
   val state: StateFlow<ServiceState> = _state.asStateFlow()
 
   private val sightings = linkedMapOf<String, SightingUi>()
@@ -265,7 +283,6 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
   private val lastCsvWriteByBssid = hashMapOf<String, Long>()
   private val sightingsMutex = Mutex()
   private val ackLock = Any()
-  private val backlogRecoveryLock = Any()
   private val sessionAcks = hashMapOf<Long, SessionAckTracker>()
 
   private val logTime = SimpleDateFormat("HH:mm:ss", Locale.US)
@@ -294,12 +311,12 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
   @Volatile private var downloadBacklogAutoStop: Boolean = false
   @Volatile private var downloadBacklogStartMs: Long = 0L
   @Volatile private var visibleTimeoutSec: Int = 25
-  @Volatile private var backlogBlobRecoveryInFlight: Boolean = false
   @Volatile private var backlogBlobRx: BacklogBlobReceiver? = null
   @Volatile private var blobProgressUiLastMs: Long = 0L
   @Volatile private var blobProgressUiLastBytes: Long = 0L
-  @Volatile private var wifiDumpInProgress: Boolean = false
   @Volatile private var wifiDumpJob: Job? = null
+  @Volatile private var preferredBleDeviceAddress: String? = null
+  @Volatile private var preferredBleDeviceName: String = ""
 
   override fun onCreate() {
     super.onCreate()
@@ -376,7 +393,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     scope.cancel()
     wifiDumpJob?.cancel()
     wifiDumpJob = null
-    wifiDumpInProgress = false
+    backlogTransferCoordinator.resetIdle()
     try { bleClient.sendGpsClear() } catch (_: Exception) {}
     try { bleClient.setWifiDumpEnabled(false) } catch (_: Exception) {}
     stopLiveGpxSession(reason = null)
@@ -392,6 +409,9 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     val autoHopEnabled = prefs.getBoolean(PREF_AUTO_HOP_ENABLED, false)
     gpsNavMode = normalizeGpsNavMode(prefs.getInt(PREF_GPS_NAV_MODE, 0))
     gpxEnabled = prefs.getBoolean(PREF_GPX_ENABLED, true)
+    preferredBleDeviceAddress = prefs.getString(PREF_PREFERRED_BLE_DEVICE_ADDRESS, null)
+    preferredBleDeviceName = prefs.getString(PREF_PREFERRED_BLE_DEVICE_NAME, "") ?: ""
+    bleClient.setPreferredDeviceAddress(preferredBleDeviceAddress)
     _state.update {
       it.copy(
         visibleTimeoutSec = visibleTimeoutSec,
@@ -400,6 +420,40 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         autoHopAppliedMs = autoHopBase,
         gpsNavMode = gpsNavMode,
         gpxEnabled = gpxEnabled,
+        preferredBleDeviceAddress = preferredBleDeviceAddress ?: "",
+        preferredBleDeviceName = preferredBleDeviceName,
+      )
+    }
+  }
+
+  private fun persistPreferredBleDevice(address: String, name: String?) {
+    preferredBleDeviceAddress = address
+    preferredBleDeviceName = name?.trim().orEmpty()
+    prefs.edit()
+      .putString(PREF_PREFERRED_BLE_DEVICE_ADDRESS, preferredBleDeviceAddress)
+      .putString(PREF_PREFERRED_BLE_DEVICE_NAME, preferredBleDeviceName)
+      .apply()
+    bleClient.setPreferredDeviceAddress(preferredBleDeviceAddress)
+    _state.update {
+      it.copy(
+        preferredBleDeviceAddress = preferredBleDeviceAddress ?: "",
+        preferredBleDeviceName = preferredBleDeviceName,
+      )
+    }
+  }
+
+  private fun clearPreferredBleDevice() {
+    preferredBleDeviceAddress = null
+    preferredBleDeviceName = ""
+    prefs.edit()
+      .remove(PREF_PREFERRED_BLE_DEVICE_ADDRESS)
+      .remove(PREF_PREFERRED_BLE_DEVICE_NAME)
+      .apply()
+    bleClient.setPreferredDeviceAddress(null)
+    _state.update {
+      it.copy(
+        preferredBleDeviceAddress = "",
+        preferredBleDeviceName = "",
       )
     }
   }
@@ -423,16 +477,29 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     prefs.edit().putBoolean(PREF_GPX_ENABLED, enabled).apply()
   }
 
+  private fun applyBacklogTransferSnapshot(snapshot: BacklogTransferSnapshot) {
+    _state.update {
+      it.copy(
+        downloadBacklogActive = snapshot.downloadActive,
+        blobActive = snapshot.blobActive,
+        blobSessionId = snapshot.blobSessionId,
+        blobBytesSent = snapshot.blobBytesSent,
+        blobBytesTotal = snapshot.blobBytesTotal,
+      )
+    }
+  }
+
   // ── Public API (called by ViewModel via binder) ─────────────
 
   fun doConnect() {
+    _state.update { it.copy(bleDevicePickerVisible = false, bleDeviceCandidates = emptyList()) }
     bleClient.connect()
   }
 
   fun doDisconnect() {
     wifiDumpJob?.cancel()
     wifiDumpJob = null
-    wifiDumpInProgress = false
+    backlogTransferCoordinator.resetIdle()
     phoneGpsPushActive = false
     stopLiveGpxSession(reason = null)
     if (controlLinkReadySilent()) {
@@ -442,9 +509,6 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     val shouldAutoStopCsv = downloadBacklogAutoStop
     downloadBacklogAutoStop = false
     downloadBacklogStartMs = 0L
-    synchronized(backlogRecoveryLock) {
-      backlogBlobRecoveryInFlight = false
-    }
     bleClient.sendGpsClear()
     resetBacklogBlobReceiver(discardFile = true)
     bleClient.disconnect()
@@ -455,7 +519,43 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     if (shouldAutoStopCsv && csvLogger.isActive) {
       stopLogging()
     }
-    _state.update { it.copy(phoneGpsPushActive = false, downloadBacklogActive = false) }
+    _state.update {
+      it.copy(
+        phoneGpsPushActive = false,
+        downloadBacklogActive = false,
+        blobActive = false,
+        blobSessionId = 0L,
+        blobBytesSent = 0L,
+        blobBytesTotal = 0L,
+        bleDevicePickerVisible = false,
+        bleDeviceCandidates = emptyList(),
+      )
+    }
+  }
+
+  fun selectBleDevice(address: String): Boolean {
+    val normalized = address.trim().uppercase(Locale.US)
+    val selected = _state.value.bleDeviceCandidates.firstOrNull { it.address == normalized } ?: run {
+      appendLog("BLE picker selection failed: device missing")
+      return false
+    }
+    persistPreferredBleDevice(normalized, selected.name)
+    _state.update { it.copy(bleDevicePickerVisible = false, bleDeviceCandidates = emptyList()) }
+    val started = bleClient.connectToAddress(normalized)
+    if (!started) {
+      appendLog("BLE picker selection failed: connect attempt did not start")
+    }
+    return started
+  }
+
+  fun dismissBleDevicePicker() {
+    _state.update { it.copy(bleDevicePickerVisible = false) }
+  }
+
+  fun forgetPreferredBleDevice() {
+    clearPreferredBleDevice()
+    _state.update { it.copy(bleDevicePickerVisible = false, bleDeviceCandidates = emptyList()) }
+    appendLog("Forgot preferred BLE device")
   }
 
   fun disconnectAndStop() {
@@ -592,25 +692,15 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     if (_state.value.downloadBacklogActive) {
       wifiDumpJob?.cancel()
       wifiDumpJob = null
-      wifiDumpInProgress = false
       val okWifiDump = bleClient.setWifiDumpEnabled(false)
       val okBlob = bleClient.setBacklogBlobEnabled(false)
       if (!okWifiDump && !okBlob) {
         appendLog("Backlog stop command failed")
         return false
       }
+      backlogTransferCoordinator.cancel("Backlog download stopped")
       downloadBacklogStartMs = 0L
       resetBacklogBlobReceiver(discardFile = true)
-      _state.update {
-        it.copy(
-          downloadBacklogActive = false,
-          blobActive = false,
-          blobSessionId = 0L,
-          blobBytesSent = 0L,
-          blobBytesTotal = 0L,
-        )
-      }
-      appendLog("Backlog download stopped")
       val shouldAutoStopCsv = downloadBacklogAutoStop
       downloadBacklogAutoStop = false
       if (shouldAutoStopCsv && csvLogger.isActive) {
@@ -625,19 +715,14 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     synchronized(ackLock) {
       sessionAcks.clear()
     }
+    if (!backlogTransferCoordinator.startWifi()) {
+      appendLog("Backlog download already active")
+      return false
+    }
     val okWifiDump = bleClient.setWifiDumpEnabled(true)
     if (!okWifiDump) {
+      backlogTransferCoordinator.failTransfer("wifi enable failed", "Backlog download request failed")
       downloadBacklogStartMs = 0L
-      _state.update {
-        it.copy(
-          downloadBacklogActive = false,
-          blobActive = false,
-          blobSessionId = 0L,
-          blobBytesSent = 0L,
-          blobBytesTotal = 0L,
-        )
-      }
-      appendLog("Backlog download request failed")
       if (downloadBacklogAutoStop && csvLogger.isActive) {
         stopLogging()
       }
@@ -646,17 +731,6 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     }
 
     downloadBacklogStartMs = System.currentTimeMillis()
-    wifiDumpInProgress = true
-    _state.update {
-      it.copy(
-        downloadBacklogActive = true,
-        blobActive = true,
-        blobSessionId = 0L,
-        blobBytesSent = 0L,
-        blobBytesTotal = 0L,
-      )
-    }
-    appendLog("Backlog download started (Wi-Fi dump)")
     wifiDumpJob?.cancel()
     wifiDumpJob = scope.launch {
       runWifiDumpTransfer()
@@ -849,7 +923,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     downloadBacklogAutoStop = false
     downloadBacklogStartMs = 0L
     csvLogger.stopSession()
-    _state.update { it.copy(loggingEnabled = false, downloadBacklogActive = false) }
+    _state.update { it.copy(loggingEnabled = false) }
     appendLog("CSV logging stopped")
   }
 
@@ -859,7 +933,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     if (!connected) {
       wifiDumpJob?.cancel()
       wifiDumpJob = null
-      wifiDumpInProgress = false
+      backlogTransferCoordinator.resetIdle()
       lastEspGps = null
       lastEspFixMs = -1L
       stopLiveGpxSession(reason = null)
@@ -872,9 +946,6 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       val shouldAutoStopCsv = downloadBacklogAutoStop
       downloadBacklogAutoStop = false
       downloadBacklogStartMs = 0L
-      synchronized(backlogRecoveryLock) {
-        backlogBlobRecoveryInFlight = false
-      }
       if (shouldAutoStopCsv && csvLogger.isActive) {
         stopLogging()
       }
@@ -927,6 +998,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         gpxLogging = if (!connected) false else current.gpxLogging,
         gpxPath = current.gpxPath,
         gpxPointCount = current.gpxPointCount,
+        bleDevicePickerVisible = if (!connected) false else current.bleDevicePickerVisible,
+        bleDeviceCandidates = if (!connected) emptyList() else current.bleDeviceCandidates,
       )
     }
     appendLog(if (connected) "Connected" else "Disconnected")
@@ -955,11 +1028,38 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     appendLog(message)
   }
 
+  override fun onBleDeviceCandidates(candidates: List<BleDeviceCandidate>) {
+    val mapped = candidates.map {
+      ServiceBleDeviceCandidate(
+        address = it.address,
+        name = it.name,
+        rssi = it.rssi,
+        remembered = it.remembered,
+      )
+    }
+    _state.update {
+      it.copy(
+        bleDevicePickerVisible = mapped.isNotEmpty(),
+        bleDeviceCandidates = mapped,
+      )
+    }
+    if (mapped.isNotEmpty()) {
+      appendLog("BLE picker: ${mapped.size} eligible devices")
+    }
+  }
+
+  override fun onBleDeviceResolved(address: String, name: String?) {
+    persistPreferredBleDevice(address, name)
+    _state.update { it.copy(bleDevicePickerVisible = false, bleDeviceCandidates = emptyList()) }
+    appendLog("BLE target set: ${name?.takeIf { n -> n.isNotBlank() } ?: address}")
+  }
+
   // ── Internal ───────────────────────────────────────────────
 
   private fun handleStatusFrame(payload: ByteArray) {
     val wasEncrypted = _state.value.bleEncrypted
     val wasReplayActive = _state.value.replayActive
+    val transferOverlayActive = backlogTransferCoordinator.isActive()
     val status: StatusPayload = try {
       WgProtocol.decodeStatusPayload(payload)
     } catch (e: Exception) {
@@ -1006,10 +1106,10 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         spiffsUsedBytes = status.spiffsUsedBytes,
         spiffsFreeBytes = status.spiffsFreeBytes,
         dieTempCenti = status.dieTempCenti,
-        blobActive = if (wifiDumpInProgress) current.blobActive else status.blobActive,
-        blobSessionId = if (wifiDumpInProgress) current.blobSessionId else status.blobSessionId,
-        blobBytesSent = if (wifiDumpInProgress) current.blobBytesSent else status.blobBytesSent,
-        blobBytesTotal = if (wifiDumpInProgress) current.blobBytesTotal else status.blobBytesTotal,
+        blobActive = if (transferOverlayActive) current.blobActive else status.blobActive,
+        blobSessionId = if (transferOverlayActive) current.blobSessionId else status.blobSessionId,
+        blobBytesSent = if (transferOverlayActive) current.blobBytesSent else status.blobBytesSent,
+        blobBytesTotal = if (transferOverlayActive) current.blobBytesTotal else status.blobBytesTotal,
       )
     }
 
@@ -1019,31 +1119,18 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     val withinStartGrace =
       downloadBacklogStartMs > 0L && (nowMs - downloadBacklogStartMs) < 2500L
     if (_state.value.downloadBacklogActive && status.scanning && !withinStartGrace) {
-      downloadBacklogStartMs = 0L
-      _state.update { it.copy(downloadBacklogActive = false) }
-      appendLog("Backlog download stopped: scanner is active")
-      val shouldAutoStopCsv = downloadBacklogAutoStop
-      downloadBacklogAutoStop = false
-      if (shouldAutoStopCsv && csvLogger.isActive) {
-        stopLogging()
-      }
+      backlogTransferCoordinator.failTransfer(
+        reason = "scanner active",
+        logMessage = "Backlog download failed: scanner is active",
+      )
+      finalizeBacklogTransferAfterTerminal()
     } else if (_state.value.downloadBacklogActive &&
-      !wifiDumpInProgress &&
+      backlogTransferCoordinator.currentStage() == BacklogTransferStage.BLE_FALLBACK_ACTIVE &&
       status.queuedRecords == 0L &&
       !status.replayActive &&
       !status.blobActive) {
-      _state.update { it.copy(downloadBacklogActive = false) }
-      if (controlLinkReadySilent()) {
-        bleClient.setBacklogBlobEnabled(false)
-      }
-      downloadBacklogStartMs = 0L
-      resetBacklogBlobReceiver(discardFile = true)
-      appendLog("Backlog download complete")
-      val shouldAutoStopCsv = downloadBacklogAutoStop
-      downloadBacklogAutoStop = false
-      if (shouldAutoStopCsv && csvLogger.isActive) {
-        stopLogging()
-      }
+      backlogTransferCoordinator.completeBleFallback("Backlog BLE fallback complete")
+      finalizeBacklogTransferAfterTerminal()
     }
 
     if (!status.bleEncrypted) return
@@ -1232,14 +1319,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     appendLog(
       "Backlog blob session 0x${java.lang.Long.toUnsignedString(meta.sessionId, 16)} size=${meta.totalBytes}B acked=${meta.ackedSeq} written=${meta.writtenSeq}",
     )
-    _state.update {
-      it.copy(
-        blobActive = true,
-        blobSessionId = meta.sessionId,
-        blobBytesSent = 0L,
-        blobBytesTotal = meta.totalBytes,
-      )
-    }
+    backlogTransferCoordinator.noteBleSessionMeta(meta.sessionId, meta.totalBytes)
   }
 
   private fun handleBacklogBlobChunkFrame(payload: ByteArray) {
@@ -1255,10 +1335,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       return
     }
 
-    var uiUpdateSessionId = 0L
-    var uiUpdateBytes = 0L
-    var uiUpdateTotal = 0L
-    var shouldUpdateUi = false
+    var progressBytes = -1L
+    var progressTotal = 0L
     var replyOffset = offset
     var replyLen = chunkLen
     var replyAccept = false
@@ -1292,7 +1370,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
           appendLog("Backlog chunk write failed: ${e.message}")
           sendBacklogBlobChunkReply(sessionId, rx.receivedBytes, 0, accepted = false)
           resetBacklogBlobReceiver(discardFile = true)
-          recoverBacklogBlobStream("chunk write failed")
+          backlogTransferCoordinator.failBleFallback("chunk write failed")
+          finalizeBacklogTransferAfterTerminal()
           return
         }
         rx.receivedBytes += chunkLen.toLong()
@@ -1308,10 +1387,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         if (dueToTime || dueToBytes || done) {
           blobProgressUiLastMs = nowMs
           blobProgressUiLastBytes = rx.receivedBytes
-          shouldUpdateUi = true
-          uiUpdateSessionId = rx.sessionId
-          uiUpdateBytes = rx.receivedBytes
-          uiUpdateTotal = rx.totalBytes
+          progressBytes = rx.receivedBytes
+          progressTotal = rx.totalBytes
         }
       }
     }
@@ -1323,15 +1400,8 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       accepted = replyAccept,
     )
 
-    if (shouldUpdateUi) {
-      _state.update {
-        it.copy(
-          blobActive = true,
-          blobSessionId = uiUpdateSessionId,
-          blobBytesSent = uiUpdateBytes,
-          blobBytesTotal = uiUpdateTotal,
-        )
-      }
+    if (progressBytes >= 0L) {
+      backlogTransferCoordinator.noteBleSessionProgress(sessionId, progressBytes, progressTotal)
     }
   }
 
@@ -1419,14 +1489,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     appendLog(
       "Backlog blob received session 0x${java.lang.Long.toUnsignedString(done.sessionId, 16)} (${done.totalBytes}B), importing...",
     )
-    _state.update {
-      it.copy(
-        blobActive = false,
-        blobSessionId = done.sessionId,
-        blobBytesSent = done.totalBytes,
-        blobBytesTotal = done.totalBytes,
-      )
-    }
+    backlogTransferCoordinator.noteBleSessionProgress(done.sessionId, done.totalBytes, done.totalBytes)
     importBacklogBlobSessionAsync(
       file = completed.file,
       sessionId = done.sessionId,
@@ -1452,11 +1515,13 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
       )
       if (importComplete) {
         queueBlobSessionAck(sessionId, targetSeq, force = true)
-      } else {
-        appendLog(
-          "Backlog import incomplete sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)}; withholding ACK and retrying",
+        backlogTransferCoordinator.completeBleFallback(
+          "Backlog BLE fallback complete sid=0x${java.lang.Long.toUnsignedString(sessionId, 16)}",
         )
-        recoverBacklogBlobStream("import integrity check failed")
+        finalizeBacklogTransferAfterTerminal()
+      } else {
+        backlogTransferCoordinator.failBleFallback("import integrity check failed")
+        finalizeBacklogTransferAfterTerminal()
       }
       try {
         file.delete()
@@ -1480,53 +1545,16 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
     }
   }
 
-  private fun recoverBacklogBlobStream(reason: String) {
-    if (!_state.value.downloadBacklogActive) {
-      return
-    }
-    if (!controlLinkReadySilent()) {
-      appendLog("Backlog recovery skipped: control link unavailable")
-      return
-    }
-    synchronized(backlogRecoveryLock) {
-      if (backlogBlobRecoveryInFlight) {
-        return
-      }
-      backlogBlobRecoveryInFlight = true
-    }
-    appendLog("Backlog blob desync ($reason); restarting stream")
-    scope.launch {
-      try {
-        val disableOk = bleClient.setBacklogBlobEnabled(false)
-        if (!disableOk) {
-          appendLog("Backlog recovery failed: disable command failed")
-          return@launch
-        }
-        delay(120)
-        val enableOk = bleClient.setBacklogBlobEnabled(true)
-        if (!enableOk) {
-          appendLog("Backlog recovery failed: enable command failed")
-          return@launch
-        }
-        delay(80)
-        bleClient.requestStatus()
-      } finally {
-        synchronized(backlogRecoveryLock) {
-          backlogBlobRecoveryInFlight = false
-        }
-      }
-    }
-  }
-
   private suspend fun runWifiDumpTransfer() {
-    var success = false
+    var wifiCommitted = false
     var cancelled = false
+    var failureReason: String? = null
     var runId: Long = 0L
     try {
       val transferOk = withWifiDumpNetwork { network ->
         val manifest = fetchWifiDumpManifest(network)
         if (manifest == null) {
-          appendLog("Backlog download failed: Wi-Fi dump manifest unavailable")
+          failureReason = "manifest unavailable"
           return@withWifiDumpNetwork false
         }
         runId = manifest.runId
@@ -1554,14 +1582,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
           )
 
           val datFile = File(dumpDir, "session-$sidHex.dat")
-          _state.update {
-            it.copy(
-              blobActive = true,
-              blobSessionId = session.sessionId,
-              blobBytesSent = 0L,
-              blobBytesTotal = session.datBytes,
-            )
-          }
+          backlogTransferCoordinator.noteBleSessionMeta(session.sessionId, session.datBytes)
 
           val datOk = downloadWifiDumpFile(
             network = network,
@@ -1570,17 +1591,14 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
             expectedBytes = session.datBytes,
             outFile = datFile,
           ) { downloaded ->
-            _state.update { state ->
-              state.copy(
-                blobActive = true,
-                blobSessionId = session.sessionId,
-                blobBytesSent = downloaded.coerceAtLeast(0L),
-                blobBytesTotal = session.datBytes,
-              )
-            }
+            backlogTransferCoordinator.noteBleSessionProgress(
+              sessionId = session.sessionId,
+              bytesReceived = downloaded.coerceAtLeast(0L),
+              totalBytes = session.datBytes,
+            )
           }
           if (!datOk) {
-            appendLog("Backlog Wi-Fi session failed sid=0x$sidHex (dat download)")
+            failureReason = "session sid=0x$sidHex dat download failed"
             return@withWifiDumpNetwork false
           }
 
@@ -1595,7 +1613,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
             "Backlog Wi-Fi import sid=0x$sidHex records=${result.records} highest_seq=${result.highestSeq} bad_blocks=${result.badBlocks} gap=${result.gapDetected}",
           )
           if (!importComplete) {
-            appendLog("Backlog Wi-Fi import failed integrity check sid=0x$sidHex")
+            failureReason = "session sid=0x$sidHex integrity check failed"
             return@withWifiDumpNetwork false
           }
           try {
@@ -1612,7 +1630,7 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
               outFile = gpxFile,
             )
             if (!gpxOk) {
-              appendLog("Backlog Wi-Fi session sid=0x$sidHex gpx download failed")
+              failureReason = "session sid=0x$sidHex gpx download failed"
               return@withWifiDumpNetwork false
             }
             try {
@@ -1623,55 +1641,82 @@ class ScannerService : Service(), WiFinderBleClient.Listener {
         true
       } ?: false
       if (!transferOk) {
+        if (failureReason == null) {
+          failureReason = if (runId != 0L) {
+            "run=0x${toHex64(runId)} transfer failed"
+          } else {
+            "Wi-Fi transfer failed"
+          }
+        }
         return
       }
 
       if (!bleClient.commitWifiDump(runId)) {
-        appendLog("Backlog commit failed (run=0x${toHex64(runId)})")
+        failureReason = "commit failed for run=0x${toHex64(runId)}"
         return
       }
       bleClient.requestStatus()
-      success = true
-      appendLog("Backlog Wi-Fi download complete")
+      backlogTransferCoordinator.completeWifi()
+      finalizeBacklogTransferAfterTerminal()
+      wifiCommitted = true
     } catch (e: kotlinx.coroutines.CancellationException) {
       cancelled = true
     } catch (e: Exception) {
-      appendLog("Backlog Wi-Fi transfer error: ${e.message}")
+      failureReason = "transfer error: ${e.message ?: e.javaClass.simpleName}"
     } finally {
-      wifiDumpInProgress = false
       wifiDumpJob = null
       downloadBacklogStartMs = 0L
-      resetBacklogBlobReceiver(discardFile = true)
-      if (controlLinkReadySilent()) {
-        bleClient.setWifiDumpEnabled(false)
-        bleClient.setBacklogBlobEnabled(false)
-        bleClient.requestStatus()
+      if (cancelled) {
+        backlogTransferCoordinator.cancel("Backlog download stopped")
+        finalizeBacklogTransferAfterTerminal()
+        return
       }
-      _state.update {
-        it.copy(
-          downloadBacklogActive = false,
-          blobActive = false,
-          blobSessionId = 0L,
-          blobBytesSent = 0L,
-          blobBytesTotal = 0L,
-        )
-      }
-      val shouldAutoStopCsv = downloadBacklogAutoStop
-      downloadBacklogAutoStop = false
-      if (shouldAutoStopCsv && csvLogger.isActive) {
-        stopLogging()
-      }
-      if (!success && !cancelled) {
-        appendLog(
-          if (runId != 0L) {
-            "Backlog Wi-Fi download ended with errors (run=0x${toHex64(runId)})"
+      if (!wifiCommitted && backlogTransferCoordinator.currentStage() == BacklogTransferStage.WIFI_ACTIVE) {
+        startBleFallbackAfterWifiFailure(
+          reason = failureReason ?: if (runId != 0L) {
+            "run=0x${toHex64(runId)} failed"
           } else {
-            "Backlog Wi-Fi download ended with errors"
+            "Wi-Fi transfer failed"
           },
         )
-      } else if (cancelled) {
-        appendLog("Backlog download stopped")
       }
+    }
+  }
+
+  private fun startBleFallbackAfterWifiFailure(reason: String) {
+    val fallbackStarted = backlogTransferCoordinator.failWifiAndRequestBleFallback(reason)
+    if (!fallbackStarted) {
+      finalizeBacklogTransferAfterTerminal()
+      return
+    }
+    if (!controlLinkReadySilent()) {
+      backlogTransferCoordinator.failBleFallback("control link unavailable")
+      finalizeBacklogTransferAfterTerminal()
+      return
+    }
+    val disableWifiOk = bleClient.setWifiDumpEnabled(false)
+    val enableBlobOk = bleClient.setBacklogBlobEnabled(true)
+    if (!disableWifiOk || !enableBlobOk) {
+      backlogTransferCoordinator.failBleFallback("BLE fallback toggle failed")
+      finalizeBacklogTransferAfterTerminal()
+      return
+    }
+    resetBacklogBlobReceiver(discardFile = true)
+    bleClient.requestStatus()
+  }
+
+  private fun finalizeBacklogTransferAfterTerminal() {
+    downloadBacklogStartMs = 0L
+    resetBacklogBlobReceiver(discardFile = true)
+    if (controlLinkReadySilent()) {
+      bleClient.setWifiDumpEnabled(false)
+      bleClient.setBacklogBlobEnabled(false)
+      bleClient.requestStatus()
+    }
+    val shouldAutoStopCsv = downloadBacklogAutoStop
+    downloadBacklogAutoStop = false
+    if (shouldAutoStopCsv && csvLogger.isActive) {
+      stopLogging()
     }
   }
 

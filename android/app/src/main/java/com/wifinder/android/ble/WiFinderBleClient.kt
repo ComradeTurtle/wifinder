@@ -11,12 +11,14 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelUuid
 import com.wifinder.android.model.GpsFix
 import com.wifinder.android.model.WgFrame
 import com.wifinder.android.model.WgProtocol
@@ -33,6 +35,10 @@ class WiFinderBleClient(
     fun onFrame(frame: WgFrame)
 
     fun onInfo(message: String)
+
+    fun onBleDeviceCandidates(candidates: List<BleDeviceCandidate>) {}
+
+    fun onBleDeviceResolved(address: String, name: String?) {}
   }
 
   companion object {
@@ -43,9 +49,9 @@ class WiFinderBleClient(
     private val CONFIG_UUID: UUID = UUID.fromString("6ee2e690-d7fd-4a11-94a2-89528da43134")
     private val DEVICE_INFO_UUID: UUID = UUID.fromString("6ee2e690-d7fd-4a11-94a2-89528da43135")
     private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-    private const val TARGET_DEVICE_NAME = "WIFINDER-C6"
-    private const val TARGET_DEVICE_ADDRESS = "A0:85:E3:DB:04:92"
+    private const val TARGET_NAME_HINT = "WIFINDER"
     private const val SCAN_TIMEOUT_MS = 12_000L
+    private const val SCAN_SETTLE_MS = 1_200L
     private const val TARGET_MTU = 517
   }
 
@@ -62,11 +68,22 @@ class WiFinderBleClient(
   private var configChar: BluetoothGattCharacteristic? = null
   private var deviceInfoChar: BluetoothGattCharacteristic? = null
   private var scanCallback: ScanCallback? = null
+  private var scanTimeoutRunnable: Runnable? = null
+  private var scanSettleRunnable: Runnable? = null
   private var connecting = false
   private var ready = false
+  private var preferredAddress: String? = null
+  private var connectedAddress: String? = null
+  private var connectedName: String? = null
+  private val discoveredCandidates = linkedMapOf<String, BleDeviceCandidate>()
+  private val discoveredDevices = linkedMapOf<String, BluetoothDevice>()
   private val notificationQueue = ArrayDeque<BluetoothGattCharacteristic>()
 
   fun isConnected(): Boolean = ready && gatt != null
+
+  fun setPreferredDeviceAddress(address: String?) {
+    preferredAddress = BleTargetingPolicy.normalizeAddress(address)
+  }
 
   fun connect() {
     if (connecting || isConnected()) {
@@ -79,31 +96,59 @@ class WiFinderBleClient(
       return
     }
 
-    val known = findKnownDevice(adapter)
+    val remembered = preferredAddress
+    val known = remembered?.let { findBondedDeviceByAddress(adapter, it) }
     if (known != null) {
       connectToDevice(known)
       return
     }
 
-    startScan(adapter)
+    startScan(adapter, remembered)
+  }
+
+  fun connectToAddress(address: String): Boolean {
+    if (connecting || isConnected()) {
+      return false
+    }
+    val normalized = BleTargetingPolicy.normalizeAddress(address) ?: return false
+    val adapter = bluetoothManager.adapter
+    if (adapter == null || !adapter.isEnabled) {
+      listener.onInfo("Bluetooth adapter unavailable or disabled")
+      return false
+    }
+    val device = discoveredDevices[normalized] ?: runCatching {
+      adapter.getRemoteDevice(normalized)
+    }.getOrNull()
+    if (device == null) {
+      listener.onInfo("Selected device unavailable: $normalized")
+      return false
+    }
+    connectToDevice(device)
+    return true
   }
 
   @SuppressLint("MissingPermission")
   fun disconnect() {
     stopScan()
+    clearScanScheduling()
     connecting = false
     ready = false
+    connectedAddress = null
+    connectedName = null
     controlChar = null
     statusChar = null
     sightingChar = null
     configChar = null
     deviceInfoChar = null
     notificationQueue.clear()
+    discoveredCandidates.clear()
+    discoveredDevices.clear()
 
     val current = gatt
     gatt = null
     current?.disconnect()
     current?.close()
+    listener.onBleDeviceCandidates(emptyList())
     listener.onConnectState(false)
   }
 
@@ -237,28 +282,66 @@ class WiFinderBleClient(
   }
 
   @SuppressLint("MissingPermission")
-  private fun startScan(adapter: BluetoothAdapter) {
+  private fun startScan(adapter: BluetoothAdapter, rememberedAddress: String?) {
     val scanner = adapter.bluetoothLeScanner
     if (scanner == null) {
       listener.onInfo("BLE scanner unavailable")
       return
     }
 
+    stopScan()
+    clearScanScheduling()
+    discoveredCandidates.clear()
+    discoveredDevices.clear()
     connecting = true
-    listener.onInfo("Scanning for $TARGET_DEVICE_NAME ($TARGET_DEVICE_ADDRESS)...")
+
+    listener.onInfo(
+      if (rememberedAddress != null) {
+        "Scanning for $TARGET_NAME_HINT service (preferring $rememberedAddress)..."
+      } else {
+        "Scanning for $TARGET_NAME_HINT service..."
+      },
+    )
 
     val settings =
       ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+    val filters = listOf(
+      ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build(),
+    )
 
     val callback =
       object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
           val device = result.device ?: return
-          val matchesAddress = device.address.equals(TARGET_DEVICE_ADDRESS, ignoreCase = true)
-          if (!matchesAddress) {
+          val normalizedAddress = BleTargetingPolicy.normalizeAddress(device.address) ?: return
+          val scanRecord = result.scanRecord
+          val hasServiceUuid = scanRecord?.serviceUuids?.any { it.uuid == SERVICE_UUID } ?: true
+          val advertisedName = scanRecord?.deviceName ?: device.name
+          if (!BleTargetingPolicy.isEligibleCandidate(hasServiceUuid, advertisedName)) {
             return
           }
-          connectToDevice(device)
+
+          val previous = discoveredCandidates[normalizedAddress]
+          val resolvedName = when {
+            !advertisedName.isNullOrBlank() -> advertisedName
+            previous != null && previous.name.isNotBlank() -> previous.name
+            else -> normalizedAddress
+          }
+          val strongestRssi = maxOf(result.rssi, previous?.rssi ?: Int.MIN_VALUE)
+          discoveredDevices[normalizedAddress] = device
+          discoveredCandidates[normalizedAddress] =
+            BleDeviceCandidate(
+              address = normalizedAddress,
+              name = resolvedName,
+              rssi = strongestRssi,
+            )
+
+          if (rememberedAddress != null && normalizedAddress == rememberedAddress) {
+            connectToDevice(device)
+            return
+          }
+
+          scheduleScanSettle()
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -269,18 +352,61 @@ class WiFinderBleClient(
       }
 
     scanCallback = callback
-    scanner.startScan(emptyList(), settings, callback)
+    scanner.startScan(filters, settings, callback)
 
-    mainHandler.postDelayed(
-      {
-        if (scanCallback != null) {
-          listener.onInfo("BLE scan timeout")
-          stopScan()
-          connecting = false
-        }
-      },
-      SCAN_TIMEOUT_MS,
+    val timeout = Runnable {
+      finalizeScanDecision()
+    }
+    scanTimeoutRunnable = timeout
+    mainHandler.postDelayed(timeout, SCAN_TIMEOUT_MS)
+  }
+
+  private fun scheduleScanSettle() {
+    val existing = scanSettleRunnable
+    if (existing != null) {
+      mainHandler.removeCallbacks(existing)
+    }
+    val settle = Runnable {
+      finalizeScanDecision()
+    }
+    scanSettleRunnable = settle
+    mainHandler.postDelayed(settle, SCAN_SETTLE_MS)
+  }
+
+  @SuppressLint("MissingPermission")
+  private fun finalizeScanDecision() {
+    if (scanCallback == null) {
+      return
+    }
+    stopScan()
+    connecting = false
+
+    val candidates = BleTargetingPolicy.sortCandidates(
+      candidates = discoveredCandidates.values,
+      preferredAddress = preferredAddress,
     )
+    if (candidates.isEmpty()) {
+      listener.onInfo("BLE scan timeout")
+      return
+    }
+
+    val auto = BleTargetingPolicy.chooseAutoConnect(candidates, preferredAddress)
+    if (auto != null) {
+      val device = discoveredDevices[auto.address]
+      if (device != null) {
+        connectToDevice(device)
+        return
+      }
+    }
+
+    listener.onInfo(
+      if (preferredAddress != null) {
+        "Remembered device unavailable; select a WiFinder device"
+      } else {
+        "Multiple WiFinder devices found; select one"
+      },
+    )
+    listener.onBleDeviceCandidates(candidates)
   }
 
   @SuppressLint("MissingPermission")
@@ -290,22 +416,36 @@ class WiFinderBleClient(
     val callback = scanCallback ?: return
     scanner.stopScan(callback)
     scanCallback = null
+    clearScanScheduling()
   }
 
-  private fun findKnownDevice(adapter: BluetoothAdapter): BluetoothDevice? {
+  private fun clearScanScheduling() {
+    scanTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+    scanSettleRunnable?.let { mainHandler.removeCallbacks(it) }
+    scanTimeoutRunnable = null
+    scanSettleRunnable = null
+  }
+
+  private fun findBondedDeviceByAddress(adapter: BluetoothAdapter, address: String): BluetoothDevice? {
     val bonded = adapter.bondedDevices ?: return null
     return bonded.firstOrNull { device ->
-      device.address.equals(TARGET_DEVICE_ADDRESS, ignoreCase = true)
+      BleTargetingPolicy.normalizeAddress(device.address) == address &&
+        BleTargetingPolicy.isNameCompatible(device.name)
     }
   }
 
   @SuppressLint("MissingPermission")
   private fun connectToDevice(device: BluetoothDevice) {
-    if (gatt != null || connecting && scanCallback == null) {
+    if (gatt != null || isConnected()) {
       return
     }
     stopScan()
-    listener.onInfo("Connecting to ${device.name ?: device.address}...")
+    clearScanScheduling()
+    val normalizedAddress = BleTargetingPolicy.normalizeAddress(device.address) ?: device.address
+    connectedAddress = normalizedAddress
+    connectedName = device.name
+    listener.onBleDeviceCandidates(emptyList())
+    listener.onInfo("Connecting to ${device.name ?: normalizedAddress}...")
     connecting = true
 
     gatt?.close()
@@ -317,20 +457,6 @@ class WiFinderBleClient(
       } else {
         device.connectGatt(appContext, false, gattCallback)
       }
-  }
-
-  @SuppressLint("MissingPermission")
-  private fun writeCharacteristicNoResponse(
-    targetGatt: BluetoothGatt,
-    characteristic: BluetoothGattCharacteristic,
-    bytes: ByteArray,
-  ): Boolean {
-    return writeCharacteristic(
-      targetGatt = targetGatt,
-      characteristic = characteristic,
-      bytes = bytes,
-      writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
-    )
   }
 
   @SuppressLint("MissingPermission")
@@ -361,6 +487,10 @@ class WiFinderBleClient(
       ready = true
       connecting = false
       listener.onConnectState(true)
+      val address = connectedAddress ?: BleTargetingPolicy.normalizeAddress(targetGatt.device.address)
+      if (address != null) {
+        listener.onBleDeviceResolved(address, connectedName ?: targetGatt.device.name)
+      }
       listener.onInfo("BLE ready")
       return
     }

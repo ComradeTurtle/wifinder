@@ -10,6 +10,13 @@ data class SightingUi(
   val seenCount: Int,
 )
 
+data class BleDeviceCandidateUi(
+  val address: String,
+  val name: String,
+  val rssi: Int,
+  val remembered: Boolean,
+)
+
 data class AppUiState(
   val permissionsGranted: Boolean = false,
   val serviceRunning: Boolean = false,
@@ -83,6 +90,10 @@ data class AppUiState(
   val dashboardMode: Boolean = false,
   val loggingEnabled: Boolean = false,
   val csvPath: String = "",
+  val preferredBleDeviceAddress: String = "",
+  val preferredBleDeviceName: String = "",
+  val bleDevicePickerVisible: Boolean = false,
+  val bleDeviceCandidates: List<BleDeviceCandidateUi> = emptyList(),
   val sightings: List<SightingUi> = emptyList(),
   val logs: List<String> = emptyList(),
   val expandedSections: Set<String> = emptySet(),

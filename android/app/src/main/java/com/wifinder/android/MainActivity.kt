@@ -148,6 +148,9 @@ class MainActivity : ComponentActivity() {
           onDownloadBacklog = viewModel::downloadBacklog,
           onSeedDebugBacklog = viewModel::seedDebugBacklog,
           onPushPhoneGpsNow = viewModel::pushPhoneGpsNow,
+          onSelectBleDevice = viewModel::selectBleDevice,
+          onDismissBlePicker = viewModel::dismissBleDevicePicker,
+          onForgetPreferredBleDevice = viewModel::forgetPreferredBleDevice,
           onToggleSection = viewModel::toggleSection,
           onToggleDashboard = viewModel::toggleDashboardMode,
         )
@@ -301,6 +304,9 @@ private fun WiFinderScreen(
   onDownloadBacklog: () -> Unit,
   onSeedDebugBacklog: () -> Unit,
   onPushPhoneGpsNow: () -> Unit,
+  onSelectBleDevice: (String) -> Unit,
+  onDismissBlePicker: () -> Unit,
+  onForgetPreferredBleDevice: () -> Unit,
   onToggleSection: (String) -> Unit,
   onToggleDashboard: () -> Unit,
 ) {
@@ -311,6 +317,45 @@ private fun WiFinderScreen(
     color = MaterialTheme.colorScheme.background,
   ) {
     Column(modifier = Modifier.fillMaxSize()) {
+      if (state.bleDevicePickerVisible) {
+        AlertDialog(
+          onDismissRequest = onDismissBlePicker,
+          title = { Text("Select WiFinder Device") },
+          text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+              state.bleDeviceCandidates.forEach { candidate ->
+                OutlinedButton(
+                  onClick = { onSelectBleDevice(candidate.address) },
+                  modifier = Modifier.fillMaxWidth(),
+                ) {
+                  Column(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                      text = candidate.name,
+                      fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                      text = "${candidate.address} • RSSI ${candidate.rssi}",
+                      style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (candidate.remembered) {
+                      Text(
+                        text = "Remembered target",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                      )
+                    }
+                  }
+                }
+              }
+            }
+          },
+          confirmButton = {},
+          dismissButton = {
+            TextButton(onClick = onDismissBlePicker) { Text("Cancel") }
+          },
+        )
+      }
+
       // ── Top bar ─────────────────────────────────────────────
       TopAppBar(
         title = {
@@ -394,6 +439,7 @@ private fun WiFinderScreen(
             onDownloadBacklog = onDownloadBacklog,
             onSeedDebugBacklog = onSeedDebugBacklog,
             onPushPhoneGpsNow = onPushPhoneGpsNow,
+            onForgetPreferredBleDevice = onForgetPreferredBleDevice,
           )
         }
 
@@ -663,6 +709,7 @@ private fun QuickActions(
   onDownloadBacklog: () -> Unit,
   onSeedDebugBacklog: () -> Unit,
   onPushPhoneGpsNow: () -> Unit,
+  onForgetPreferredBleDevice: () -> Unit,
 ) {
   Card(
     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -672,6 +719,29 @@ private fun QuickActions(
       modifier = Modifier.padding(10.dp),
       verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+      if (state.preferredBleDeviceAddress.isNotBlank()) {
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(6.dp),
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          val label = state.preferredBleDeviceName.takeIf { it.isNotBlank() }
+            ?: state.preferredBleDeviceAddress
+          Text(
+            text = "Preferred: $label",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+          )
+          CompactButton(
+            label = "Forget",
+            primary = false,
+            modifier = Modifier.weight(0.45f),
+            onClick = onForgetPreferredBleDevice,
+          )
+        }
+      }
       // Row 1: connection + scanning
       Row(
         modifier = Modifier.fillMaxWidth(),
