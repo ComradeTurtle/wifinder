@@ -3,6 +3,41 @@ plugins {
   id("org.jetbrains.kotlin.android")
 }
 
+val repoVersion: String by lazy {
+  val file = rootProject.projectDir.parentFile.resolve("VERSION")
+  if (!file.exists()) {
+    throw GradleException("Missing VERSION file at ${file.absolutePath}")
+  }
+  val value = file.readText().trim()
+  if (value.isBlank()) {
+    throw GradleException("VERSION file is empty")
+  }
+  value
+}
+
+fun parseSemVer(version: String): Triple<Int, Int, Int> {
+  val parts = version.split('.')
+  if (parts.size !in 2..3) {
+    throw GradleException("VERSION must be MAJOR.MINOR or MAJOR.MINOR.PATCH, got '$version'")
+  }
+  val major = parts[0].toIntOrNull()
+    ?: throw GradleException("Invalid major version in '$version'")
+  val minor = parts[1].toIntOrNull()
+    ?: throw GradleException("Invalid minor version in '$version'")
+  val patch = when (parts.size) {
+    3 -> parts[2].toIntOrNull()
+      ?: throw GradleException("Invalid patch version in '$version'")
+    else -> 0
+  }
+  if (major < 0 || minor < 0 || patch < 0) {
+    throw GradleException("VERSION components must be non-negative, got '$version'")
+  }
+  return Triple(major, minor, patch)
+}
+
+val (versionMajor, versionMinor, versionPatch) = parseSemVer(repoVersion)
+val computedVersionCode = (versionMajor * 10000) + (versionMinor * 100) + versionPatch
+
 android {
   namespace = "com.wifinder.android"
   compileSdk = 34
@@ -11,8 +46,8 @@ android {
     applicationId = "com.wifinder.android"
     minSdk = 26
     targetSdk = 34
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = computedVersionCode
+    versionName = repoVersion
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

@@ -25,6 +25,7 @@
 #include "driver/temperature_sensor.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -66,10 +67,8 @@ extern void ble_store_config_init(void);
 
 #if CONFIG_IDF_TARGET_ESP32C6
 #define WG_DEVICE_NAME "WIFINDER-C6"
-#define WG_DEVICE_INFO_TEXT "WIFINDER-C6 FW1"
 #else
 #define WG_DEVICE_NAME "WIFINDER-S3"
-#define WG_DEVICE_INFO_TEXT "WIFINDER-S3 FW1"
 #endif
 
 #define WG_DEFAULT_HOP_MS 250
@@ -7479,7 +7478,11 @@ static int handle_gatt_read(uint16_t attr_handle, struct ble_gatt_access_ctxt *c
   }
 
   if (attr_handle == s_device_info_handle) {
-    return os_mbuf_append(ctxt->om, WG_DEVICE_INFO_TEXT, strlen(WG_DEVICE_INFO_TEXT)) == 0
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const char *fw_ver = (app_desc != NULL && app_desc->version[0] != '\0') ? app_desc->version : "unknown";
+    char info[96] = {0};
+    (void)snprintf(info, sizeof(info), "%s FW %s", WG_DEVICE_NAME, fw_ver);
+    return os_mbuf_append(ctxt->om, info, strlen(info)) == 0
                ? 0
                : BLE_ATT_ERR_INSUFFICIENT_RES;
   }

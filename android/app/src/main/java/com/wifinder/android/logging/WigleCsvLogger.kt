@@ -103,15 +103,16 @@ class WigleCsvLogger(private val context: Context) {
       currentDisplayPath = displayPath
     }
 
+    val appVersion = appVersionName()
     val header =
       WigleCsvFormatter.header(
-        appRelease = "wifinder-android-1",
-        model = Build.MODEL ?: "unknown",
-        release = Build.VERSION.RELEASE ?: "unknown",
-        device = Build.DEVICE ?: "unknown",
-        display = Build.DISPLAY ?: "unknown",
-        board = Build.BOARD ?: "unknown",
-        brand = Build.BRAND ?: "unknown",
+        appRelease = "WiFinder-Android-$appVersion",
+        model = "WiFinder",
+        release = appVersion,
+        device = "WiFinder-Android",
+        display = "WiFinder",
+        board = "WiFinder",
+        brand = "WiFinder",
       )
 
     for (line in header) {
@@ -163,6 +164,23 @@ class WigleCsvLogger(private val context: Context) {
     currentUri = null
     currentFile = null
     currentDisplayPath = null
+  }
+
+  private fun appVersionName(): String {
+    return try {
+      val pkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        context.packageManager.getPackageInfo(
+          context.packageName,
+          android.content.pm.PackageManager.PackageInfoFlags.of(0),
+        )
+      } else {
+        @Suppress("DEPRECATION")
+        context.packageManager.getPackageInfo(context.packageName, 0)
+      }
+      pkgInfo.versionName?.takeIf { it.isNotBlank() } ?: "unknown"
+    } catch (_: Exception) {
+      "unknown"
+    }
   }
 }
 
