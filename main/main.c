@@ -1123,7 +1123,7 @@ static void led_sync_runtime_state(void) {
   s_led_state.scanning = s_scanning;
   s_led_state.gps_valid = s_latest_gps.valid;
   s_led_state.gps_source = s_latest_gps.valid ? (uint8_t)s_gps_source : 0;
-  s_led_state.replay_active = s_replay_active || s_blob_active;
+  s_led_state.replay_active = s_replay_active || s_blob_active || s_wifi_dump_active;
   s_led_state.backlog_present = s_queue_backlog_records > 0;
 }
 
@@ -4740,7 +4740,7 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .session_id = s_session_open ? s_session_id : s_last_session_id,
       .queued_records = s_queue_backlog_records,
       .queued_bytes = s_queue_backlog_bytes,
-      .replay_active = s_replay_active || s_blob_active,
+      .replay_active = s_replay_active || s_blob_active || s_wifi_dump_active,
       .replay_cursor = s_blob_active ? s_blob_bytes_acked : s_replay_cursor_seq,
       .queue_full = s_queue_full,
       .dropped_flash_full = s_dropped_flash_full,

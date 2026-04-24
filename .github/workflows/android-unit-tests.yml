@@ -3,8 +3,6 @@ name: Android Unit Tests
 on:
   pull_request:
   push:
-    branches:
-      - main
 
 jobs:
   android-unit-tests:

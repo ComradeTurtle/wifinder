@@ -3,8 +3,6 @@ name: Web Core Tests
 on:
   pull_request:
   push:
-    branches:
-      - main
 
 jobs:
   web-core-tests:

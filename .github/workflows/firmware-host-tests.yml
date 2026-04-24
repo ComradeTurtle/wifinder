@@ -3,8 +3,6 @@ name: Firmware Host Tests
 on:
   pull_request:
   push:
-    branches:
-      - main
 
 jobs:
   firmware-host-tests:
