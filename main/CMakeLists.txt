@@ -7,6 +7,9 @@ idf_component_register(
     "wg_payload.c"
     "ble_security_policy.c"
     "scan_policy.c"
+    "wg_session_transport.c"
+    "wg_storage_backlog.c"
+    "wg_gps_nmea.c"
   INCLUDE_DIRS
     "."
   REQUIRES
@@ -16,6 +19,8 @@ idf_component_register(
     esp_event
     esp_netif
     esp_timer
+    esp_http_server
+    esp_app_format
     spiffs
     fatfs
     sdmmc

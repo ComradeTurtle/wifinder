@@ -1,5 +1,8 @@
 package com.wifinder.android.ui
 
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -22,6 +25,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -29,6 +38,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -40,6 +50,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wifinder.android.model.WifiBand
+import kotlinx.coroutines.delay
 
 // ---------------------------------------------------------------------------
 // Colours
@@ -51,7 +62,7 @@ private val TealDim = Color(0xFF00897B)
 private val Amber = Color(0xFFFFC107)
 private val Red = Color(0xFFEF5350)
 private val Green = Color(0xFF4CAF50)
-private val DimLabel = Color(0xFF757575)
+private val DimLabel = Color(0xFF9E9E9E)
 private val BrightLabel = Color(0xFFE0E0E0)
 
 // ---------------------------------------------------------------------------
@@ -85,40 +96,38 @@ private fun DashboardPortrait(state: AppUiState, onExit: () -> Unit) {
   Column(
     modifier = Modifier
       .fillMaxSize()
-      .padding(horizontal = 16.dp, vertical = 8.dp),
+      .padding(horizontal = 16.dp),
   ) {
-    DashTopBar(onExit = onExit, state = state)
+    // 5% top margin
+    Spacer(Modifier.weight(0.05f))
 
-    Spacer(Modifier.weight(1f))
+    // 55% info section
+    Column(
+      modifier = Modifier
+        .fillMaxWidth()
+        .weight(0.55f),
+      verticalArrangement = Arrangement.SpaceEvenly,
+    ) {
+      DashTopBar(onExit = onExit, state = state)
+      HeroRow(count = state.uniqueBssids, modifier = Modifier.fillMaxWidth())
+      RateStrip(state = state, modifier = Modifier.fillMaxWidth())
+      HealthIndicators(state = state, modifier = Modifier.fillMaxWidth())
+      GpsDopRow(state = state, modifier = Modifier.fillMaxWidth())
+      GpsStatusRow(state = state, modifier = Modifier.fillMaxWidth())
+      StorageBar(state = state, modifier = Modifier.fillMaxWidth())
+      BacklogRow(state = state, modifier = Modifier.fillMaxWidth())
+    }
 
-    HeroApCount(count = state.uniqueBssids, modifier = Modifier.fillMaxWidth())
-
-    Spacer(Modifier.weight(1f))
-
-    RateStrip(state = state, modifier = Modifier.fillMaxWidth())
-
-    Spacer(Modifier.weight(1f))
-
-    HealthIndicators(state = state, modifier = Modifier.fillMaxWidth())
-
-    Spacer(Modifier.weight(1f))
-
-    GpsDetailRow(state = state, modifier = Modifier.fillMaxWidth())
-
-    Spacer(Modifier.weight(1f))
-
+    // 35% channel chart
     ChannelChart(
       sightings = state.sightings,
       modifier = Modifier
         .fillMaxWidth()
-        .height(150.dp),
+        .weight(0.35f),
     )
 
-    Spacer(Modifier.weight(1f))
-
-    StorageBar(state = state, modifier = Modifier.fillMaxWidth())
-    Spacer(Modifier.height(4.dp))
-    BacklogRow(state = state, modifier = Modifier.fillMaxWidth())
+    // 5% bottom margin
+    Spacer(Modifier.weight(0.05f))
   }
 }
 
@@ -149,10 +158,11 @@ private fun DashboardLandscape(state: AppUiState, onExit: () -> Unit) {
           .fillMaxHeight(),
         verticalArrangement = Arrangement.SpaceEvenly,
       ) {
-        HeroApCount(count = state.uniqueBssids, modifier = Modifier.fillMaxWidth())
+        HeroRow(count = state.uniqueBssids, modifier = Modifier.fillMaxWidth())
         RateStrip(state = state, modifier = Modifier.fillMaxWidth())
         HealthIndicators(state = state, modifier = Modifier.fillMaxWidth())
-        GpsDetailRow(state = state, modifier = Modifier.fillMaxWidth())
+        GpsDopRow(state = state, modifier = Modifier.fillMaxWidth())
+        GpsStatusRow(state = state, modifier = Modifier.fillMaxWidth())
       }
 
       // Right column
@@ -238,26 +248,86 @@ private fun MiniDot(color: Color) {
 }
 
 // ---------------------------------------------------------------------------
-// Hero AP count
+// Hero row: AP count + battery side by side
 // ---------------------------------------------------------------------------
 @Composable
-private fun HeroApCount(count: Int, modifier: Modifier = Modifier) {
+private fun HeroRow(count: Int, modifier: Modifier = Modifier) {
+  Row(
+    modifier = modifier,
+    horizontalArrangement = Arrangement.SpaceEvenly,
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    // AP count – hero
+    Column(
+      horizontalAlignment = Alignment.CenterHorizontally,
+      modifier = Modifier.weight(1f),
+    ) {
+      Text(
+        text = "%,d".format(count),
+        color = Teal,
+        fontSize = 56.sp,
+        fontWeight = FontWeight.Bold,
+        fontFamily = FontFamily.Monospace,
+        textAlign = TextAlign.Center,
+        maxLines = 1,
+      )
+      Text(
+        text = "UNIQUE APs",
+        color = DimLabel,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Medium,
+        letterSpacing = 2.sp,
+      )
+    }
+
+    // Battery block
+    BatteryBlock(modifier = Modifier.weight(0.6f))
+  }
+}
+
+@Composable
+private fun BatteryBlock(modifier: Modifier = Modifier) {
+  val context = LocalContext.current
+  var pct by remember { mutableIntStateOf(-1) }
+  var charging by remember { mutableStateOf(false) }
+
+  // Poll every 5 seconds via the sticky broadcast (very cheap, no receiver registration)
+  LaunchedEffect(Unit) {
+    while (true) {
+      val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+      val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+      val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+      pct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+      charging = (intent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
+      delay(5_000L)
+    }
+  }
+
+  val battColor = when {
+    pct < 0 -> DimLabel
+    pct <= 15 -> Red
+    pct <= 30 -> Amber
+    charging -> Green
+    else -> BrightLabel
+  }
+  val stateText = if (charging) "⚡CHG" else "BAT"
+
   Column(
     modifier = modifier,
     horizontalAlignment = Alignment.CenterHorizontally,
   ) {
     Text(
-      text = "%,d".format(count),
-      color = Teal,
-      fontSize = 56.sp,
+      text = if (pct >= 0) "$pct%" else "—",
+      color = battColor,
+      fontSize = 36.sp,
       fontWeight = FontWeight.Bold,
       fontFamily = FontFamily.Monospace,
       textAlign = TextAlign.Center,
       maxLines = 1,
     )
     Text(
-      text = "UNIQUE APs",
-      color = DimLabel,
+      text = stateText,
+      color = if (charging) Green else DimLabel,
       fontSize = 12.sp,
       fontWeight = FontWeight.Medium,
       letterSpacing = 2.sp,
@@ -274,7 +344,7 @@ private fun RateStrip(state: AppUiState, modifier: Modifier = Modifier) {
     modifier = modifier
       .clip(RoundedCornerShape(8.dp))
       .background(CardBg)
-      .padding(horizontal = 12.dp, vertical = 8.dp),
+      .padding(horizontal = 12.dp, vertical = 10.dp),
     horizontalArrangement = Arrangement.SpaceEvenly,
     verticalAlignment = Alignment.CenterVertically,
   ) {
@@ -285,8 +355,8 @@ private fun RateStrip(state: AppUiState, modifier: Modifier = Modifier) {
     )
     VerticalDivider()
     MetricCell(
-      value = "%.0f".format(state.phoneSpeedKmh),
-      label = "km/h",
+      value = if (state.dieTempCenti != Int.MIN_VALUE) "%.0f°".format(state.dieTempCenti / 100.0) else "—",
+      label = "die temp",
       modifier = Modifier.weight(1f),
     )
     VerticalDivider()
@@ -315,7 +385,8 @@ private fun MetricCell(value: String, label: String, modifier: Modifier = Modifi
     Text(
       text = label,
       color = DimLabel,
-      fontSize = 10.sp,
+      fontSize = 12.sp,
+      fontWeight = FontWeight.Medium,
       maxLines = 1,
     )
   }
@@ -340,7 +411,7 @@ private fun HealthIndicators(state: AppUiState, modifier: Modifier = Modifier) {
     modifier = modifier
       .clip(RoundedCornerShape(8.dp))
       .background(CardBg)
-      .padding(horizontal = 12.dp, vertical = 8.dp),
+      .padding(horizontal = 12.dp, vertical = 10.dp),
     horizontalArrangement = Arrangement.SpaceEvenly,
     verticalAlignment = Alignment.CenterVertically,
   ) {
@@ -383,7 +454,7 @@ private fun HealthIndicators(state: AppUiState, modifier: Modifier = Modifier) {
 private fun HealthDot(label: String, color: Color) {
   Column(
     horizontalAlignment = Alignment.CenterHorizontally,
-    verticalArrangement = Arrangement.spacedBy(3.dp),
+    verticalArrangement = Arrangement.spacedBy(4.dp),
   ) {
     Box(
       modifier = Modifier
@@ -394,7 +465,8 @@ private fun HealthDot(label: String, color: Color) {
     Text(
       text = label,
       color = DimLabel,
-      fontSize = 9.sp,
+      fontSize = 11.sp,
+      fontWeight = FontWeight.Medium,
       maxLines = 1,
     )
   }
@@ -426,7 +498,7 @@ private fun gpsNavRateCompact(mode: Int, appliedHz: Int): String {
 }
 
 @Composable
-private fun GpsDetailRow(state: AppUiState, modifier: Modifier = Modifier) {
+private fun GpsDopRow(state: AppUiState, modifier: Modifier = Modifier) {
   val hdopText = if (state.gpsHdopCenti > 0) "%.2f".format(state.gpsHdopCenti / 100.0) else "—"
   val vdopText = if (state.gpsVdopCenti > 0) "%.2f".format(state.gpsVdopCenti / 100.0) else "—"
   val pdopText = if (state.gpsPdopCenti > 0) "%.2f".format(state.gpsPdopCenti / 100.0) else "—"
@@ -437,21 +509,34 @@ private fun GpsDetailRow(state: AppUiState, modifier: Modifier = Modifier) {
     else -> "—"
   }
   val accText = if (state.gpsValid) "±${"%.1f".format(state.gpsAccuracyDm / 10.0)}m" else "—"
-  val ageText = if (state.gpsValid) "${state.gpsAgeS}s" else "—"
-  val rateText = gpsNavRateCompact(state.gpsNavMode, state.gpsNavAppliedHz)
-  val dopText = "$hdopText/$vdopText/$pdopText"
 
   Row(
     modifier = modifier
-      .clip(RoundedCornerShape(8.dp))
+      .clip(RoundedCornerShape(topStart = 8.dp, topEnd = 8.dp))
       .background(CardBg)
       .padding(horizontal = 10.dp, vertical = 8.dp),
     horizontalArrangement = Arrangement.SpaceEvenly,
     verticalAlignment = Alignment.CenterVertically,
   ) {
-    GpsMini(value = dopText, label = "H/V/P", color = pdopColor(state.gpsPdopCenti))
+    GpsMini(value = "$hdopText/$vdopText/$pdopText", label = "H/V/P", color = pdopColor(state.gpsPdopCenti))
     GpsMini(value = satText, label = "Use/View", color = BrightLabel)
     GpsMini(value = accText, label = "Acc", color = BrightLabel)
+  }
+}
+
+@Composable
+private fun GpsStatusRow(state: AppUiState, modifier: Modifier = Modifier) {
+  val ageText = if (state.gpsValid) "${state.gpsAgeS}s" else "—"
+  val rateText = gpsNavRateCompact(state.gpsNavMode, state.gpsNavAppliedHz)
+
+  Row(
+    modifier = modifier
+      .clip(RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
+      .background(CardBg)
+      .padding(horizontal = 10.dp, vertical = 8.dp),
+    horizontalArrangement = Arrangement.SpaceEvenly,
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
     GpsMini(
       value = gpsSourceLabel(state.gpsSource),
       label = "Src",
@@ -468,6 +553,11 @@ private fun GpsDetailRow(state: AppUiState, modifier: Modifier = Modifier) {
       else -> Red
     })
     GpsMini(value = rateText, label = "Nav", color = DimLabel)
+    GpsMini(
+      value = "%.0f".format(state.phoneSpeedKmh),
+      label = "km/h",
+      color = BrightLabel,
+    )
   }
 }
 
@@ -485,7 +575,8 @@ private fun GpsMini(value: String, label: String, color: Color) {
     Text(
       text = label,
       color = DimLabel,
-      fontSize = 9.sp,
+      fontSize = 11.sp,
+      fontWeight = FontWeight.Medium,
       maxLines = 1,
     )
   }

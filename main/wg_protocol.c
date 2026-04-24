@@ -113,6 +113,8 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
   out->backlog_blob_chunk_offset = 0;
   out->backlog_blob_chunk_len = 0;
   out->backlog_blob_chunk_reply = WG_BACKLOG_BLOB_CHUNK_REPLY_NAK;
+  out->wifi_dump_enable = 0;
+  out->wifi_dump_run_id = 0;
 
   switch (out->id) {
     case WG_CMD_START:
@@ -202,6 +204,18 @@ wg_result_t wg_command_decode(const uint8_t *payload, size_t payload_len, wg_com
       out->backlog_blob_chunk_offset = rd_u32(&payload[9]);
       out->backlog_blob_chunk_len = rd_u16(&payload[13]);
       out->backlog_blob_chunk_reply = payload[15];
+      return WG_OK;
+    case WG_CMD_SET_WIFI_DUMP:
+      if (payload_len != (size_t)(1 + WG_WIFI_DUMP_TOGGLE_PAYLOAD_SIZE)) {
+        return WG_ERR_INVALID_FRAME;
+      }
+      out->wifi_dump_enable = payload[1];
+      return WG_OK;
+    case WG_CMD_COMMIT_WIFI_DUMP:
+      if (payload_len != (size_t)(1 + WG_WIFI_DUMP_COMMIT_PAYLOAD_SIZE)) {
+        return WG_ERR_INVALID_FRAME;
+      }
+      out->wifi_dump_run_id = rd_u64(&payload[1]);
       return WG_OK;
     default:
       return WG_ERR_UNSUPPORTED;

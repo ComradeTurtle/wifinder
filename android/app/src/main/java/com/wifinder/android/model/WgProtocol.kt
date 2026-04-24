@@ -45,6 +45,8 @@ object WgProtocol {
     const val DEBUG_SEED_STORAGE = 0x0E
     const val SET_CHANNEL_PLAN = 0x0F
     const val BACKLOG_BLOB_CHUNK_REPLY = 0x10
+    const val SET_WIFI_DUMP = 0x11
+    const val COMMIT_WIFI_DUMP = 0x12
   }
 
   const val GPS_FLAG_VALID = 1 shl 0
@@ -359,6 +361,16 @@ object WgProtocol {
 
   fun encodeBacklogBlobTogglePayload(enabled: Boolean): ByteArray =
     byteArrayOf(if (enabled) 1 else 0)
+
+  fun encodeWifiDumpTogglePayload(enabled: Boolean): ByteArray =
+    byteArrayOf(if (enabled) 1 else 0)
+
+  fun encodeWifiDumpCommitPayload(runId: Long): ByteArray {
+    val out = ByteArray(8)
+    val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+    bb.putLong(runId)
+    return out
+  }
 
   fun encodeBacklogBlobChunkReplyPayload(
     sessionId: Long,

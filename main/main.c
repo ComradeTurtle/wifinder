@@ -25,12 +25,14 @@
 #include "driver/temperature_sensor.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_vfs_fat.h"
+#include "esp_http_server.h"
 #include "esp_spiffs.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -58,17 +60,18 @@
 #include "ble_security_policy.h"
 #include "scan_policy.h"
 #include "sniffer_logic.h"
+#include "wg_gps_nmea.h"
 #include "wg_payload.h"
 #include "wg_protocol.h"
+#include "wg_session_transport.h"
+#include "wg_storage_backlog.h"
 
 extern void ble_store_config_init(void);
 
 #if CONFIG_IDF_TARGET_ESP32C6
 #define WG_DEVICE_NAME "WIFINDER-C6"
-#define WG_DEVICE_INFO_TEXT "WIFINDER-C6 FW1"
 #else
 #define WG_DEVICE_NAME "WIFINDER-S3"
-#define WG_DEVICE_INFO_TEXT "WIFINDER-S3 FW1"
 #endif
 
 #define WG_DEFAULT_HOP_MS 250
@@ -173,6 +176,18 @@ _Static_assert(WG_NODE_5GHZ_MASK_BIT_COUNT < 64, "WG_NODE_5GHZ_MASK_BIT_COUNT mu
 #define WG_SD_SPI_SCK_GPIO GPIO_NUM_21
 #define WG_SD_SPI_MOSI_GPIO GPIO_NUM_22
 #define WG_SD_SPI_MISO_GPIO GPIO_NUM_23
+
+#define WG_WIFI_DUMP_AP_SSID "WIFINDER-DUMP"
+#define WG_WIFI_DUMP_AP_CHANNEL 6
+#define WG_WIFI_DUMP_HTTP_PORT 80
+#define WG_WIFI_DUMP_MANIFEST_URI "/wifinder/dump/manifest.json"
+#define WG_WIFI_DUMP_FILE_URI "/wifinder/dump/file"
+#define WG_WIFI_DUMP_COMMIT_URI "/wifinder/dump/commit"
+#define WG_WIFI_DUMP_ABORT_URI "/wifinder/dump/abort"
+#define WG_WIFI_DUMP_JOURNAL_FILE "wq_dump_journal.bin"
+#define WG_WIFI_DUMP_JOURNAL_MAGIC 0x314A4457U
+#define WG_WIFI_DUMP_JOURNAL_VERSION 1
+#define WG_WIFI_DUMP_HTTP_CHUNK 2048
 
 #define WG_NODE_UART_NUM LP_UART_NUM_0
 #define WG_NODE_UART_TX_GPIO 5
@@ -351,6 +366,30 @@ typedef struct __attribute__((packed)) {
   uint8_t reserved1[3];
   uint32_t crc32;
 } wg_session_manifest_t;
+
+typedef struct __attribute__((packed)) {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t header_size;
+  uint64_t run_id;
+  uint8_t committed;
+  uint8_t reserved[7];
+  uint32_t session_count;
+  uint32_t crc32;
+} wg_dump_journal_header_t;
+
+typedef struct __attribute__((packed)) {
+  uint64_t session_id;
+  uint32_t ack_seq;
+} wg_dump_journal_entry_t;
+
+typedef struct {
+  uint64_t session_id;
+  uint32_t data_bytes;
+  uint32_t gpx_bytes;
+  uint32_t written_seq;
+  uint32_t acked_seq;
+} wg_dump_session_t;
 
 static const char *TAG = "wifinder";
 
@@ -575,6 +614,16 @@ static int64_t s_gpx_last_point_ms = 0;
 static int64_t s_gpx_last_flush_ms = 0;
 static uint32_t s_gpx_points_written = 0;
 
+static httpd_handle_t s_wifi_dump_httpd = NULL;
+static bool s_wifi_dump_requested = false;
+static bool s_wifi_dump_active = false;
+static bool s_wifi_dump_ap_running = false;
+static uint64_t s_wifi_dump_run_id = 0;
+static int64_t s_wifi_dump_started_ms = 0;
+static wg_dump_session_t *s_wifi_dump_sessions = NULL;
+static size_t s_wifi_dump_session_count = 0;
+static size_t s_wifi_dump_session_capacity = 0;
+
 #if CONFIG_WG_RGB_LED_ENABLE
 typedef struct {
   uint8_t r;
@@ -678,6 +727,7 @@ static bool storage_has_output_link(void);
 static const char *storage_base_path(void);
 static bool storage_get_fs_info(uint64_t *total_bytes_out, uint64_t *used_bytes_out);
 static bool storage_commit_file(FILE *fp, const char *kind, uint64_t session_id);
+static bool storage_parse_meta_filename(const char *name, uint64_t *session_id_out);
 static bool storage_open_session(void);
 static bool storage_open_session_locked(void);
 static void storage_close_session(wg_session_state_t final_state);
@@ -697,6 +747,14 @@ static bool storage_seed_synthetic(uint32_t target_bytes, uint32_t *records_adde
                                    uint32_t *bytes_added_out);
 static bool storage_clear_sessions(void);
 static bool storage_patch_sighting_source(uint8_t *payload, uint16_t payload_len, uint8_t source_flags);
+static void storage_refresh_backlog_locked(bool reclaim);
+static bool storage_read_manifest(uint64_t session_id, wg_session_manifest_t *out);
+static bool storage_flush_pending_locked(bool force);
+static void storage_reset_replay_locked(void);
+static void storage_reset_blob_locked(void);
+static bool storage_set_wifi_dump_enabled(bool enabled);
+static bool storage_commit_wifi_dump_run(uint64_t run_id);
+static void storage_recover_wifi_dump_journal(void);
 static uint16_t ble_notify_frame_payload_limit(void);
 static void wake_replay_task(void);
 static void request_fast_ble_conn_params(uint16_t conn_handle);
@@ -713,6 +771,22 @@ static void wr_u32_le(uint8_t *out, uint32_t value);
 static void wr_u64_le(uint8_t *out, uint64_t value);
 static void scan_state_lock(void);
 static void scan_state_unlock(void);
+static void storage_dump_reset_sessions_locked(void);
+static bool storage_dump_ensure_capacity_locked(size_t needed);
+static bool storage_dump_collect_sessions_locked(void);
+static bool storage_dump_journal_write_locked(bool committed);
+static bool storage_dump_journal_load_locked(wg_dump_journal_header_t *header_out,
+                                             wg_dump_journal_entry_t **entries_out);
+static bool storage_dump_journal_delete_locked(void);
+static bool storage_dump_start_locked(void);
+static void storage_dump_stop_locked(bool keep_journal);
+static bool storage_dump_commit_locked(uint64_t run_id);
+static bool wifi_dump_http_start_locked(void);
+static void wifi_dump_http_stop_locked(void);
+static bool wifi_dump_ap_start_locked(void);
+static void wifi_dump_ap_stop_locked(void);
+static int wifi_dump_manifest_handler(httpd_req_t *req);
+static int wifi_dump_file_handler(httpd_req_t *req);
 
 static const struct ble_gatt_svc_def gatt_services[] = {
     {
@@ -1049,7 +1123,7 @@ static void led_sync_runtime_state(void) {
   s_led_state.scanning = s_scanning;
   s_led_state.gps_valid = s_latest_gps.valid;
   s_led_state.gps_source = s_latest_gps.valid ? (uint8_t)s_gps_source : 0;
-  s_led_state.replay_active = s_replay_active || s_blob_active;
+  s_led_state.replay_active = s_replay_active || s_blob_active || s_wifi_dump_active;
   s_led_state.backlog_present = s_queue_backlog_records > 0;
 }
 
@@ -1469,6 +1543,128 @@ static void storage_gpx_paths(uint64_t session_id, char *gpx_path, size_t gpx_si
   }
 }
 
+static void storage_dump_journal_path(char *path_out, size_t path_size) {
+  if (path_out == NULL || path_size == 0) {
+    return;
+  }
+  snprintf(path_out, path_size, "%s/%s", storage_base_path(), WG_WIFI_DUMP_JOURNAL_FILE);
+}
+
+static void storage_dump_reset_sessions_locked(void) {
+  if (s_wifi_dump_sessions != NULL) {
+    free(s_wifi_dump_sessions);
+  }
+  s_wifi_dump_sessions = NULL;
+  s_wifi_dump_session_count = 0;
+  s_wifi_dump_session_capacity = 0;
+}
+
+static bool storage_dump_ensure_capacity_locked(size_t needed) {
+  if (needed <= s_wifi_dump_session_capacity) {
+    return true;
+  }
+  size_t next_cap = s_wifi_dump_session_capacity > 0 ? s_wifi_dump_session_capacity : 8;
+  while (next_cap < needed) {
+    if (next_cap > (SIZE_MAX / 2U)) {
+      next_cap = needed;
+      break;
+    }
+    next_cap *= 2U;
+  }
+  wg_dump_session_t *grown = (wg_dump_session_t *)realloc(
+      s_wifi_dump_sessions, next_cap * sizeof(wg_dump_session_t));
+  if (grown == NULL) {
+    return false;
+  }
+  s_wifi_dump_sessions = grown;
+  s_wifi_dump_session_capacity = next_cap;
+  return true;
+}
+
+static int storage_dump_session_cmp(const void *a, const void *b) {
+  const wg_dump_session_t *lhs = (const wg_dump_session_t *)a;
+  const wg_dump_session_t *rhs = (const wg_dump_session_t *)b;
+  if (lhs->session_id < rhs->session_id) {
+    return -1;
+  }
+  if (lhs->session_id > rhs->session_id) {
+    return 1;
+  }
+  return 0;
+}
+
+static bool storage_dump_collect_sessions_locked(void) {
+  storage_dump_reset_sessions_locked();
+
+  DIR *dir = opendir(storage_base_path());
+  if (dir == NULL) {
+    return false;
+  }
+
+  struct dirent *ent = NULL;
+  while ((ent = readdir(dir)) != NULL) {
+    uint64_t sid = 0;
+    if (!storage_parse_meta_filename(ent->d_name, &sid)) {
+      continue;
+    }
+
+    wg_session_manifest_t manifest = {0};
+    if (!storage_read_manifest(sid, &manifest)) {
+      continue;
+    }
+    if (manifest.state == WG_SESSION_STATE_OPEN || manifest.records_written == 0 ||
+        manifest.records_acked >= manifest.records_written ||
+        manifest.last_seq_written == 0) {
+      continue;
+    }
+
+    if (!storage_dump_ensure_capacity_locked(s_wifi_dump_session_count + 1U)) {
+      closedir(dir);
+      return false;
+    }
+
+    char data_path[96] = {0};
+    char gpx_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+    storage_session_paths(sid, NULL, 0, data_path, sizeof(data_path));
+    storage_gpx_paths(sid, gpx_path, sizeof(gpx_path), NULL, 0);
+    struct stat st_data = {0};
+    struct stat st_gpx = {0};
+    uint32_t data_bytes = 0;
+    uint32_t gpx_bytes = 0;
+    if (stat(data_path, &st_data) == 0 && st_data.st_size > 0) {
+      if ((uint64_t)st_data.st_size > UINT32_MAX) {
+        data_bytes = UINT32_MAX;
+      } else {
+        data_bytes = (uint32_t)st_data.st_size;
+      }
+    }
+    if (stat(gpx_path, &st_gpx) == 0 && st_gpx.st_size > 0) {
+      if ((uint64_t)st_gpx.st_size > UINT32_MAX) {
+        gpx_bytes = UINT32_MAX;
+      } else {
+        gpx_bytes = (uint32_t)st_gpx.st_size;
+      }
+    }
+    if (data_bytes == 0) {
+      continue;
+    }
+
+    wg_dump_session_t *slot = &s_wifi_dump_sessions[s_wifi_dump_session_count++];
+    slot->session_id = sid;
+    slot->data_bytes = data_bytes;
+    slot->gpx_bytes = gpx_bytes;
+    slot->written_seq = manifest.last_seq_written;
+    slot->acked_seq = manifest.last_seq_acked;
+  }
+  closedir(dir);
+
+  if (s_wifi_dump_session_count > 1U) {
+    qsort(s_wifi_dump_sessions, s_wifi_dump_session_count, sizeof(wg_dump_session_t),
+          storage_dump_session_cmp);
+  }
+  return true;
+}
+
 static double gpx_distance_meters_e7(int32_t lat1_e7, int32_t lon1_e7, int32_t lat2_e7, int32_t lon2_e7) {
   static const double k_earth_radius_m = 6371000.0;
   const double lat1 = ((double)lat1_e7 / 10000000.0) * (M_PI / 180.0);
@@ -1614,56 +1810,38 @@ static bool storage_finalize_stale_gpx_session(uint64_t session_id) {
 }
 
 static bool storage_parse_meta_filename(const char *name, uint64_t *session_id_out) {
-  if (name == NULL || session_id_out == NULL) {
-    return false;
-  }
-  const size_t prefix_len = strlen(WG_STORAGE_FILE_PREFIX);
-  const size_t n = strlen(name);
-  if (n != (prefix_len + 16 + 5) || strncmp(name, WG_STORAGE_FILE_PREFIX, prefix_len) != 0 ||
-      strcmp(name + prefix_len + 16, ".meta") != 0) {
-    return false;
-  }
-  char hex[17] = {0};
-  memcpy(hex, name + prefix_len, 16);
-  errno = 0;
-  char *end = NULL;
-  unsigned long long parsed = strtoull(hex, &end, 16);
-  if (errno != 0 || end == NULL || *end != '\0') {
-    return false;
-  }
-  *session_id_out = (uint64_t)parsed;
-  return true;
+  return wg_storage_parse_meta_filename(name, WG_STORAGE_FILE_PREFIX, session_id_out);
 }
 
 static uint32_t storage_manifest_generation_get(const wg_session_manifest_t *manifest,
                                                 bool *valid_out) {
-  bool valid = (manifest != NULL && manifest->reserved1[2] == WG_STORAGE_MANIFEST_GEN_MAGIC);
-  if (valid_out != NULL) {
-    *valid_out = valid;
-  }
-  if (!valid) {
+  if (manifest == NULL) {
+    if (valid_out != NULL) {
+      *valid_out = false;
+    }
     return 0;
   }
-  return (uint32_t)manifest->reserved0 | ((uint32_t)manifest->reserved1[0] << 16) |
-         ((uint32_t)manifest->reserved1[1] << 24);
+  return wg_storage_manifest_generation_get(manifest->reserved0, manifest->reserved1,
+                                            WG_STORAGE_MANIFEST_GEN_MAGIC, valid_out);
 }
 
 static void storage_manifest_generation_set(wg_session_manifest_t *manifest, uint32_t generation) {
   if (manifest == NULL) {
     return;
   }
-  manifest->reserved0 = (uint16_t)(generation & 0xFFFFU);
-  manifest->reserved1[0] = (uint8_t)((generation >> 16) & 0xFFU);
-  manifest->reserved1[1] = (uint8_t)((generation >> 24) & 0xFFU);
-  manifest->reserved1[2] = WG_STORAGE_MANIFEST_GEN_MAGIC;
+  uint16_t reserved0 = manifest->reserved0;
+  uint8_t reserved1[sizeof(manifest->reserved1)] = {0};
+  memcpy(reserved1, manifest->reserved1, sizeof(reserved1));
+
+  wg_storage_manifest_generation_set(&reserved0, reserved1, WG_STORAGE_MANIFEST_GEN_MAGIC,
+                                     generation);
+
+  manifest->reserved0 = reserved0;
+  memcpy(manifest->reserved1, reserved1, sizeof(reserved1));
 }
 
 static int storage_manifest_generation_cmp(uint32_t lhs, uint32_t rhs) {
-  if (lhs == rhs) {
-    return 0;
-  }
-  uint32_t delta = lhs - rhs;
-  return (delta < 0x80000000U) ? 1 : -1;
+  return wg_storage_manifest_generation_cmp(lhs, rhs);
 }
 
 static int storage_manifest_compare_freshness(const wg_session_manifest_t *lhs,
@@ -1875,6 +2053,649 @@ static bool storage_write_manifest(const wg_session_manifest_t *manifest_in) {
   return storage_write_manifest_path(fallback_path, &manifest);
 }
 
+static bool storage_dump_journal_write_locked(bool committed) {
+  char journal_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+  storage_dump_journal_path(journal_path, sizeof(journal_path));
+  FILE *fp = fopen(journal_path, "wb");
+  if (fp == NULL) {
+    ESP_LOGW(TAG, "wifi dump journal open failed path=%s errno=%d", journal_path, errno);
+    return false;
+  }
+
+  const uint32_t session_count =
+      (s_wifi_dump_session_count > UINT32_MAX) ? UINT32_MAX : (uint32_t)s_wifi_dump_session_count;
+  const size_t entries_size = (size_t)session_count * sizeof(wg_dump_journal_entry_t);
+  uint8_t *entries_buf = NULL;
+  if (entries_size > 0) {
+    entries_buf = (uint8_t *)calloc(1, entries_size);
+    if (entries_buf == NULL) {
+      fclose(fp);
+      return false;
+    }
+    for (uint32_t i = 0; i < session_count; ++i) {
+      wg_dump_journal_entry_t *entry = (wg_dump_journal_entry_t *)(entries_buf + (i * sizeof(*entry)));
+      entry->session_id = s_wifi_dump_sessions[i].session_id;
+      entry->ack_seq = s_wifi_dump_sessions[i].written_seq;
+    }
+  }
+
+  wg_dump_journal_header_t header = {
+      .magic = WG_WIFI_DUMP_JOURNAL_MAGIC,
+      .version = WG_WIFI_DUMP_JOURNAL_VERSION,
+      .header_size = sizeof(wg_dump_journal_header_t),
+      .run_id = s_wifi_dump_run_id,
+      .committed = committed ? 1 : 0,
+      .reserved = {0},
+      .session_count = session_count,
+      .crc32 = entries_size > 0 ? crc32_ieee(entries_buf, entries_size) : 0,
+  };
+
+  bool ok = (fwrite(&header, 1, sizeof(header), fp) == sizeof(header));
+  if (ok && entries_size > 0) {
+    ok = (fwrite(entries_buf, 1, entries_size, fp) == entries_size);
+  }
+  if (entries_buf != NULL) {
+    free(entries_buf);
+  }
+  if (ok) {
+    ok = storage_commit_file(fp, "wifi dump journal", s_wifi_dump_run_id);
+  }
+  fclose(fp);
+  if (!ok) {
+    ESP_LOGW(TAG, "wifi dump journal write failed run=%016llX errno=%d",
+             (unsigned long long)s_wifi_dump_run_id, errno);
+  }
+  return ok;
+}
+
+static bool storage_dump_journal_load_locked(wg_dump_journal_header_t *header_out,
+                                             wg_dump_journal_entry_t **entries_out) {
+  if (header_out == NULL || entries_out == NULL) {
+    return false;
+  }
+  *entries_out = NULL;
+  memset(header_out, 0, sizeof(*header_out));
+
+  char journal_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+  storage_dump_journal_path(journal_path, sizeof(journal_path));
+  FILE *fp = fopen(journal_path, "rb");
+  if (fp == NULL) {
+    return false;
+  }
+
+  wg_dump_journal_header_t header = {0};
+  bool ok = (fread(&header, 1, sizeof(header), fp) == sizeof(header));
+  if (!ok || header.magic != WG_WIFI_DUMP_JOURNAL_MAGIC ||
+      header.version != WG_WIFI_DUMP_JOURNAL_VERSION ||
+      header.header_size != sizeof(wg_dump_journal_header_t)) {
+    fclose(fp);
+    return false;
+  }
+
+  const size_t entries_size = (size_t)header.session_count * sizeof(wg_dump_journal_entry_t);
+  wg_dump_journal_entry_t *entries = NULL;
+  if (entries_size > 0) {
+    entries = (wg_dump_journal_entry_t *)calloc(1, entries_size);
+    if (entries == NULL) {
+      fclose(fp);
+      return false;
+    }
+    ok = (fread(entries, 1, entries_size, fp) == entries_size);
+    if (!ok) {
+      free(entries);
+      fclose(fp);
+      return false;
+    }
+    const uint32_t crc = crc32_ieee((const uint8_t *)entries, entries_size);
+    if (crc != header.crc32) {
+      free(entries);
+      fclose(fp);
+      return false;
+    }
+  } else if (header.crc32 != 0) {
+    fclose(fp);
+    return false;
+  }
+
+  fclose(fp);
+  *header_out = header;
+  *entries_out = entries;
+  return true;
+}
+
+static bool storage_dump_journal_delete_locked(void) {
+  char journal_path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+  storage_dump_journal_path(journal_path, sizeof(journal_path));
+  if (unlink(journal_path) == 0 || errno == ENOENT) {
+    return true;
+  }
+  ESP_LOGW(TAG, "wifi dump journal delete failed path=%s errno=%d", journal_path, errno);
+  return false;
+}
+
+static const wg_dump_session_t *storage_dump_find_session_locked(uint64_t sid) {
+  if (sid == 0 || s_wifi_dump_sessions == NULL) {
+    return NULL;
+  }
+  for (size_t i = 0; i < s_wifi_dump_session_count; ++i) {
+    if (s_wifi_dump_sessions[i].session_id == sid) {
+      return &s_wifi_dump_sessions[i];
+    }
+  }
+  return NULL;
+}
+
+static bool wifi_dump_parse_query_value(httpd_req_t *req, const char *key, char *value_out,
+                                        size_t value_size) {
+  if (req == NULL || key == NULL || value_out == NULL || value_size == 0) {
+    return false;
+  }
+  int query_len = httpd_req_get_url_query_len(req);
+  if (query_len <= 0 || query_len >= 192) {
+    return false;
+  }
+  char query[192] = {0};
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+    return false;
+  }
+  return httpd_query_key_value(query, key, value_out, value_size) == ESP_OK;
+}
+
+static int wifi_dump_manifest_handler(httpd_req_t *req) {
+  if (req == NULL) {
+    return ESP_FAIL;
+  }
+  if (!storage_lock(pdMS_TO_TICKS(200))) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_sendstr(req, "storage lock failed");
+    return ESP_FAIL;
+  }
+  if (!s_wifi_dump_active) {
+    storage_unlock();
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_sendstr(req, "wifi dump not active");
+    return ESP_FAIL;
+  }
+
+  uint64_t run_id = s_wifi_dump_run_id;
+  size_t count = s_wifi_dump_session_count;
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  char line[256] = {0};
+  snprintf(line, sizeof(line),
+           "{\"run_id\":\"%016llX\",\"ap_ssid\":\"%s\",\"session_count\":%lu,\"sessions\":[",
+           (unsigned long long)run_id, WG_WIFI_DUMP_AP_SSID, (unsigned long)count);
+  esp_err_t rc = httpd_resp_sendstr_chunk(req, line);
+  if (rc != ESP_OK) {
+    storage_unlock();
+    return rc;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    const wg_dump_session_t *s = &s_wifi_dump_sessions[i];
+    snprintf(line, sizeof(line),
+             "%s{\"sid\":\"%016llX\",\"dat_bytes\":%lu,\"gpx_bytes\":%lu,\"written_seq\":%lu,\"acked_seq\":%lu}",
+             (i == 0U) ? "" : ",", (unsigned long long)s->session_id,
+             (unsigned long)s->data_bytes, (unsigned long)s->gpx_bytes,
+             (unsigned long)s->written_seq, (unsigned long)s->acked_seq);
+    rc = httpd_resp_sendstr_chunk(req, line);
+    if (rc != ESP_OK) {
+      storage_unlock();
+      return rc;
+    }
+  }
+  storage_unlock();
+
+  if (httpd_resp_sendstr_chunk(req, "]}") != ESP_OK) {
+    return ESP_FAIL;
+  }
+  return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static int wifi_dump_file_handler(httpd_req_t *req) {
+  if (req == NULL) {
+    return ESP_FAIL;
+  }
+  char sid_hex[24] = {0};
+  char type[8] = {0};
+  if (!wifi_dump_parse_query_value(req, "sid", sid_hex, sizeof(sid_hex)) ||
+      !wifi_dump_parse_query_value(req, "type", type, sizeof(type))) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_sendstr(req, "missing sid/type");
+    return ESP_FAIL;
+  }
+
+  errno = 0;
+  char *sid_end = NULL;
+  uint64_t sid = strtoull(sid_hex, &sid_end, 16);
+  if (errno != 0 || sid_end == sid_hex || (sid_end != NULL && *sid_end != '\0')) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_sendstr(req, "bad sid");
+    return ESP_FAIL;
+  }
+
+  bool want_dat = strcmp(type, "dat") == 0;
+  bool want_gpx = strcmp(type, "gpx") == 0;
+  if (!want_dat && !want_gpx) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_sendstr(req, "bad type");
+    return ESP_FAIL;
+  }
+
+  char path[WG_STORAGE_PATH_BUF_SIZE] = {0};
+  uint32_t expected_bytes = 0;
+  if (!storage_lock(pdMS_TO_TICKS(200))) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_sendstr(req, "storage lock failed");
+    return ESP_FAIL;
+  }
+  if (!s_wifi_dump_active) {
+    storage_unlock();
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_sendstr(req, "wifi dump not active");
+    return ESP_FAIL;
+  }
+  const wg_dump_session_t *session = storage_dump_find_session_locked(sid);
+  if (session == NULL) {
+    storage_unlock();
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_sendstr(req, "unknown session");
+    return ESP_FAIL;
+  }
+  if (want_dat) {
+    storage_session_paths(sid, NULL, 0, path, sizeof(path));
+    expected_bytes = session->data_bytes;
+  } else {
+    storage_gpx_paths(sid, path, sizeof(path), NULL, 0);
+    expected_bytes = session->gpx_bytes;
+  }
+  storage_unlock();
+
+  if (expected_bytes == 0) {
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_sendstr(req, "file absent");
+    return ESP_FAIL;
+  }
+
+  struct stat st = {0};
+  if (stat(path, &st) != 0 || st.st_size <= 0) {
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_sendstr(req, "file missing");
+    return ESP_FAIL;
+  }
+  uint32_t file_size = ((uint64_t)st.st_size > UINT32_MAX) ? UINT32_MAX : (uint32_t)st.st_size;
+  if (file_size == 0) {
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_sendstr(req, "empty file");
+    return ESP_FAIL;
+  }
+
+  uint32_t start = 0;
+  bool partial = false;
+  int range_len = httpd_req_get_hdr_value_len(req, "Range");
+  if (range_len > 0 && range_len < 64) {
+    char range[64] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Range", range, sizeof(range)) == ESP_OK &&
+        strncmp(range, "bytes=", 6) == 0) {
+      errno = 0;
+      char *end = NULL;
+      unsigned long parsed = strtoul(range + 6, &end, 10);
+      if (errno == 0 && end != (range + 6)) {
+        if (parsed > UINT32_MAX) {
+          start = UINT32_MAX;
+        } else {
+          start = (uint32_t)parsed;
+        }
+        partial = true;
+      }
+    }
+  }
+  if (start >= file_size) {
+    httpd_resp_set_status(req, "416 Range Not Satisfiable");
+    httpd_resp_sendstr(req, "range out of bounds");
+    return ESP_FAIL;
+  }
+
+  FILE *fp = fopen(path, "rb");
+  if (fp == NULL) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "open failed");
+    return ESP_FAIL;
+  }
+  if (start > 0 && fseek(fp, (long)start, SEEK_SET) != 0) {
+    fclose(fp);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "seek failed");
+    return ESP_FAIL;
+  }
+
+  uint32_t remain = file_size - start;
+  char hdr[96] = {0};
+  if (want_dat) {
+    httpd_resp_set_type(req, "application/octet-stream");
+  } else {
+    httpd_resp_set_type(req, "application/gpx+xml");
+  }
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  if (partial) {
+    httpd_resp_set_status(req, "206 Partial Content");
+    snprintf(hdr, sizeof(hdr), "bytes %lu-%lu/%lu", (unsigned long)start,
+             (unsigned long)(file_size - 1U), (unsigned long)file_size);
+    httpd_resp_set_hdr(req, "Content-Range", hdr);
+  }
+  snprintf(hdr, sizeof(hdr), "%lu", (unsigned long)remain);
+  httpd_resp_set_hdr(req, "Content-Length", hdr);
+
+  uint8_t chunk[WG_WIFI_DUMP_HTTP_CHUNK] = {0};
+  while (remain > 0) {
+    size_t want = remain > sizeof(chunk) ? sizeof(chunk) : (size_t)remain;
+    size_t n = fread(chunk, 1, want, fp);
+    if (n == 0) {
+      fclose(fp);
+      httpd_resp_send_chunk(req, NULL, 0);
+      return ESP_FAIL;
+    }
+    if (httpd_resp_send_chunk(req, (const char *)chunk, n) != ESP_OK) {
+      fclose(fp);
+      return ESP_FAIL;
+    }
+    remain -= (uint32_t)n;
+  }
+  fclose(fp);
+  return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static bool wifi_dump_http_start_locked(void) {
+  if (s_wifi_dump_httpd != NULL) {
+    return true;
+  }
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.server_port = WG_WIFI_DUMP_HTTP_PORT;
+  cfg.max_uri_handlers = 6;
+  cfg.stack_size = 6144;
+  cfg.lru_purge_enable = true;
+  cfg.max_open_sockets = 4;
+
+  if (httpd_start(&s_wifi_dump_httpd, &cfg) != ESP_OK) {
+    s_wifi_dump_httpd = NULL;
+    return false;
+  }
+
+  const httpd_uri_t manifest_uri = {
+      .uri = WG_WIFI_DUMP_MANIFEST_URI,
+      .method = HTTP_GET,
+      .handler = wifi_dump_manifest_handler,
+      .user_ctx = NULL,
+  };
+  const httpd_uri_t file_uri = {
+      .uri = WG_WIFI_DUMP_FILE_URI,
+      .method = HTTP_GET,
+      .handler = wifi_dump_file_handler,
+      .user_ctx = NULL,
+  };
+  if (httpd_register_uri_handler(s_wifi_dump_httpd, &manifest_uri) != ESP_OK ||
+      httpd_register_uri_handler(s_wifi_dump_httpd, &file_uri) != ESP_OK) {
+    httpd_stop(s_wifi_dump_httpd);
+    s_wifi_dump_httpd = NULL;
+    return false;
+  }
+  return true;
+}
+
+static void wifi_dump_http_stop_locked(void) {
+  if (s_wifi_dump_httpd != NULL) {
+    httpd_handle_t handle = s_wifi_dump_httpd;
+    s_wifi_dump_httpd = NULL;
+    httpd_stop(handle);
+  }
+}
+
+static bool wifi_dump_ap_start_locked(void) {
+  if (s_wifi_dump_ap_running) {
+    return true;
+  }
+  wifi_config_t ap_cfg = {0};
+  memcpy(ap_cfg.ap.ssid, WG_WIFI_DUMP_AP_SSID, strlen(WG_WIFI_DUMP_AP_SSID));
+  ap_cfg.ap.ssid_len = strlen(WG_WIFI_DUMP_AP_SSID);
+  ap_cfg.ap.channel = WG_WIFI_DUMP_AP_CHANNEL;
+  ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+  ap_cfg.ap.max_connection = 2;
+  ap_cfg.ap.beacon_interval = 100;
+
+  esp_err_t rc = esp_wifi_set_mode(WIFI_MODE_APSTA);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "wifi dump set mode APSTA failed rc=%s", esp_err_to_name(rc));
+    return false;
+  }
+  rc = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "wifi dump AP config failed rc=%s", esp_err_to_name(rc));
+    (void)esp_wifi_set_mode(WIFI_MODE_STA);
+    return false;
+  }
+  s_wifi_dump_ap_running = true;
+  ESP_LOGI(TAG, "wifi dump AP ready ssid=%s channel=%u", WG_WIFI_DUMP_AP_SSID,
+           (unsigned)WG_WIFI_DUMP_AP_CHANNEL);
+  return true;
+}
+
+static void wifi_dump_ap_stop_locked(void) {
+  if (!s_wifi_dump_ap_running) {
+    return;
+  }
+  (void)esp_wifi_set_mode(WIFI_MODE_STA);
+  s_wifi_dump_ap_running = false;
+}
+
+static bool storage_dump_start_locked(void) {
+  if (!s_storage_ready || s_scanning) {
+    return false;
+  }
+
+  s_replay_requested = false;
+  storage_reset_replay_locked();
+  s_blob_requested = false;
+  storage_reset_blob_locked();
+  (void)storage_flush_pending_locked(true);
+
+  if (s_session_open) {
+    storage_close_session_locked(WG_SESSION_STATE_CLOSED);
+  }
+  if (!storage_dump_collect_sessions_locked()) {
+    return false;
+  }
+  s_wifi_dump_run_id = ((uint64_t)(uint32_t)now_ms() << 32) ^ (uint64_t)esp_random();
+  if (s_wifi_dump_run_id == 0) {
+    s_wifi_dump_run_id = 1;
+  }
+  if (!storage_dump_journal_write_locked(false)) {
+    storage_dump_reset_sessions_locked();
+    s_wifi_dump_run_id = 0;
+    return false;
+  }
+  s_wifi_dump_requested = true;
+  s_wifi_dump_active = true;
+  s_wifi_dump_started_ms = now_ms();
+  ESP_LOGI(TAG, "wifi dump start run=%016llX sessions=%lu", (unsigned long long)s_wifi_dump_run_id,
+           (unsigned long)s_wifi_dump_session_count);
+  return true;
+}
+
+static void storage_dump_stop_locked(bool keep_journal) {
+  s_wifi_dump_requested = false;
+  s_wifi_dump_active = false;
+  s_wifi_dump_run_id = 0;
+  s_wifi_dump_started_ms = 0;
+  storage_dump_reset_sessions_locked();
+  if (!keep_journal) {
+    (void)storage_dump_journal_delete_locked();
+  }
+}
+
+static bool storage_dump_commit_locked(uint64_t run_id) {
+  if (!s_wifi_dump_active || run_id == 0 || run_id != s_wifi_dump_run_id) {
+    return false;
+  }
+  return storage_dump_journal_write_locked(true);
+}
+
+static bool storage_set_wifi_dump_enabled(bool enabled) {
+  bool ok = true;
+  if (!storage_lock(pdMS_TO_TICKS(500))) {
+    return false;
+  }
+
+  if (enabled) {
+    if (s_wifi_dump_active || s_wifi_dump_requested) {
+      storage_unlock();
+      notify_status_frame();
+      return true;
+    }
+    if (!storage_dump_start_locked()) {
+      storage_unlock();
+      return false;
+    }
+    if (!wifi_dump_ap_start_locked() || !wifi_dump_http_start_locked()) {
+      wifi_dump_http_stop_locked();
+      wifi_dump_ap_stop_locked();
+      storage_dump_stop_locked(false);
+      ok = false;
+    }
+  } else {
+    if (!s_wifi_dump_active && !s_wifi_dump_requested) {
+      storage_unlock();
+      notify_status_frame();
+      return true;
+    }
+    wifi_dump_http_stop_locked();
+    wifi_dump_ap_stop_locked();
+    storage_dump_stop_locked(false);
+  }
+
+  storage_unlock();
+  notify_status_frame();
+  return ok;
+}
+
+static bool storage_commit_wifi_dump_run(uint64_t run_id) {
+  if (run_id == 0) {
+    return false;
+  }
+
+  wg_dump_journal_entry_t *entries = NULL;
+  uint32_t session_count = 0;
+  bool prepared = false;
+  if (!storage_lock(pdMS_TO_TICKS(500))) {
+    return false;
+  }
+  prepared = storage_dump_commit_locked(run_id);
+  if (prepared) {
+    session_count = (s_wifi_dump_session_count > UINT32_MAX) ? UINT32_MAX : (uint32_t)s_wifi_dump_session_count;
+    if (session_count > 0) {
+      entries = (wg_dump_journal_entry_t *)calloc(session_count, sizeof(wg_dump_journal_entry_t));
+      if (entries == NULL) {
+        prepared = false;
+      } else {
+        for (uint32_t i = 0; i < session_count; ++i) {
+          entries[i].session_id = s_wifi_dump_sessions[i].session_id;
+          entries[i].ack_seq = s_wifi_dump_sessions[i].written_seq;
+        }
+      }
+    }
+  }
+  storage_unlock();
+  if (!prepared) {
+    if (entries != NULL) {
+      free(entries);
+    }
+    return false;
+  }
+
+  bool ack_ok = true;
+  for (uint32_t i = 0; i < session_count; ++i) {
+    if (entries[i].session_id == 0 || entries[i].ack_seq == 0) {
+      continue;
+    }
+    if (!storage_apply_replay_ack(entries[i].session_id, entries[i].ack_seq)) {
+      ack_ok = false;
+      ESP_LOGW(TAG, "wifi dump commit ack failed sid=%016llX seq=%lu",
+               (unsigned long long)entries[i].session_id, (unsigned long)entries[i].ack_seq);
+    }
+  }
+  if (entries != NULL) {
+    free(entries);
+  }
+
+  if (!storage_lock(pdMS_TO_TICKS(500))) {
+    return false;
+  }
+  if (ack_ok) {
+    storage_refresh_backlog_locked(true);
+    (void)storage_dump_journal_delete_locked();
+  }
+  wifi_dump_http_stop_locked();
+  wifi_dump_ap_stop_locked();
+  storage_dump_stop_locked(true);
+  storage_unlock();
+  notify_status_frame();
+
+  if (ack_ok) {
+    ESP_LOGI(TAG, "wifi dump commit complete run=%016llX", (unsigned long long)run_id);
+  }
+  return ack_ok;
+}
+
+static void storage_recover_wifi_dump_journal(void) {
+  wg_dump_journal_header_t header = {0};
+  wg_dump_journal_entry_t *entries = NULL;
+  bool loaded = false;
+  if (!storage_lock(pdMS_TO_TICKS(300))) {
+    return;
+  }
+  loaded = storage_dump_journal_load_locked(&header, &entries);
+  if (!loaded) {
+    storage_unlock();
+    return;
+  }
+  if (header.committed == 0) {
+    ESP_LOGW(TAG, "wifi dump recovery: uncommitted journal retained run=%016llX sessions=%lu",
+             (unsigned long long)header.run_id, (unsigned long)header.session_count);
+    storage_unlock();
+    if (entries != NULL) {
+      free(entries);
+    }
+    return;
+  }
+  storage_unlock();
+
+  bool ok = true;
+  for (uint32_t i = 0; i < header.session_count; ++i) {
+    if (entries[i].session_id == 0 || entries[i].ack_seq == 0) {
+      continue;
+    }
+    if (!storage_apply_replay_ack(entries[i].session_id, entries[i].ack_seq)) {
+      ok = false;
+    }
+  }
+  if (entries != NULL) {
+    free(entries);
+  }
+
+  if (!storage_lock(pdMS_TO_TICKS(300))) {
+    return;
+  }
+  if (ok) {
+    (void)storage_refresh_backlog_locked(true);
+    (void)storage_dump_journal_delete_locked();
+    ESP_LOGI(TAG, "wifi dump recovery replayed committed journal run=%016llX",
+             (unsigned long long)header.run_id);
+  } else {
+    ESP_LOGW(TAG, "wifi dump recovery incomplete run=%016llX", (unsigned long long)header.run_id);
+  }
+  storage_unlock();
+}
+
 static uint64_t storage_generate_session_id(void) {
   uint32_t unix_s = s_latest_gps.unix_time_s;
   if (unix_s == 0) {
@@ -1889,8 +2710,6 @@ static void storage_reset_pending_block_locked(void) {
   s_store_block_first_seq = 0;
   s_store_block_started_ms = 0;
 }
-
-static void storage_refresh_backlog_locked(bool reclaim);
 
 static uint32_t storage_reclaim_acked_sessions_locked(void) {
   DIR *dir = opendir(storage_base_path());
@@ -2478,6 +3297,9 @@ static bool storage_replay_allowed_locked(void) {
   if (!s_storage_ready || !s_replay_requested || s_blob_requested) {
     return false;
   }
+  if (s_wifi_dump_requested || s_wifi_dump_active) {
+    return false;
+  }
   if (s_scanning) {
     return false;
   }
@@ -2707,6 +3529,9 @@ static bool storage_prepare_replay_pending_locked(void) {
 
 static bool storage_blob_allowed_locked(void) {
   if (!s_storage_ready || !s_blob_requested) {
+    return false;
+  }
+  if (s_wifi_dump_requested || s_wifi_dump_active) {
     return false;
   }
   if (s_scanning) {
@@ -3582,6 +4407,7 @@ static void init_storage(void) {
 
   s_storage_ready = true;
   storage_abort_stale_open_sessions();
+  storage_recover_wifi_dump_journal();
   storage_refresh_backlog(true);
   uint64_t total = 0;
   uint64_t used = 0;
@@ -3914,7 +4740,7 @@ static void build_status_payload(wg_status_payload_t *payload) {
       .session_id = s_session_open ? s_session_id : s_last_session_id,
       .queued_records = s_queue_backlog_records,
       .queued_bytes = s_queue_backlog_bytes,
-      .replay_active = s_replay_active || s_blob_active,
+      .replay_active = s_replay_active || s_blob_active || s_wifi_dump_active,
       .replay_cursor = s_blob_active ? s_blob_bytes_acked : s_replay_cursor_seq,
       .queue_full = s_queue_full,
       .dropped_flash_full = s_dropped_flash_full,
@@ -4015,65 +4841,23 @@ static void recompute_effective_gps_fix(void) {
 }
 
 static bool parse_nmea_latlon(const char *value, const char *hemi, int32_t *out_e7) {
-  if (value == NULL || hemi == NULL || out_e7 == NULL || value[0] == '\0' || hemi[0] == '\0') {
-    return false;
-  }
-  char *end = NULL;
-  double raw = strtod(value, &end);
-  if (end == value || raw <= 0.0) {
-    return false;
-  }
-  int degrees = (int)(raw / 100.0);
-  double minutes = raw - (double)degrees * 100.0;
-  double dec = (double)degrees + minutes / 60.0;
-  if (hemi[0] == 'S' || hemi[0] == 'W') {
-    dec = -dec;
-  } else if (hemi[0] != 'N' && hemi[0] != 'E') {
-    return false;
-  }
-  *out_e7 = (int32_t)llround(dec * 10000000.0);
-  return true;
+  return wg_gps_parse_nmea_latlon(value, hemi, out_e7);
 }
 
 static uint16_t parse_nmea_dop_centi(const char *token) {
-  if (token == NULL || token[0] == '\0') {
-    return 0;
-  }
-  char *end = NULL;
-  double dop = strtod(token, &end);
-  if (end == token || !isfinite(dop) || dop <= 0.0) {
-    return 0;
-  }
-  if (dop > 999.99) {
-    dop = 999.99;
-  }
-  return clamp_u16_u32((uint32_t)llround(dop * 100.0));
+  return wg_gps_parse_nmea_dop_centi(token);
 }
 
 static bool nmea_sentence_has_type(const char *line, const char *type3) {
-  if (line == NULL || type3 == NULL) {
-    return false;
-  }
-  size_t len = strnlen(line, 16);
-  if (len < 6) {
-    return false;
-  }
-  return line[0] == '$' && strncmp(&line[3], type3, 3) == 0;
+  return wg_gps_nmea_sentence_has_type(line, type3);
 }
 
 static uint16_t nmea_sentence_talker_key(const char *line) {
-  if (line == NULL) {
-    return 0;
-  }
-  size_t len = strnlen(line, 8);
-  if (len < 3 || line[0] != '$') {
-    return 0;
-  }
-  return (((uint16_t)(uint8_t)line[1]) << 8) | (uint16_t)(uint8_t)line[2];
+  return wg_gps_nmea_sentence_talker_key(line);
 }
 
 static bool talker_key_is_gn(uint16_t key) {
-  return key == ((((uint16_t)'G') << 8) | (uint16_t)'N');
+  return wg_gps_talker_key_is_gn(key);
 }
 
 static void gps_update_talker_sat(gps_talker_sat_t *buckets, size_t bucket_count, uint16_t talker_key,
@@ -5288,23 +6072,18 @@ static bool send_snapshot_end(void) {
   return sent;
 }
 
-static uint16_t rd_u16_le(const uint8_t *in) { return (uint16_t)in[0] | ((uint16_t)in[1] << 8); }
+static uint16_t rd_u16_le(const uint8_t *in) { return wg_transport_rd_u16_le(in); }
 
 static void wr_u16_le(uint8_t *out, uint16_t value) {
-  out[0] = (uint8_t)(value & 0xFF);
-  out[1] = (uint8_t)((value >> 8) & 0xFF);
+  wg_transport_wr_u16_le(out, value);
 }
 
 static void wr_u32_le(uint8_t *out, uint32_t value) {
-  out[0] = (uint8_t)(value & 0xFF);
-  out[1] = (uint8_t)((value >> 8) & 0xFF);
-  out[2] = (uint8_t)((value >> 16) & 0xFF);
-  out[3] = (uint8_t)((value >> 24) & 0xFF);
+  wg_transport_wr_u32_le(out, value);
 }
 
 static void wr_u64_le(uint8_t *out, uint64_t value) {
-  wr_u32_le(out, (uint32_t)(value & 0xFFFFFFFFULL));
-  wr_u32_le(out + 4, (uint32_t)((value >> 32) & 0xFFFFFFFFULL));
+  wg_transport_wr_u64_le(out, value);
 }
 
 static uint8_t rsn_cipher_flags_from_suite(const uint8_t *suite) {
@@ -6142,6 +6921,11 @@ static esp_err_t start_scan(void) {
     rc = ESP_ERR_INVALID_STATE;
     goto out;
   }
+  if (s_wifi_dump_requested || s_wifi_dump_active) {
+    ESP_LOGW(TAG, "Scan start blocked: Wi-Fi dump mode is active");
+    rc = ESP_ERR_INVALID_STATE;
+    goto out;
+  }
   if (s_scanning) {
     rc = ESP_OK;
     goto out;
@@ -6339,6 +7123,9 @@ static uint8_t apply_command(const wg_command_t *cmd) {
       if (!s_latest_gps.valid) {
         return WG_ERR_BAD_ARG;
       }
+      if (s_wifi_dump_requested || s_wifi_dump_active) {
+        return WG_ERR_BUSY;
+      }
       wg_scan_policy_on_explicit_start(&s_auto_scan_paused);
       return start_scan() == ESP_OK ? WG_ACK_OK : WG_ERR_INTERNAL;
     case WG_CMD_STOP:
@@ -6415,6 +7202,9 @@ static uint8_t apply_command(const wg_command_t *cmd) {
       if (cmd->replay_enable > 1) {
         return WG_ERR_BAD_ARG;
       }
+      if (cmd->replay_enable == 1 && (s_wifi_dump_requested || s_wifi_dump_active)) {
+        return WG_ERR_BUSY;
+      }
       if (cmd->replay_enable == 1 && s_scanning) {
         esp_err_t stop_rc = stop_scan();
         if (stop_rc != ESP_OK) {
@@ -6428,6 +7218,9 @@ static uint8_t apply_command(const wg_command_t *cmd) {
     case WG_CMD_SET_BACKLOG_BLOB:
       if (cmd->backlog_blob_enable > 1) {
         return WG_ERR_BAD_ARG;
+      }
+      if (cmd->backlog_blob_enable == 1 && (s_wifi_dump_requested || s_wifi_dump_active)) {
+        return WG_ERR_BUSY;
       }
       if (cmd->backlog_blob_enable == 1 && s_scanning) {
         esp_err_t stop_rc = stop_scan();
@@ -6457,6 +7250,25 @@ static uint8_t apply_command(const wg_command_t *cmd) {
                                             cmd->backlog_blob_chunk_reply)
                  ? WG_ACK_OK
                  : WG_ERR_INTERNAL;
+    case WG_CMD_SET_WIFI_DUMP:
+      if (cmd->wifi_dump_enable > 1) {
+        return WG_ERR_BAD_ARG;
+      }
+      if (cmd->wifi_dump_enable == 1 && s_scanning) {
+        esp_err_t stop_rc = stop_scan();
+        if (stop_rc != ESP_OK) {
+          ESP_LOGW(TAG, "set wifi dump failed: stop scan rc=%s", esp_err_to_name(stop_rc));
+          return WG_ERR_INTERNAL;
+        }
+      }
+      return storage_set_wifi_dump_enabled(cmd->wifi_dump_enable == 1) ? WG_ACK_OK
+                                                                        : WG_ERR_INTERNAL;
+    case WG_CMD_COMMIT_WIFI_DUMP:
+      if (cmd->wifi_dump_run_id == 0) {
+        return WG_ERR_BAD_ARG;
+      }
+      return storage_commit_wifi_dump_run(cmd->wifi_dump_run_id) ? WG_ACK_OK
+                                                                  : WG_ERR_INTERNAL;
     case WG_CMD_DEBUG_SEED_STORAGE: {
       if (s_scanning) {
         return WG_ERR_BUSY;
@@ -6472,7 +7284,7 @@ static uint8_t apply_command(const wg_command_t *cmd) {
       return WG_ACK_OK;
     }
     case WG_CMD_CLEAR_STORAGE:
-      if (s_scanning) {
+      if (s_scanning || s_wifi_dump_requested || s_wifi_dump_active) {
         return WG_ERR_BUSY;
       }
       if (!storage_clear_sessions()) {
@@ -6604,7 +7416,11 @@ static int handle_gatt_read(uint16_t attr_handle, struct ble_gatt_access_ctxt *c
   }
 
   if (attr_handle == s_device_info_handle) {
-    return os_mbuf_append(ctxt->om, WG_DEVICE_INFO_TEXT, strlen(WG_DEVICE_INFO_TEXT)) == 0
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const char *fw_ver = (app_desc != NULL && app_desc->version[0] != '\0') ? app_desc->version : "unknown";
+    char info[96] = {0};
+    (void)snprintf(info, sizeof(info), "%s FW %s", WG_DEVICE_NAME, fw_ver);
+    return os_mbuf_append(ctxt->om, info, strlen(info)) == 0
                ? 0
                : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
@@ -6708,48 +7524,13 @@ static void refresh_link_security_state(uint16_t conn_handle) {
 }
 
 static const char *ble_phy_name(uint8_t phy) {
-  switch (phy) {
-    case BLE_GAP_LE_PHY_1M:
-      return "1M";
-    case BLE_GAP_LE_PHY_2M:
-      return "2M";
-    case BLE_GAP_LE_PHY_CODED:
-      return "CODED";
-    default:
-      return "unknown";
-  }
+  return wg_transport_ble_phy_name(phy);
 }
 
 static uint16_t ble_notify_frame_payload_limit(void) {
-  uint16_t mtu = s_ble_att_mtu;
-  if (mtu < 23) {
-    mtu = 23;
-  }
-  if (mtu <= (WG_FRAME_HEADER_SIZE + 3)) {
-    return 0;
-  }
-  uint16_t limit = (uint16_t)(mtu - WG_FRAME_HEADER_SIZE - 3);
-  if (limit > WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX) {
-    limit = WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX;
-  }
-  // Cap payload so the entire BLE notification fits within 2 LL PDU fragments.
-  // Some Android BLE stacks silently fail to reassemble L2CAP PDUs spanning 3+
-  // LL fragments.  With DLE=251 and encryption (4-byte MIC), each fragment
-  // carries at most 247 bytes of L2CAP data.  Two fragments = 494 bytes L2CAP
-  // → 490 ATT PDU → 487 notification value → 475 WG frame payload.
-  const uint16_t dle = WG_BLE_DATA_LEN_OCTETS;
-  const uint16_t mic = s_ble_encrypted ? 4 : 0;
-  const uint16_t l2cap_per_frag = (dle > mic) ? (uint16_t)(dle - mic) : 1;
-  const uint16_t safe_l2cap = (uint16_t)(l2cap_per_frag * 2U);
-  const uint16_t safe_att = (safe_l2cap > 4) ? (uint16_t)(safe_l2cap - 4) : 0;
-  const uint16_t safe_notify = (safe_att > 3) ? (uint16_t)(safe_att - 3) : 0;
-  const uint16_t safe_payload = (safe_notify > WG_FRAME_HEADER_SIZE)
-                                    ? (uint16_t)(safe_notify - WG_FRAME_HEADER_SIZE)
-                                    : 0;
-  if (limit > safe_payload) {
-    limit = safe_payload;
-  }
-  return limit;
+  return wg_transport_ble_notify_payload_limit(s_ble_att_mtu, WG_FRAME_HEADER_SIZE,
+                                               WG_BLE_NOTIFY_FRAME_MAX_PAYLOAD_MAX,
+                                               WG_BLE_DATA_LEN_OCTETS, s_ble_encrypted);
 }
 
 static void refresh_ble_link_metrics(uint16_t conn_handle, const char *reason_tag) {
@@ -7155,6 +7936,7 @@ static void init_wifi(void) {
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   esp_netif_create_default_wifi_sta();
+  esp_netif_create_default_wifi_ap();
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
